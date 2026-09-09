@@ -1,0 +1,57 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: event
+      POSTGRES_PASSWORD: event
+      POSTGRES_DB: events
+    command: ["postgres", "-c", "max_connections=300"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U event -d events"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  ingest-api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://event:event@postgres:5432/events
+      DB_POOL_SIZE: "${DB_POOL_SIZE:-10}"
+      DB_MAX_OVERFLOW: "${DB_MAX_OVERFLOW:-5}"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://event:event@postgres:5432/events
+      DB_POOL_SIZE: "${WORKER_DB_POOL_SIZE:-4}"
+      DB_MAX_OVERFLOW: "${WORKER_DB_MAX_OVERFLOW:-2}"
+      WORKER_CONCURRENCY: "${WORKER_CONCURRENCY:-4}"
+      POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-0.5}"
+      HTTP_TIMEOUT_SECONDS: "${HTTP_TIMEOUT_SECONDS:-10}"
+      CLAIM_LEASE_SECONDS: "${CLAIM_LEASE_SECONDS:-60}"
+      RETRY_BACKOFF_BASE_SECONDS: "${RETRY_BACKOFF_BASE_SECONDS:-2}"
+      RETRY_BACKOFF_MAX_SECONDS: "${RETRY_BACKOFF_MAX_SECONDS:-3600}"
+      FAILURE_THRESHOLD: "${FAILURE_THRESHOLD:-5}"
+      QUARANTINE_SECONDS: "${QUARANTINE_SECONDS:-900}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
