@@ -41,10 +41,21 @@ REAP_SQL = text(
     SET status = 'pending',
         claim_token = NULL,
         claimed_at = NULL,
+        lease_until = NULL,
         next_attempt_at = LEAST(next_attempt_at, now()),
         updated_at = now()
     WHERE status = 'in_flight'
-      AND claimed_at < now() - make_interval(secs => :lease_seconds)
+      AND lease_until < now()
+    """
+)
+
+HEARTBEAT_SQL = text(
+    """
+    UPDATE events
+    SET lease_until = now() + make_interval(secs => :lease_seconds)
+    WHERE id = :event_id
+      AND status = 'in_flight'
+      AND claim_token = :claim_token
     """
 )
 
@@ -78,6 +89,7 @@ CLAIM_SQL = text(
             attempts = attempts + 1,
             claim_token = :claim_token,
             claimed_at = now(),
+            lease_until = now() + make_interval(secs => :lease_seconds),
             updated_at = now()
         FROM candidate_destination d,
         LATERAL (
@@ -130,6 +142,7 @@ EVENT_SUCCESS_SQL = text(
     SET status = 'delivered',
         claim_token = NULL,
         claimed_at = NULL,
+        lease_until = NULL,
         last_error = NULL,
         updated_at = now(),
         delivered_at = now()
@@ -154,6 +167,7 @@ FAILURE_SQL = text(
         SET status = 'pending',
             claim_token = NULL,
             claimed_at = NULL,
+            lease_until = NULL,
             last_error = :error,
             next_attempt_at = :next_attempt_at,
             updated_at = now()
@@ -181,10 +195,25 @@ ATTEMPT_SQL = text(
     """
     INSERT INTO delivery_attempts (
         event_id, destination_id, attempt_no, started_at, finished_at,
-        success, status_code, response_excerpt, error
+        success, status_code, response_excerpt, error, lost_lease
     ) VALUES (
         :event_id, :destination_id, :attempt_no, :started_at, :finished_at,
-        :success, :status_code, :response_excerpt, :error
+        :success, :status_code, :response_excerpt, :error, :lost_lease
+    )
+    """
+)
+
+# Used when this worker's lease expired mid-delivery and another worker took
+# over. We only append an audit row; the event/destination are owned by the
+# new worker and must not be touched.
+AUDIT_ATTEMPT_SQL = text(
+    """
+    INSERT INTO delivery_attempts (
+        event_id, destination_id, attempt_no, started_at, finished_at,
+        success, status_code, response_excerpt, error, lost_lease
+    ) VALUES (
+        :event_id, :destination_id, :attempt_no, :started_at, :finished_at,
+        :success, :status_code, :response_excerpt, :error, TRUE
     )
     """
 )
@@ -206,6 +235,72 @@ def truncate(value: str | None) -> str | None:
     if value is None:
         return None
     return value[: settings.max_response_body_bytes]
+
+
+class LeaseHeartbeat:
+    """Renews an in-flight event's lease while its HTTP call is running.
+
+    A slow receiver must not look like a dead worker: as long as this thread
+    keeps renewing ``lease_until`` no other worker takes the event. If the
+    process dies, the thread stops with it and the lease expires, allowing
+    another worker to resume the undelivered event.
+    """
+
+    def __init__(self, claim: RowMapping) -> None:
+        self.claim = claim
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=f"heartbeat-{claim['event_id']}", daemon=True
+        )
+
+    @property
+    def lost(self) -> bool:
+        return self._lost.is_set()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=10)
+
+    def _run(self) -> None:
+        interval = max(
+            1.0,
+            min(
+                settings.lease_heartbeat_seconds,
+                settings.claim_lease_seconds / 3.0,
+            ),
+        )
+        while not self._stop.wait(interval):
+            db = SessionLocal()
+            try:
+                updated = db.execute(
+                    HEARTBEAT_SQL,
+                    {
+                        "event_id": self.claim["event_id"],
+                        "claim_token": self.claim["claim_token"],
+                        "lease_seconds": settings.claim_lease_seconds,
+                    },
+                )
+                db.commit()
+                if updated.rowcount != 1:
+                    # Another worker already took the lease over; stop acting
+                    # like we still own this event.
+                    self._lost.set()
+                    return
+            except SQLAlchemyError:
+                # Keep retrying: a transient DB outage should not by itself
+                # surrender the lease. If it lasts beyond the lease window the
+                # lease genuinely expires, which is the desired takeover.
+                db.rollback()
+                logger.warning(
+                    "lease heartbeat DB error for event_id=%s; retrying",
+                    self.claim["event_id"],
+                )
+            finally:
+                db.close()
 
 
 def deliver(
@@ -251,7 +346,62 @@ def deliver(
         }
 
 
-def record_result(db: Session, claim: RowMapping, result: MappingProxyType | dict[str, Any]) -> None:
+def still_owns_lease(db: Session, claim: RowMapping) -> bool:
+    """Authoritative ownership check done in the result-writing transaction."""
+    row = db.execute(
+        text(
+            """
+            SELECT 1
+            FROM events
+            WHERE id = :event_id
+              AND status = 'in_flight'
+              AND claim_token = :claim_token
+            """
+        ),
+        {
+            "event_id": claim["event_id"],
+            "claim_token": claim["claim_token"],
+        },
+    ).first()
+    return row is not None
+
+
+def record_result(
+    db: Session,
+    claim: RowMapping,
+    result: MappingProxyType | dict[str, Any],
+    lease_lost: bool,
+) -> None:
+    lease_lost = lease_lost or not still_owns_lease(db, claim)
+    attempt_params = {
+        "event_id": claim["event_id"],
+        "destination_id": claim["destination_id"],
+        "attempt_no": claim["attempts"],
+        "started_at": result["started_at"],
+        "finished_at": result["finished_at"],
+        "success": result["success"],
+        "status_code": result["status_code"],
+        "response_excerpt": result["response_excerpt"],
+        "error": result["error"],
+    }
+
+    # The lease expired while we were still talking to a slow receiver and
+    # another worker took over. We must not mutate the event/destination
+    # (those are owned by the new worker); only append an audit row so the
+    # duplicate in-flight call stays visible in the trace.
+    if lease_lost:
+        db.execute(AUDIT_ATTEMPT_SQL, attempt_params)
+        db.commit()
+        logger.warning(
+            "lease lost for event_id=%s during attempt=%s; result not applied "
+            "(success=%s, status_code=%s)",
+            claim["event_id"],
+            claim["attempts"],
+            result["success"],
+            result["status_code"],
+        )
+        return
+
     next_attempt_at = utc_now() + backoff_delay(claim["attempts"])
     should_isolate = False
     recoverable_at = None
@@ -291,17 +441,7 @@ def record_result(db: Session, claim: RowMapping, result: MappingProxyType | dic
 
     db.execute(
         ATTEMPT_SQL,
-        {
-            "event_id": claim["event_id"],
-            "destination_id": claim["destination_id"],
-            "attempt_no": claim["attempts"],
-            "started_at": result["started_at"],
-            "finished_at": result["finished_at"],
-            "success": result["success"],
-            "status_code": result["status_code"],
-            "response_excerpt": result["response_excerpt"],
-            "error": result["error"],
-        },
+        {**attempt_params, "lost_lease": False},
     )
 
     db.commit()
@@ -315,16 +455,17 @@ def record_result(db: Session, claim: RowMapping, result: MappingProxyType | dic
 
 
 def claim_next_event(db: Session) -> RowMapping | None:
-    # Reap stale claims before selecting a new one. An in-flight head event
-    # is still row-locked by a live HTTP delivery, so it will not match the
-    # later FOR UPDATE SKIP LOCKED query.
-    db.execute(
-        REAP_SQL,
-        {"lease_seconds": settings.claim_lease_seconds},
-    )
+    # Reap expired leases before selecting. Reaper and claim run in one
+    # transaction. A genuinely live HTTP call keeps its heartbeat fresh, so
+    # its lease never expires and it keeps holding the destination's head;
+    # only a dead worker stops heartbeating and becomes eligible to take over.
+    db.execute(REAP_SQL)
     result = db.execute(
         CLAIM_SQL,
-        {"claim_token": uuid4()},
+        {
+            "claim_token": uuid4(),
+            "lease_seconds": settings.claim_lease_seconds,
+        },
     ).mappings().first()
     db.commit()
     return result
@@ -333,6 +474,7 @@ def claim_next_event(db: Session) -> RowMapping | None:
 def process_once() -> bool:
     db = SessionLocal()
     claim = None
+    heartbeat = None
     try:
         claim = claim_next_event(db)
         if claim is None:
@@ -344,6 +486,8 @@ def process_once() -> bool:
                 claim["destination_id"],
             )
 
+        heartbeat = LeaseHeartbeat(claim)
+        heartbeat.start()
         result = deliver(
             client=get_http_client(),
             url=claim["destination_url"],
@@ -352,7 +496,9 @@ def process_once() -> bool:
             payload=claim["payload"],
             destination_seq=claim["destination_seq"],
         )
-        record_result(db, claim, result)
+        heartbeat.stop()
+
+        record_result(db, claim, result, lease_lost=heartbeat.lost)
         if result["success"]:
             logger.info(
                 "delivered event_id=%s destination_id=%s attempt=%s",
@@ -382,6 +528,8 @@ def process_once() -> bool:
         logger.exception("unexpected worker error")
         return False
     finally:
+        if heartbeat is not None:
+            heartbeat.stop()
         db.close()
 
 

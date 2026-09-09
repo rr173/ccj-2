@@ -28,6 +28,7 @@ SCHEMA_STATEMENTS = [
         attempts INTEGER NOT NULL DEFAULT 0,
         claim_token UUID,
         claimed_at TIMESTAMPTZ,
+        lease_until TIMESTAMPTZ,
         next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         last_error TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -52,6 +53,7 @@ SCHEMA_STATEMENTS = [
         status_code INTEGER,
         response_excerpt TEXT,
         error TEXT,
+        lost_lease BOOLEAN NOT NULL DEFAULT FALSE,
         CHECK (attempt_no > 0),
         CHECK (finished_at >= started_at)
     )
@@ -61,9 +63,13 @@ SCHEMA_STATEMENTS = [
         ON events (destination_id, destination_seq)
         WHERE status IN ('pending', 'in_flight')
     """,
+    # Idempotent upgrades for databases created before the lease heartbeat.
+    "ALTER TABLE events ADD COLUMN IF NOT EXISTS lease_until TIMESTAMPTZ",
+    "ALTER TABLE delivery_attempts ADD COLUMN IF NOT EXISTS lost_lease BOOLEAN NOT NULL DEFAULT FALSE",
+    "DROP INDEX IF EXISTS events_stale_claim_idx",
     """
-    CREATE INDEX IF NOT EXISTS events_stale_claim_idx
-        ON events (claimed_at)
+    CREATE INDEX IF NOT EXISTS events_lease_until_idx
+        ON events (lease_until)
         WHERE status = 'in_flight'
     """,
     """

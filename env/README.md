@@ -38,9 +38,15 @@
   - `X-Event-Id: <event_id>`
 - 投递采用至少一次语义：Worker 崩溃或网络超时时可能重复发送。接收方必须使用 `Idempotency-Key` 做幂等处理，从而做到业务效果只处理一次。
 
-### 4. Worker 崩溃恢复
+### 4. Worker 崩溃恢复（租约 + 心跳）
 
-事件被领取后进入 `in_flight`，并记录 `claim_token` 和 `claimed_at`。如果 Worker 在投递过程中崩溃，其他 Worker 会在租约时间（默认 60 秒）后把该事件重新置为 `pending` 并继续投递。`delivery_attempts` 表保留每次尝试记录。
+事件被领取后进入 `in_flight`，记录 `claim_token`、`claimed_at` 和 `lease_until`。投递期间，Worker 会用后台心跳线程按 `LEASE_HEARTBEAT_SECONDS`（默认 15 秒）把 `lease_until` 向后延长一个租约窗口（默认 60 秒）：
+
+- **Worker 活着、只是接收方响应慢**：心跳持续续约，租约不过期，同一条事件不会被其他 Worker 重复领取或重复外发；该地址后续事件继续按 FIFO 被它挡在后面，直到这次调用结束。
+- **Worker 进程真的挂掉或被 kill**：心跳随之停止，`lease_until` 在一个租约窗口后过期。其他 Worker 的 reaper 会把事件重新置为 `pending` 并从最小序号继续投递，不会丢任务。
+- **极端情况下租约仍过期并被接管**（例如数据库长时间不可用导致心跳无法续约）：旧 Worker 那次 HTTP 调用结束后，不会再修改已被新 Worker 接管的事件，只在 `delivery_attempts` 中追加一条 `lost_lease=true` 的审计记录，因此这些“多打的一次”在投递轨迹里可见。
+
+这样“慢响应”和“真宕机”被区分开：慢不会导致重复外发，宕机仍能从未成功处续投。
 
 ## 快速启动
 
@@ -117,7 +123,7 @@ curl -s http://localhost:8000/v1/events \
 curl -s http://localhost:8000/v1/events/<event_id>/trace
 ```
 
-返回事件当前状态和每次投递尝试：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息。
+返回事件当前状态和每次投递尝试：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息；若某次调用是在租约丢失后返回的，会带 `lost_lease: true`。
 
 ### 立即恢复隔离地址
 
@@ -177,7 +183,8 @@ python3 scripts/mock_receiver.py --port 9000 --fail-times 3
 | `WORKER_CONCURRENCY` | `4` | 单个 Worker 实例内的投递线程数 |
 | `POLL_INTERVAL_SECONDS` | `0.5` | 无可投递任务时的轮询间隔 |
 | `HTTP_TIMEOUT_SECONDS` | `10` | 单次 HTTP 请求超时 |
-| `CLAIM_LEASE_SECONDS` | `60` | `in_flight` 事件多久后可被其他 Worker 接管 |
+| `CLAIM_LEASE_SECONDS` | `60` | Worker 崩溃后，`in_flight` 事件多久可被其他 Worker 接管；存活 Worker 会用心跳续约 |
+| `LEASE_HEARTBEAT_SECONDS` | `15` | 投递期间续约租约的心跳间隔（实际取该值与租约的 1/3 的较小值） |
 | `RETRY_BACKOFF_BASE_SECONDS` | `2` | 初始退避时间 |
 | `RETRY_BACKOFF_MAX_SECONDS` | `3600` | 最大退避时间 |
 | `FAILURE_THRESHOLD` | `5` | 连续失败多少次后隔离地址 |

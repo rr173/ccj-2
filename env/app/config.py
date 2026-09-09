@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     poll_interval_seconds: float = 0.5
     http_timeout_seconds: float = 10.0
     claim_lease_seconds: float = 60.0
+    lease_heartbeat_seconds: float = 15.0
     retry_backoff_base_seconds: float = 2.0
     retry_backoff_max_seconds: float = 3600.0
     failure_threshold: int = 5

@@ -53,6 +53,7 @@ class DeliveryAttemptOut(BaseModel):
     status_code: int | None = None
     response_excerpt: str | None = None
     error: str | None = None
+    lost_lease: bool = False
 
     model_config = {"from_attributes": True}
 

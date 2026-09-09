@@ -161,7 +161,7 @@ def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
             """
             SELECT id, event_id, destination_id, attempt_no,
                    started_at, finished_at, success, status_code,
-                   response_excerpt, error
+                   response_excerpt, error, lost_lease
             FROM delivery_attempts
             WHERE event_id = CAST(:event_id AS UUID)
             ORDER BY attempt_no ASC, id ASC
