@@ -37,7 +37,7 @@ def get_http_client() -> httpx.Client:
 
 REAP_SQL = text(
     """
-    UPDATE events
+    UPDATE deliveries
     SET status = 'pending',
         claim_token = NULL,
         claimed_at = NULL,
@@ -51,9 +51,9 @@ REAP_SQL = text(
 
 HEARTBEAT_SQL = text(
     """
-    UPDATE events
+    UPDATE deliveries
     SET lease_until = now() + make_interval(secs => :lease_seconds)
-    WHERE id = :event_id
+    WHERE id = :delivery_id
       AND status = 'in_flight'
       AND claim_token = :claim_token
     """
@@ -65,26 +65,26 @@ CLAIM_SQL = text(
         SELECT d.*
         FROM destinations d,
         LATERAL (
-            SELECT e.id AS event_id,
-                   e.status AS event_status,
-                   e.next_attempt_at AS event_due_at
-            FROM events e
+            SELECT e.id AS delivery_id,
+                   e.status AS delivery_status,
+                   e.next_attempt_at AS delivery_due_at
+            FROM deliveries e
             WHERE e.destination_id = d.id
               AND e.status IN ('pending', 'in_flight')
             ORDER BY e.destination_seq
             LIMIT 1
         ) oldest
-        WHERE oldest.event_status = 'pending'
-          AND oldest.event_due_at <= now()
+        WHERE oldest.delivery_status = 'pending'
+          AND oldest.delivery_due_at <= now()
           AND (
                 d.status = 'active'
              OR (d.status = 'isolated' AND d.recoverable_at <= now())
         )
-        ORDER BY oldest.event_due_at
+        ORDER BY oldest.delivery_due_at
         LIMIT 1
         FOR UPDATE OF d SKIP LOCKED
     ), claimed_event AS (
-        UPDATE events e
+        UPDATE deliveries e
         SET status = 'in_flight',
             attempts = attempts + 1,
             claim_token = :claim_token,
@@ -94,7 +94,7 @@ CLAIM_SQL = text(
         FROM candidate_destination d,
         LATERAL (
             SELECT id, status, next_attempt_at
-            FROM events
+            FROM deliveries
             WHERE destination_id = d.id
               AND status IN ('pending', 'in_flight')
             ORDER BY destination_seq
@@ -122,8 +122,10 @@ CLAIM_SQL = text(
         RETURNING d.id
     )
     SELECT
-        e.id AS event_id,
+        e.id AS delivery_id,
+        e.event_id,
         e.destination_id,
+        e.event_type,
         e.dedupe_key,
         e.payload,
         e.destination_seq,
@@ -138,7 +140,7 @@ CLAIM_SQL = text(
 
 EVENT_SUCCESS_SQL = text(
     """
-    UPDATE events
+    UPDATE deliveries
     SET status = 'delivered',
         claim_token = NULL,
         claimed_at = NULL,
@@ -146,7 +148,7 @@ EVENT_SUCCESS_SQL = text(
         last_error = NULL,
         updated_at = now(),
         delivered_at = now()
-    WHERE id = :event_id
+    WHERE id = :delivery_id
       AND status = 'in_flight'
       AND claim_token = :claim_token
     """
@@ -163,7 +165,7 @@ DESTINATION_SUCCESS_SQL = text(
 FAILURE_SQL = text(
     """
     WITH failed_event AS (
-        UPDATE events
+        UPDATE deliveries
         SET status = 'pending',
             claim_token = NULL,
             claimed_at = NULL,
@@ -171,7 +173,7 @@ FAILURE_SQL = text(
             last_error = :error,
             next_attempt_at = :next_attempt_at,
             updated_at = now()
-        WHERE id = :event_id
+        WHERE id = :delivery_id
           AND status = 'in_flight'
           AND claim_token = :claim_token
         RETURNING destination_id
@@ -194,11 +196,12 @@ FAILURE_SQL = text(
 ATTEMPT_SQL = text(
     """
     INSERT INTO delivery_attempts (
-        event_id, destination_id, attempt_no, started_at, finished_at,
-        success, status_code, response_excerpt, error, lost_lease
+        delivery_id, event_id, destination_id, attempt_no, started_at,
+        finished_at, success, status_code, response_excerpt, error, lost_lease
     ) VALUES (
-        :event_id, :destination_id, :attempt_no, :started_at, :finished_at,
-        :success, :status_code, :response_excerpt, :error, :lost_lease
+        :delivery_id, :event_id, :destination_id, :attempt_no, :started_at,
+        :finished_at, :success, :status_code, :response_excerpt, :error,
+        :lost_lease
     )
     """
 )
@@ -209,11 +212,11 @@ ATTEMPT_SQL = text(
 AUDIT_ATTEMPT_SQL = text(
     """
     INSERT INTO delivery_attempts (
-        event_id, destination_id, attempt_no, started_at, finished_at,
-        success, status_code, response_excerpt, error, lost_lease
+        delivery_id, event_id, destination_id, attempt_no, started_at,
+        finished_at, success, status_code, response_excerpt, error, lost_lease
     ) VALUES (
-        :event_id, :destination_id, :attempt_no, :started_at, :finished_at,
-        :success, :status_code, :response_excerpt, :error, TRUE
+        :delivery_id, :event_id, :destination_id, :attempt_no, :started_at,
+        :finished_at, :success, :status_code, :response_excerpt, :error, TRUE
     )
     """
 )
@@ -251,7 +254,7 @@ class LeaseHeartbeat:
         self._stop = threading.Event()
         self._lost = threading.Event()
         self._thread = threading.Thread(
-            target=self._run, name=f"heartbeat-{claim['event_id']}", daemon=True
+            target=self._run, name=f"heartbeat-{claim['delivery_id']}", daemon=True
         )
 
     @property
@@ -279,7 +282,7 @@ class LeaseHeartbeat:
                 updated = db.execute(
                     HEARTBEAT_SQL,
                     {
-                        "event_id": self.claim["event_id"],
+                        "delivery_id": self.claim["delivery_id"],
                         "claim_token": self.claim["claim_token"],
                         "lease_seconds": settings.claim_lease_seconds,
                     },
@@ -287,7 +290,7 @@ class LeaseHeartbeat:
                 db.commit()
                 if updated.rowcount != 1:
                     # Another worker already took the lease over; stop acting
-                    # like we still own this event.
+                    # like we still own this delivery.
                     self._lost.set()
                     return
             except SQLAlchemyError:
@@ -296,8 +299,8 @@ class LeaseHeartbeat:
                 # lease genuinely expires, which is the desired takeover.
                 db.rollback()
                 logger.warning(
-                    "lease heartbeat DB error for event_id=%s; retrying",
-                    self.claim["event_id"],
+                    "lease heartbeat DB error for delivery_id=%s; retrying",
+                    self.claim["delivery_id"],
                 )
             finally:
                 db.close()
@@ -307,21 +310,30 @@ def deliver(
     client: httpx.Client,
     url: str,
     event_id: str,
+    delivery_id: str,
+    event_type: str | None,
+    destination_id: str,
     dedupe_key: str,
     payload: dict[str, Any],
     destination_seq: int,
 ) -> dict[str, Any]:
     body = {
         "event_id": event_id,
-        "dedupe_key": dedupe_key,
+        "delivery_id": delivery_id,
+        "event_type": event_type,
+        "destination_id": destination_id,
         "destination_seq": destination_seq,
+        "dedupe_key": dedupe_key,
         "payload": payload,
     }
     headers = {
         "Content-Type": "application/json",
         "Idempotency-Key": dedupe_key,
         "X-Event-Id": event_id,
+        "X-Delivery-Id": delivery_id,
     }
+    if event_type is not None:
+        headers["X-Event-Type"] = event_type
     started = utc_now()
     try:
         response = client.post(url, json=body, headers=headers)
@@ -352,14 +364,14 @@ def still_owns_lease(db: Session, claim: RowMapping) -> bool:
         text(
             """
             SELECT 1
-            FROM events
-            WHERE id = :event_id
+            FROM deliveries
+            WHERE id = :delivery_id
               AND status = 'in_flight'
               AND claim_token = :claim_token
             """
         ),
         {
-            "event_id": claim["event_id"],
+            "delivery_id": claim["delivery_id"],
             "claim_token": claim["claim_token"],
         },
     ).first()
@@ -374,6 +386,7 @@ def record_result(
 ) -> None:
     lease_lost = lease_lost or not still_owns_lease(db, claim)
     attempt_params = {
+        "delivery_id": claim["delivery_id"],
         "event_id": claim["event_id"],
         "destination_id": claim["destination_id"],
         "attempt_no": claim["attempts"],
@@ -386,16 +399,16 @@ def record_result(
     }
 
     # The lease expired while we were still talking to a slow receiver and
-    # another worker took over. We must not mutate the event/destination
+    # another worker took over. We must not mutate the delivery/destination
     # (those are owned by the new worker); only append an audit row so the
     # duplicate in-flight call stays visible in the trace.
     if lease_lost:
         db.execute(AUDIT_ATTEMPT_SQL, attempt_params)
         db.commit()
         logger.warning(
-            "lease lost for event_id=%s during attempt=%s; result not applied "
+            "lease lost for delivery_id=%s during attempt=%s; result not applied "
             "(success=%s, status_code=%s)",
-            claim["event_id"],
+            claim["delivery_id"],
             claim["attempts"],
             result["success"],
             result["status_code"],
@@ -414,12 +427,12 @@ def record_result(
         updated = db.execute(
             EVENT_SUCCESS_SQL,
             {
-                "event_id": claim["event_id"],
+                "delivery_id": claim["delivery_id"],
                 "claim_token": claim["claim_token"],
             },
         )
         if updated.rowcount != 1:
-            raise StaleClaimError(f"event {claim['event_id']} is no longer owned by this worker")
+            raise StaleClaimError(f"delivery {claim['delivery_id']} is no longer owned by this worker")
         db.execute(
             DESTINATION_SUCCESS_SQL,
             {"destination_id": claim["destination_id"]},
@@ -428,7 +441,7 @@ def record_result(
         updated = db.execute(
             FAILURE_SQL,
             {
-                "event_id": claim["event_id"],
+                "delivery_id": claim["delivery_id"],
                 "claim_token": claim["claim_token"],
                 "error": result["error"],
                 "next_attempt_at": next_attempt_at,
@@ -437,7 +450,7 @@ def record_result(
             },
         )
         if updated.rowcount != 1:
-            raise StaleClaimError(f"event {claim['event_id']} is no longer owned by this worker")
+            raise StaleClaimError(f"delivery {claim['delivery_id']} is no longer owned by this worker")
 
     db.execute(
         ATTEMPT_SQL,
@@ -447,9 +460,9 @@ def record_result(
     db.commit()
     if should_isolate:
         logger.warning(
-            "destination_id=%s isolated after event_id=%s failed %s times",
+            "destination_id=%s isolated after delivery_id=%s failed %s times",
             claim["destination_id"],
-            claim["event_id"],
+            claim["delivery_id"],
             claim["attempts"],
         )
 
@@ -492,6 +505,9 @@ def process_once() -> bool:
             client=get_http_client(),
             url=claim["destination_url"],
             event_id=str(claim["event_id"]),
+            delivery_id=str(claim["delivery_id"]),
+            event_type=claim["event_type"],
+            destination_id=str(claim["destination_id"]),
             dedupe_key=claim["dedupe_key"],
             payload=claim["payload"],
             destination_seq=claim["destination_seq"],
@@ -501,14 +517,16 @@ def process_once() -> bool:
         record_result(db, claim, result, lease_lost=heartbeat.lost)
         if result["success"]:
             logger.info(
-                "delivered event_id=%s destination_id=%s attempt=%s",
+                "delivered delivery_id=%s event_id=%s destination_id=%s attempt=%s",
+                claim["delivery_id"],
                 claim["event_id"],
                 claim["destination_id"],
                 claim["attempts"],
             )
         else:
             logger.warning(
-                "delivery failed event_id=%s destination_id=%s attempt=%s error=%s",
+                "delivery failed delivery_id=%s event_id=%s destination_id=%s attempt=%s error=%s",
+                claim["delivery_id"],
                 claim["event_id"],
                 claim["destination_id"],
                 claim["attempts"],
