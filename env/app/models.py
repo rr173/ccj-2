@@ -42,6 +42,8 @@ SCHEMA_STATEMENTS = [
         event_type TEXT NOT NULL,
         dedupe_key TEXT NOT NULL UNIQUE,
         payload JSONB NOT NULL,
+        not_before TIMESTAMPTZ,
+        cancelled_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
     """,
@@ -63,6 +65,7 @@ SCHEMA_STATEMENTS = [
         claimed_at TIMESTAMPTZ,
         lease_until TIMESTAMPTZ,
         next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        not_before TIMESTAMPTZ,
         last_error TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -75,7 +78,7 @@ SCHEMA_STATEMENTS = [
         requeue_count INTEGER NOT NULL DEFAULT 0,
         UNIQUE (destination_id, destination_seq),
         UNIQUE (destination_id, dedupe_key),
-        CHECK (status IN ('pending', 'in_flight', 'delivered')),
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled')),
         CHECK (attempts >= 0),
         CHECK (destination_seq >= 0),
         CHECK (reconcile_state IN ('none', 'awaiting', 'acknowledged', 'receipt_failed', 'timed_out')),
@@ -207,6 +210,24 @@ SCHEMA_STATEMENTS = [
     """
     CREATE INDEX IF NOT EXISTS receipts_delivery_idx
         ON receipts (delivery_id)
+    """,
+    # Idempotent upgrades for databases created before scheduled delivery
+    # (not_before) and event cancellation.
+    "ALTER TABLE events ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ",
+    "ALTER TABLE events ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS not_before TIMESTAMPTZ",
+    # 'cancelled' is the terminal state of copies belonging to a cancelled
+    # event. Fresh databases get the widened CHECK from CREATE TABLE above;
+    # existing ones need it replaced. The constraint keeps whatever name it
+    # was auto-created with, which is "deliveries_status_check" — or
+    # "events_status_check" on databases whose deliveries table was renamed
+    # from the legacy per-destination "events" table (renames keep
+    # constraint names), so drop both before re-adding.
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_status_check",
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled'))
     """,
 ]
 

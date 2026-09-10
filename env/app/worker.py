@@ -67,7 +67,15 @@ CLAIM_SQL = text(
         LATERAL (
             SELECT e.id AS delivery_id,
                    e.status AS delivery_status,
-                   e.next_attempt_at AS delivery_due_at
+                   -- A copy is due only when both its retry backoff
+                   -- (next_attempt_at) and its scheduled send gate
+                   -- (not_before) have passed. A not-yet-due scheduled copy
+                   -- keeps its queue position: it is the head, so later
+                   -- copies of this destination wait behind it.
+                   GREATEST(
+                       e.next_attempt_at,
+                       COALESCE(e.not_before, '-infinity'::timestamptz)
+                   ) AS delivery_due_at
             FROM deliveries e
             WHERE e.destination_id = d.id
               AND e.status IN ('pending', 'in_flight')
@@ -103,7 +111,7 @@ CLAIM_SQL = text(
             updated_at = now()
         FROM candidate_destination d,
         LATERAL (
-            SELECT id, status, next_attempt_at
+            SELECT id, status, next_attempt_at, not_before
             FROM deliveries
             WHERE destination_id = d.id
               AND status IN ('pending', 'in_flight')
@@ -114,6 +122,7 @@ CLAIM_SQL = text(
         WHERE e.id = picked.id
           AND picked.status = 'pending'
           AND picked.next_attempt_at <= now()
+          AND (picked.not_before IS NULL OR picked.not_before <= now())
         RETURNING
             e.*,
             CASE

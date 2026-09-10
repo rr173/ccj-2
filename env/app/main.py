@@ -19,6 +19,7 @@ from app.schemas import (
     EventBulkRequeueOut,
     EventIn,
     EventOut,
+    EventRescheduleIn,
     EventTraceOut,
     ReceiptIn,
     ReceiptOut,
@@ -36,7 +37,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Event Ingest Service",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
@@ -73,7 +74,9 @@ def destination_response(db: Session, destination: RowMapping) -> dict:
     return result
 
 
-def event_status(delivery_count: int, delivered_count: int) -> str:
+def event_status(cancelled_at, delivery_count: int, delivered_count: int) -> str:
+    if cancelled_at is not None:
+        return "cancelled"
     if delivery_count == 0:
         return "unrouted"
     if delivered_count >= delivery_count:
@@ -92,7 +95,9 @@ def event_reconcile_status(delivery_count: int, acknowledged_count: int) -> str:
 def event_response(event: RowMapping | dict[str, Any]) -> dict:
     result = dict(event)
     result["status"] = event_status(
-        result["delivery_count"], result["delivered_count"]
+        result.get("cancelled_at"),
+        result["delivery_count"],
+        result["delivered_count"],
     )
     result["reconcile_status"] = event_reconcile_status(
         result["delivery_count"], result["acknowledged_count"]
@@ -105,6 +110,7 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
 
 EVENT_WITH_COUNTS_SQL = """
     SELECT e.id, e.event_type, e.dedupe_key, e.payload, e.created_at,
+           e.not_before, e.cancelled_at,
            COUNT(d.id)::int AS delivery_count,
            COUNT(d.id) FILTER (WHERE d.status = 'delivered')::int AS delivered_count,
            COUNT(d.id) FILTER (WHERE d.reconcile_state = 'acknowledged')::int
@@ -188,16 +194,19 @@ def create_event(body: EventIn, db: Session = Depends(get_db)):
     event = db.execute(
         text(
             """
-            INSERT INTO events (event_type, dedupe_key, payload)
-            VALUES (:event_type, :dedupe_key, CAST(:payload AS JSONB))
+            INSERT INTO events (event_type, dedupe_key, payload, not_before)
+            VALUES (:event_type, :dedupe_key, CAST(:payload AS JSONB),
+                    CAST(:not_before AS TIMESTAMPTZ))
             ON CONFLICT (dedupe_key) DO NOTHING
-            RETURNING id, event_type, dedupe_key, payload, created_at
+            RETURNING id, event_type, dedupe_key, payload, not_before,
+                      cancelled_at, created_at
             """
         ),
         {
             "event_type": body.event_type,
             "dedupe_key": body.dedupe_key,
             "payload": payload,
+            "not_before": body.not_before,
         },
     ).mappings().first()
 
@@ -217,7 +226,8 @@ def create_event(body: EventIn, db: Session = Depends(get_db)):
     # its own queued copy with the next per-destination sequence number, so
     # one destination's backlog, retries or isolation never affect the others.
     # Destinations are locked in id order to keep concurrent fan-outs
-    # deadlock-free.
+    # deadlock-free. The schedule gate (not_before) is copied onto every
+    # delivery; each copy keeps its queue position while it waits for its time.
     subscribers = db.execute(
         text(
             """
@@ -242,9 +252,10 @@ def create_event(body: EventIn, db: Session = Depends(get_db)):
                 )
                 INSERT INTO deliveries
                     (event_id, destination_id, event_type, dedupe_key, payload,
-                     destination_seq)
+                     destination_seq, not_before)
                 SELECT :event_id, id, :event_type, :dedupe_key,
-                       CAST(:payload AS JSONB), next_event_seq
+                       CAST(:payload AS JSONB), next_event_seq,
+                       CAST(:not_before AS TIMESTAMPTZ)
                 FROM bumped
                 """
             ),
@@ -254,6 +265,7 @@ def create_event(body: EventIn, db: Session = Depends(get_db)):
                 "event_type": body.event_type,
                 "dedupe_key": body.dedupe_key,
                 "payload": payload,
+                "not_before": body.not_before,
             },
         )
 
@@ -279,9 +291,9 @@ def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
             """
             SELECT d.id, d.event_id, d.destination_id, dest.url AS destination_url,
                    d.destination_seq, d.status, d.attempts, d.next_attempt_at,
-                   d.last_error, d.created_at, d.updated_at, d.delivered_at,
-                   d.reconcile_state, d.reconcile_deadline, d.reconciled_at,
-                   d.receipt_result, d.requeue_count
+                   d.not_before, d.last_error, d.created_at, d.updated_at,
+                   d.delivered_at, d.reconcile_state, d.reconcile_deadline,
+                   d.reconciled_at, d.receipt_result, d.requeue_count
             FROM deliveries d
             JOIN destinations dest ON dest.id = d.destination_id
             WHERE d.event_id = CAST(:event_id AS UUID)
@@ -323,6 +335,152 @@ def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
         "attempts": attempts,
         "receipts": receipts,
     }
+
+
+# --- Cancellation and rescheduling ------------------------------------------
+#
+# Both operations share one rule: once any copy of the event has been handed
+# to a receiver (delivered) or is being handed over right now (in_flight),
+# the event is frozen — what already went out cannot be taken back or moved.
+# While every copy is still queued, cancellation drops them into the terminal
+# 'cancelled' state (the worker never touches those again) and rescheduling
+# rewrites the not_before gate on the queued copies in place, so each copy
+# keeps its original per-destination queue position.
+
+LOCK_EVENT_SQL = """
+    SELECT id, cancelled_at
+    FROM events
+    WHERE id = CAST(:event_id AS UUID)
+    FOR UPDATE
+"""
+
+# Locks every copy that is not yet terminally cancelled, in a stable order.
+# Delivered copies are locked too so a concurrent requeue cannot flip one
+# back to pending in the middle of the decision.
+LOCK_EVENT_DELIVERIES_SQL = """
+    SELECT id, status
+    FROM deliveries
+    WHERE event_id = CAST(:event_id AS UUID)
+      AND status IN ('pending', 'in_flight', 'delivered')
+    ORDER BY destination_id, destination_seq
+    FOR UPDATE
+"""
+
+
+def lock_event(db: Session, event_id: UUID):
+    return db.execute(
+        text(LOCK_EVENT_SQL), {"event_id": str(event_id)}
+    ).mappings().first()
+
+
+def lock_event_deliveries(db: Session, event_id: UUID):
+    return db.execute(
+        text(LOCK_EVENT_DELIVERIES_SQL), {"event_id": str(event_id)}
+    ).mappings().all()
+
+
+def fetch_event_response(db: Session, event_id: UUID) -> dict:
+    row = db.execute(
+        text(EVENT_WITH_COUNTS_SQL.format(where="e.id = CAST(:event_id AS UUID)")),
+        {"event_id": str(event_id)},
+    ).mappings().first()
+    return event_response(row)
+
+
+def event_already_sent(deliveries) -> bool:
+    """True once any copy reached a receiver (or is in flight right now)."""
+    return any(d["status"] in ("in_flight", "delivered") for d in deliveries)
+
+
+@app.post("/v1/events/{event_id}/cancel", response_model=EventOut)
+def cancel_event(event_id: UUID, db: Session = Depends(get_db)):
+    event = lock_event(db, event_id)
+    if event is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="event not found")
+    if event["cancelled_at"] is not None:
+        # Cancelling is idempotent: an already-cancelled event stays cancelled.
+        db.rollback()
+        return fetch_event_response(db, event_id)
+
+    if event_already_sent(lock_event_deliveries(db, event_id)):
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="event has already been sent out and can no longer be cancelled",
+        )
+
+    # Every copy is still queued and now locked by this transaction, so the
+    # worker cannot claim any of them (its SKIP LOCKED pick skips locked
+    # rows). Cancel them all: cancelled is terminal, they will never go out.
+    db.execute(
+        text(
+            """
+            UPDATE deliveries
+            SET status = 'cancelled',
+                updated_at = now()
+            WHERE event_id = CAST(:event_id AS UUID)
+              AND status = 'pending'
+            """
+        ),
+        {"event_id": str(event_id)},
+    )
+    db.execute(
+        text("UPDATE events SET cancelled_at = now() WHERE id = CAST(:event_id AS UUID)"),
+        {"event_id": str(event_id)},
+    )
+    db.commit()
+    return fetch_event_response(db, event_id)
+
+
+@app.post("/v1/events/{event_id}/reschedule", response_model=EventOut)
+def reschedule_event(
+    event_id: UUID, body: EventRescheduleIn, db: Session = Depends(get_db)
+):
+    event = lock_event(db, event_id)
+    if event is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="event not found")
+    if event["cancelled_at"] is not None:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="a cancelled event cannot be rescheduled"
+        )
+
+    if event_already_sent(lock_event_deliveries(db, event_id)):
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="event has already been sent out and can no longer be rescheduled",
+        )
+
+    # Rewrite the gate on the event and on every still-queued copy. The copies
+    # keep their destination_seq, so they rejoin their queues exactly where
+    # they already were — only the earliest send time moves.
+    db.execute(
+        text(
+            """
+            UPDATE events
+            SET not_before = CAST(:not_before AS TIMESTAMPTZ)
+            WHERE id = CAST(:event_id AS UUID)
+            """
+        ),
+        {"event_id": str(event_id), "not_before": body.not_before},
+    )
+    db.execute(
+        text(
+            """
+            UPDATE deliveries
+            SET not_before = CAST(:not_before AS TIMESTAMPTZ),
+                updated_at = now()
+            WHERE event_id = CAST(:event_id AS UUID)
+              AND status = 'pending'
+            """
+        ),
+        {"event_id": str(event_id), "not_before": body.not_before},
+    )
+    db.commit()
+    return fetch_event_response(db, event_id)
 
 
 @app.post(
@@ -562,9 +720,9 @@ def list_reconciliation_deliveries(
             """
             SELECT d.id, d.event_id, d.destination_id, dest.url AS destination_url,
                    d.destination_seq, d.status, d.attempts, d.next_attempt_at,
-                   d.last_error, d.created_at, d.updated_at, d.delivered_at,
-                   d.reconcile_state, d.reconcile_deadline, d.reconciled_at,
-                   d.receipt_result, d.requeue_count
+                   d.not_before, d.last_error, d.created_at, d.updated_at,
+                   d.delivered_at, d.reconcile_state, d.reconcile_deadline,
+                   d.reconciled_at, d.receipt_result, d.requeue_count
             FROM deliveries d
             JOIN destinations dest ON dest.id = d.destination_id
             WHERE d.reconcile_state = :reconcile_state

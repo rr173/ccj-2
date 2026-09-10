@@ -2,7 +2,7 @@
 
 这是一个接收事件、按事件类型分发给订阅地址，把事件按顺序推送到外部 Webhook，并对推送结果做**回执对账**的系统：
 
-- **ingest-api**：登记接收地址（含订阅的事件类型）、接收事件、**接入回执**、查询事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（支持只重投某一笔事件中尚未认的那些副本）。
+- **ingest-api**：登记接收地址（含订阅的事件类型）、接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**接入回执**、查询事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（支持只重投某一笔事件中尚未认的那些副本）。
 - **worker**：负责真正的 HTTP 投递、重试、熔断隔离、崩溃恢复。
 - **reconciler**：独立的对账进程，周期性把超过约定时间仍未收到回执的副本标记为 `timed_out`（可查，不算认）。
 - **PostgreSQL**：作为任务队列和事实来源，用行锁和每地址单调序号保证同一个接收地址严格 FIFO。
@@ -23,11 +23,21 @@
 扇出时，每个地址的副本在该地址行锁内分配 `(destination_id, destination_seq)` 单调递增序号。Worker 每次只选择某地址当前最小的待投递副本，并用 `FOR UPDATE SKIP LOCKED` 锁定该地址：
 
 - 同一个地址同一时刻只会被一个 Worker 线程处理；同一事件的不同地址副本互不等待。
-- Worker 会先检查地址队头：队头投递中、未到下次重试时间或地址隔离时，后续副本不会越过它。
+- Worker 会先检查地址队头：队头投递中、未到下次重试时间、**未到约定外发时间（`not_before`）**或地址隔离时，后续副本不会越过它。
 - Worker 崩溃时，队头会在租约超时后重新变为待投递，然后继续按序处理。
 - 不同接收地址之间互不阻塞，可以并行投递；一个地址被隔离不影响订了同一类型的其他地址。
 
-### 3. 重试与隔离
+### 3. 定时外发、取消与改期
+
+提交事件时可以带 `not_before`（ISO 8601 时间，无时区按 UTC 理解），约定这条事件**最早什么时候才准往外打**：
+
+- **没到点不发出**：扇出时 `not_before` 写到每份副本上，Worker 只领取 `not_before` 已过的副本。没到点的副本就排在它在该地址队列里原来的位置（序号在提交那一刻已分配）等到点，**不会提前打，也不会被后面提交的副本越过**；到点后按该地址原有顺序投递，也不会插到正在投的副本前面。
+- **没到点可以不要**：`POST /v1/events/{event_id}/cancel`。只要还没有任何一份副本打出去（含正在投），取消就成功：所有未投副本置为终态 `cancelled`，**之后任何时候都不会再打出去**，事件状态变为 `cancelled`。重复取消是幂等的。只要已有一份副本投妥或正在投，取消返回 `409`——打出去的收不回来。
+- **没打出去前可以改时间**：`POST /v1/events/{event_id}/reschedule`，body 为 `{"not_before": "..."}`（传 `null` 表示取消定时、轮到就投）。改期只动未投副本的时间门槛，**每份副本在该地址队列里的位置不变**。同样地，只要有一份副本已投妥或正在投，改期返回 `409`——**已经打出去的不能改时间**；已取消的事件也不能再改期。
+- **对账从真正打出去之后才开始算**：`reconcile_deadline` 是在投妥那一刻才写入的（投妥时间 + `RECEIPT_TIMEOUT_SECONDS`）。提交时间、定时等待的时间都不计入倒计时；没到点、未投妥、已取消的副本 `reconcile_state` 一直是 `none`，reconciler 不会扫它们。
+- **没人订的类型照收**：带 `not_before` 的无人订阅事件同样正常接收、持久化，状态 `unrouted`，不会被当成已发出；也可以对它取消或改期（只改事件记录，本来就没有副本）。
+
+### 4. 重试与隔离
 
 - 非 2xx 响应、连接失败、超时等都算投递失败。
 - 使用指数退避并加入随机抖动：约为 `2s, 4s, 8s, ...`，最大 1 小时。
@@ -36,7 +46,7 @@
 - 隔离时间结束后，Worker 会自动将地址恢复为 `active`，并从尚未成功的最小序号副本继续投递。
 - 也可以调用管理 API 立即人工恢复。
 
-### 4. 去重与“接收方只处理一次”
+### 5. 去重与“接收方只处理一次”
 
 事件必须带 `dedupe_key`，全局唯一：
 
@@ -48,7 +58,7 @@
   - `X-Delivery-Id: <delivery_id>`
 - 投递采用至少一次语义：Worker 崩溃或网络超时时可能重复发送。接收方必须使用 `Idempotency-Key` 做幂等处理，从而做到业务效果只处理一次。
 
-### 5. Worker 崩溃恢复（租约 + 心跳）
+### 6. Worker 崩溃恢复（租约 + 心跳）
 
 副本被领取后进入 `in_flight`，记录 `claim_token`、`claimed_at` 和 `lease_until`。投递期间，Worker 会用后台心跳线程按 `LEASE_HEARTBEAT_SECONDS`（默认 15 秒）把 `lease_until` 向后延长一个租约窗口（默认 60 秒）：
 
@@ -58,11 +68,11 @@
 
 这样“慢响应”和“真宕机”被区分开：慢不会导致重复外发，宕机仍能从未成功处续投。
 
-### 6. 回执对账
+### 7. 回执对账
 
 HTTP 投递拿到 2xx 只说明“打出去了”，不代表对方处理完了。对账语义：
 
-- 副本投妥后进入 `awaiting` 对账状态，并写入约定对账时限 `reconcile_deadline`（投妥时间 + `RECEIPT_TIMEOUT_SECONDS`，默认 300 秒）。
+- 副本投妥后进入 `awaiting` 对账状态，并写入约定对账时限 `reconcile_deadline`（**投妥时间** + `RECEIPT_TIMEOUT_SECONDS`，默认 300 秒）。对账倒计时从真正打出去那一刻才开始算：事件提交时间、`not_before` 定时等待的时间都不计入；还在排队等定时、等待重试或已取消的副本 `reconcile_state` 为 `none`，没有任何倒计时。
 - 接收方处理完后回调 `POST /v1/receipts`，带上它拿到的 `destination_id`、`dedupe_key` 和处理结果 `result`（`success` / `failure`）。系统按 `(destination_id, dedupe_key)` 定位唯一副本：
   - 在时限内匹配上 → 副本记为 `acknowledged`（result=success）或 `receipt_failed`（result=failure），这才算**对方认了**；
   - 时限内没等到 → reconciler 把副本标记为 `timed_out`。**超时不是认**，可以通过对账查询接口全部查出来；
@@ -168,15 +178,46 @@ curl -s http://localhost:8000/v1/events \
   }'
 ```
 
+约定最早外发时间（可选；没到点不会打出去，到点后按各地址原队列顺序投）：
+
+```bash
+curl -s http://localhost:8000/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "event_type": "paid",
+    "dedupe_key": "order-1002-paid",
+    "not_before": "2026-09-10T08:00:00Z",
+    "payload": {
+      "order_id": "1002",
+      "event_type": "paid"
+    }
+  }'
+```
+
 响应中包含：
 
 - `id`：事件 ID
 - `event_type` / `dedupe_key` / `payload`：事件本体
-- `status`：`unrouted`（没有地址订该类型）、`pending`（至少一份副本未投完）、`delivered`（全部副本已收到传输层 2xx，但不一定已对上回执）
+- `not_before`：约定的最早外发时间（未定时为 `null`）；`cancelled_at`：取消时间（未取消为 `null`）
+- `status`：`unrouted`（没有地址订该类型）、`pending`（至少一份副本未投完）、`delivered`（全部副本已收到传输层 2xx，但不一定已对上回执）、`cancelled`（未打出前已取消，剩余副本永不再投）
 - `reconcile_status`：`pending`（还没有副本认）、`partially_acknowledged`（只认了一部分）、`acknowledged`（所有订阅地址的副本都认了）
 - `delivery_count` / `delivered_count`：扇出副本总数 / 已投妥数
 - `acknowledged_count` / `unacknowledged_count`：已对上成功回执的份数 / 还没对上的份数
 - `duplicate`：是否命中去重并返回已有事件
+
+### 取消与改期（仅在任何副本打出之前可用）
+
+```bash
+# 没到点不想要了：所有未投副本置为终态 cancelled，永不再投；重复调用幂等
+curl -s -X POST http://localhost:8000/v1/events/<event_id>/cancel
+
+# 改时间：只动未投副本的时间门槛，队列位置不变；传 null 表示取消定时、轮到就投
+curl -s -X POST http://localhost:8000/v1/events/<event_id>/reschedule \
+  -H 'Content-Type: application/json' \
+  -d '{"not_before": "2026-09-10T10:00:00Z"}'
+```
+
+只要已有一份副本投妥或正在投，这两个接口都返回 `409`——已经打出去的不能取消、也不能改时间；已取消的事件再改期同样返回 `409`。
 
 ### 查询某条事件的投递过程
 
@@ -335,9 +376,9 @@ python3 scripts/mock_receiver.py --port 9000 \
 
 ## 数据表概览
 
-- `events`：事件本体（类型、去重键、负载），一条事件一行，与地址无关。
+- `events`：事件本体（类型、去重键、负载、最早外发时间 `not_before`、取消时间 `cancelled_at`），一条事件一行，与地址无关。
 - `destination_subscriptions`：地址订阅的事件类型集合。
-- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态、下次尝试时间、租约信息和对账状态（`reconcile_state`、对账时限、回执结果、重投次数）；Worker 只消费这张表。
+- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled`）、下次尝试时间、最早外发时间 `not_before`、租约信息和对账状态（`reconcile_state`、对账时限、回执结果、重投次数）；Worker 只消费这张表。
 - `delivery_attempts`：每次 HTTP 投递尝试的审计轨迹（关联事件与副本）。
 - `receipts`：接收方回执日志，一条回执一行，含处置结果（`applied`/`duplicate`/`late`/`orphan`/`premature`）与匹配到的副本；重复、迟到、查无副本的回执都留在这里可查。
 - `destinations`：接收地址、状态、连续失败次数、隔离可恢复时间、该地址下一个序号。

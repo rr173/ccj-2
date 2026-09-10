@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID
 
@@ -6,6 +6,15 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 MAX_EVENT_TYPE_LENGTH = 128
 MAX_EVENT_TYPES_PER_DESTINATION = 100
+
+
+def _normalize_optional_datetime(value: datetime | None) -> datetime | None:
+    """Naive timestamps are interpreted as UTC."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
 
 
 def _normalize_event_type(value: str) -> str:
@@ -59,11 +68,30 @@ class EventIn(BaseModel):
     event_type: str
     dedupe_key: str = Field(..., min_length=1, max_length=256)
     payload: dict[str, Any]
+    # Earliest time the event may be sent out. None means "as soon as its
+    # per-destination queue position is reached".
+    not_before: datetime | None = None
 
     @field_validator("event_type")
     @classmethod
     def normalize_event_type(cls, value: str) -> str:
         return _normalize_event_type(value)
+
+    @field_validator("not_before")
+    @classmethod
+    def normalize_not_before(cls, value: datetime | None) -> datetime | None:
+        return _normalize_optional_datetime(value)
+
+
+class EventRescheduleIn(BaseModel):
+    # New earliest send time. Null clears the schedule, so the event goes out
+    # as soon as its per-destination queue position allows.
+    not_before: datetime | None = None
+
+    @field_validator("not_before")
+    @classmethod
+    def normalize_not_before(cls, value: datetime | None) -> datetime | None:
+        return _normalize_optional_datetime(value)
 
 
 class EventOut(BaseModel):
@@ -74,7 +102,9 @@ class EventOut(BaseModel):
     # Transport state:
     # unrouted: no destination subscribed to this type at ingest time;
     # pending: at least one delivery is still undelivered;
-    # delivered: every delivery created for this event got a transport 2xx.
+    # delivered: every delivery created for this event got a transport 2xx;
+    # cancelled: the event was cancelled before anything was sent; its
+    # remaining copies will never go out.
     status: str
     # Whole-event receipt state. Only success receipts on every fanned-out copy
     # make the whole event acknowledged:
@@ -88,6 +118,10 @@ class EventOut(BaseModel):
     acknowledged_count: int = 0
     # Copies still awaiting, transport-failed/pending, receipt-failed or timed out.
     unacknowledged_count: int = 0
+    # Scheduled send gate copied onto every fanned-out copy; null = send as
+    # soon as the per-destination queue reaches it.
+    not_before: datetime | None = None
+    cancelled_at: datetime | None = None
     created_at: datetime
     duplicate: bool = False
 
@@ -98,9 +132,14 @@ class DeliveryOut(BaseModel):
     destination_id: UUID
     destination_url: str | None = None
     destination_seq: int
+    # pending: queued (possibly waiting for not_before); in_flight: being
+    # delivered right now; delivered: transport 2xx; cancelled: the event was
+    # cancelled before this copy went out — terminal, it will never be sent.
     status: str
     attempts: int
     next_attempt_at: datetime
+    # Earliest time this copy may be sent; null = no schedule gate.
+    not_before: datetime | None = None
     last_error: str | None = None
     created_at: datetime
     updated_at: datetime
