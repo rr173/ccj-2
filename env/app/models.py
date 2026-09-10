@@ -101,6 +101,69 @@ SCHEMA_STATEMENTS = [
         CHECK (disposition IN ('applied', 'duplicate', 'late', 'orphan', 'premature'))
     )
     """,
+    # One row per registered external system allowed to push events in. The
+    # secret authenticates that system's events (HMAC signature); rotating it
+    # overwrites secret_hmac so old signatures stop matching immediately.
+    # disabled_at freezes admission: new events from the source are rejected,
+    # while events already accepted keep draining through their queues.
+    """
+    CREATE TABLE IF NOT EXISTS event_sources (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name TEXT NOT NULL UNIQUE,
+        secret TEXT NOT NULL,
+        key_rotated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        disabled_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    # One row per inbound event attempt, including every rejected one. A
+    # rejected event is visible here with an explicit disposition; it never
+    # creates an event/delivery row, so it can never be reported as accepted
+    # or sent out. accepted rows link to the event they produced.
+    """
+    CREATE TABLE IF NOT EXISTS ingestion_attempts (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        -- No FK: a rejected attempt may name a source id that was never
+        -- registered, and it must still be recorded as source_unknown.
+        source_id UUID,
+        source_name TEXT,
+        event_id UUID REFERENCES events(id),
+        dedupe_key TEXT,
+        event_type TEXT,
+        signed_at TIMESTAMPTZ,
+        disposition TEXT NOT NULL,
+        reason TEXT,
+        remote_addr TEXT,
+        received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CHECK (disposition IN (
+            'accepted',
+            'unrouted',
+            'duplicate',
+            'source_unknown',
+            'source_disabled',
+            'bad_signature',
+            'stale_timestamp',
+            'future_timestamp',
+            'invalid_timestamp',
+            'invalid_body'
+        ))
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ingestion_attempts_received_idx
+        ON ingestion_attempts (received_at DESC, id DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ingestion_attempts_disposition_idx
+        ON ingestion_attempts (disposition, received_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ingestion_attempts_source_idx
+        ON ingestion_attempts (source_id, received_at DESC)
+    """,
+    # ingestion_attempts.source_id must stay FK-free so attempts from
+    # unregistered source ids can be recorded.
+    "ALTER TABLE ingestion_attempts DROP CONSTRAINT IF EXISTS ingestion_attempts_source_id_fkey",
     """
     CREATE TABLE IF NOT EXISTS destination_subscriptions (
         destination_id UUID NOT NULL REFERENCES destinations(id) ON DELETE CASCADE,
@@ -228,6 +291,26 @@ SCHEMA_STATEMENTS = [
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
         CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled'))
+    """,
+    # Idempotent upgrades for databases created before inbound source auth.
+    # Every newly accepted event belongs to the registered source that pushed
+    # it; the column is nullable so pre-upgrade events remain valid.
+    "ALTER TABLE events ADD COLUMN IF NOT EXISTS source_id UUID",
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.table_constraints
+            WHERE constraint_name = 'events_source_id_fkey'
+        ) THEN
+            ALTER TABLE events
+                ADD CONSTRAINT events_source_id_fkey
+                FOREIGN KEY (source_id) REFERENCES event_sources(id);
+        END IF;
+    END $$
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS events_source_idx ON events (source_id)
     """,
 ]
 

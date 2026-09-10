@@ -3,12 +3,25 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
 
 from app.db import engine, get_db
+from app.ingest_auth import (
+    ACCEPTED,
+    DUPLICATE,
+    INVALID_BODY,
+    SOURCE_DISABLED,
+    UNROUTED,
+    AdmissionError,
+    authenticate,
+    generate_secret,
+    log_attempt,
+    parse_event_body,
+)
 from app.models import init_db
 from app.receipts import ingest_receipt
 from app.schemas import (
@@ -21,11 +34,16 @@ from app.schemas import (
     EventOut,
     EventRescheduleIn,
     EventTraceOut,
+    IngestionAttemptOut,
     ReceiptIn,
     ReceiptOut,
     ReconciliationSummaryOut,
     RecoveryOut,
     RequeueOut,
+    SourceCreatedOut,
+    SourceIn,
+    SourceOut,
+    SourceRotatedOut,
 )
 
 
@@ -37,7 +55,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Event Ingest Service",
-    version="2.2.0",
+    version="2.3.0",
     lifespan=lifespan,
 )
 
@@ -109,7 +127,7 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
 
 
 EVENT_WITH_COUNTS_SQL = """
-    SELECT e.id, e.event_type, e.dedupe_key, e.payload, e.created_at,
+    SELECT e.id, e.source_id, e.event_type, e.dedupe_key, e.payload, e.created_at,
            e.not_before, e.cancelled_at,
            COUNT(d.id)::int AS delivery_count,
            COUNT(d.id) FILTER (WHERE d.status = 'delivered')::int AS delivered_count,
@@ -188,21 +206,239 @@ def get_destination(destination_id: UUID, db: Session = Depends(get_db)):
     return destination_response(db, destination)
 
 
+# --- Inbound event sources: registration, rotation, enable/disable ----------
+
+SOURCE_COLUMNS_SQL = (
+    "id, name, secret, disabled_at, key_rotated_at, created_at"
+)
+
+
+def source_response(row: RowMapping, *, include_secret: bool) -> dict:
+    result = dict(row)
+    result["status"] = "disabled" if result.get("disabled_at") else "active"
+    if not include_secret:
+        result.pop("secret", None)
+    return result
+
+
+@app.post(
+    "/v1/sources",
+    response_model=SourceCreatedOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def register_source(body: SourceIn, db: Session = Depends(get_db)):
+    # The secret is generated server side and returned exactly once; later
+    # endpoints never expose it.
+    source = db.execute(
+        text(
+            """
+            INSERT INTO event_sources (name, secret)
+            VALUES (:name, :secret)
+            ON CONFLICT (name) DO NOTHING
+            RETURNING """
+            + SOURCE_COLUMNS_SQL
+        ),
+        {"name": body.name, "secret": generate_secret()},
+    ).mappings().first()
+    if source is None:
+        db.rollback()
+        existing = db.execute(
+            text("SELECT " + SOURCE_COLUMNS_SQL + " FROM event_sources WHERE name = :name"),
+            {"name": body.name},
+        ).mappings().first()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "source name already registered",
+                "source_id": str(existing["id"]),
+                "hint": "rotate the secret or disable the source instead",
+            },
+        )
+    result = source_response(source, include_secret=True)
+    db.commit()
+    return result
+
+
+def _fetch_source(db: Session, source_id: UUID, *, for_update: bool = False):
+    return db.execute(
+        text(
+            "SELECT "
+            + SOURCE_COLUMNS_SQL
+            + " FROM event_sources WHERE id = CAST(:source_id AS UUID)"
+            + (" FOR UPDATE" if for_update else "")
+        ),
+        {"source_id": str(source_id)},
+    ).mappings().first()
+
+
+@app.get("/v1/sources", response_model=list[SourceOut])
+def list_sources(
+    include_disabled: bool = True,
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    rows = db.execute(
+        text(
+            f"""
+            SELECT {SOURCE_COLUMNS_SQL}
+            FROM event_sources
+            WHERE (:include_disabled OR disabled_at IS NULL)
+            ORDER BY created_at ASC, id ASC
+            LIMIT :limit
+            """
+        ),
+        {"include_disabled": include_disabled, "limit": limit},
+    ).mappings().all()
+    return [source_response(row, include_secret=False) for row in rows]
+
+
+@app.get("/v1/sources/{source_id}", response_model=SourceOut)
+def get_source(source_id: UUID, db: Session = Depends(get_db)):
+    source = _fetch_source(db, source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="source not found")
+    return source_response(source, include_secret=False)
+
+
+@app.post("/v1/sources/{source_id}/rotate-key", response_model=SourceRotatedOut)
+def rotate_source_key(source_id: UUID, db: Session = Depends(get_db)):
+    # Overwrite the only secret the verifier checks. The old secret is not
+    # retained, so events still signed with it fail signature verification
+    # and are rejected from this same instant on.
+    source = _fetch_source(db, source_id, for_update=True)
+    if source is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="source not found")
+    previous_rotated_at = source["key_rotated_at"]
+    rotated = db.execute(
+        text(
+            """
+            UPDATE event_sources
+            SET secret = :secret, key_rotated_at = now()
+            WHERE id = CAST(:source_id AS UUID)
+            RETURNING """
+            + SOURCE_COLUMNS_SQL
+        ),
+        {"secret": generate_secret(), "source_id": str(source_id)},
+    ).mappings().one()
+    result = source_response(rotated, include_secret=True)
+    db.commit()
+    return {"source": result, "previous_key_rotated_at": previous_rotated_at}
+
+
+@app.post("/v1/sources/{source_id}/disable", response_model=SourceOut)
+def disable_source(source_id: UUID, db: Session = Depends(get_db)):
+    # Admission stops for new events; deliveries of already-accepted events are
+    # rows in the queues and are never touched here, so they keep draining.
+    source = db.execute(
+        text(
+            """
+            UPDATE event_sources
+            SET disabled_at = COALESCE(disabled_at, now())
+            WHERE id = CAST(:source_id AS UUID)
+            RETURNING """
+            + SOURCE_COLUMNS_SQL
+        ),
+        {"source_id": str(source_id)},
+    ).mappings().first()
+    if source is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="source not found")
+    db.commit()
+    return source_response(source, include_secret=False)
+
+
+@app.post("/v1/sources/{source_id}/enable", response_model=SourceOut)
+def enable_source(source_id: UUID, db: Session = Depends(get_db)):
+    source = db.execute(
+        text(
+            """
+            UPDATE event_sources
+            SET disabled_at = NULL
+            WHERE id = CAST(:source_id AS UUID)
+            RETURNING """
+            + SOURCE_COLUMNS_SQL
+        ),
+        {"source_id": str(source_id)},
+    ).mappings().first()
+    if source is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="source not found")
+    db.commit()
+    return source_response(source, include_secret=False)
+
+
 @app.post("/v1/events", response_model=EventOut, status_code=status.HTTP_201_CREATED)
-def create_event(body: EventIn, db: Session = Depends(get_db)):
+async def create_event(request: Request, response: Response, db: Session = Depends(get_db)):
+    # Authenticate against the exact raw bytes before they are parsed, so the
+    # signature covers precisely what the sender signed. This and the blocking
+    # DB work run in a worker thread to avoid stalling the event loop.
+    body = await request.body()
+
+    def handle() -> tuple[dict, int]:
+        source = authenticate(
+            db,
+            source_id_header=request.headers.get("X-Source-Id"),
+            signed_at_header=request.headers.get("X-Signed-At"),
+            signature_header=request.headers.get("X-Signature"),
+            body=body,
+            remote_addr=request.client.host if request.client else None,
+        )
+        parsed = parse_event_body(
+            db,
+            body,
+            source=source,
+            signed_at=source["signed_at"],
+            remote_addr=request.client.host if request.client else None,
+        )
+        try:
+            event_body = EventIn.model_validate(parsed)
+        except Exception as exc:
+            # Authenticated sender, malformed event: refuse it and keep the
+            # rejection visible; no event row is created.
+            log_attempt(
+                db,
+                disposition=INVALID_BODY,
+                source_id=str(source["id"]),
+                source_name=source["name"],
+                dedupe_key=parsed.get("dedupe_key") if isinstance(parsed, dict) else None,
+                event_type=parsed.get("event_type") if isinstance(parsed, dict) else None,
+                signed_at=source["signed_at"],
+                reason=f"event failed schema validation: {str(exc)[:500]}",
+                remote_addr=request.client.host if request.client else None,
+                commit=True,
+            )
+            raise AdmissionError(422, INVALID_BODY, "event failed schema validation")
+        return store_event(db, event_body, source)
+
+    try:
+        result, code = await run_in_threadpool(handle)
+    except AdmissionError as exc:
+        # Every rejection was already written to ingestion_attempts by the
+        # admission layer; nothing was ever inserted as an event.
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"error": exc.reason, "disposition": exc.disposition},
+        )
+    response.status_code = code
+    return result
+
+
+def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     payload = json.dumps(body.payload)
     event = db.execute(
         text(
             """
-            INSERT INTO events (event_type, dedupe_key, payload, not_before)
-            VALUES (:event_type, :dedupe_key, CAST(:payload AS JSONB),
-                    CAST(:not_before AS TIMESTAMPTZ))
+            INSERT INTO events (source_id, event_type, dedupe_key, payload, not_before)
+            VALUES (CAST(:source_id AS UUID), :event_type, :dedupe_key,
+                    CAST(:payload AS JSONB), CAST(:not_before AS TIMESTAMPTZ))
             ON CONFLICT (dedupe_key) DO NOTHING
-            RETURNING id, event_type, dedupe_key, payload, not_before,
+            RETURNING id, source_id, event_type, dedupe_key, payload, not_before,
                       cancelled_at, created_at
             """
         ),
         {
+            "source_id": str(source["id"]),
             "event_type": body.event_type,
             "dedupe_key": body.dedupe_key,
             "payload": payload,
@@ -211,16 +447,32 @@ def create_event(body: EventIn, db: Session = Depends(get_db)):
     ).mappings().first()
 
     if event is None:
+        # Same dedupe_key pushed again — even from the same source. It must not
+        # become a new event and must not fan out a second time. Record the
+        # refusal and return the original event marked as a duplicate.
         existing = db.execute(
             text(EVENT_WITH_COUNTS_SQL.format(where="e.dedupe_key = :dedupe_key")),
             {"dedupe_key": body.dedupe_key},
         ).mappings().first()
-        db.rollback()
         if existing is None:  # pragma: no cover - cannot happen after a conflict
+            db.rollback()
             raise HTTPException(status_code=500, detail="event insert conflict lost")
+        signed_at = source["signed_at"]
+        log_attempt(
+            db,
+            disposition=DUPLICATE,
+            source_id=str(source["id"]),
+            source_name=source["name"],
+            event_id=str(existing["id"]),
+            dedupe_key=body.dedupe_key,
+            event_type=body.event_type,
+            signed_at=signed_at,
+            reason="dedupe_key already ingested; no new event or deliveries created",
+        )
+        db.commit()
         result = event_response(existing)
         result["duplicate"] = True
-        return result
+        return result, 200
 
     # Fan out to the destinations subscribed to this type right now. Each gets
     # its own queued copy with the next per-destination sequence number, so
@@ -269,12 +521,26 @@ def create_event(body: EventIn, db: Session = Depends(get_db)):
             },
         )
 
+    signed_at = source["signed_at"]
+    # No subscribers: still accepted and persisted (the event is "unrouted"),
+    # but the disposition makes explicit that nothing was sent out.
+    disposition = UNROUTED if not subscribers else ACCEPTED
+    log_attempt(
+        db,
+        disposition=disposition,
+        source_id=str(source["id"]),
+        source_name=source["name"],
+        event_id=str(event["id"]),
+        dedupe_key=body.dedupe_key,
+        event_type=body.event_type,
+        signed_at=signed_at,
+    )
     db.commit()
     result = dict(event)
     result["delivery_count"] = len(subscribers)
     result["delivered_count"] = 0
     result["acknowledged_count"] = 0
-    return event_response(result)
+    return event_response(result), 201
 
 
 @app.get("/v1/events/{event_id}/trace", response_model=EventTraceOut)
@@ -600,9 +866,79 @@ def recover_destination(destination_id: UUID, db: Session = Depends(get_db)):
     }
 
 
+# --- Inbound admission log --------------------------------------------------
+
+INGESTION_DISPOSITIONS = (
+    ACCEPTED,
+    UNROUTED,
+    DUPLICATE,
+    "source_unknown",
+    SOURCE_DISABLED,
+    "bad_signature",
+    "stale_timestamp",
+    "future_timestamp",
+    "invalid_timestamp",
+    INVALID_BODY,
+)
+
+
+@app.get("/v1/ingestion/attempts", response_model=list[IngestionAttemptOut])
+def list_ingestion_attempts(
+    source_id: UUID | None = None,
+    disposition: str | None = None,
+    dedupe_key: str | None = None,
+    rejected_only: bool = False,
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    # Every push is visible here — including the ones turned away at entry —
+    # so a rejected event can always be audited instead of silently dropped.
+    if disposition is not None and disposition not in INGESTION_DISPOSITIONS:
+        raise HTTPException(status_code=422, detail="invalid disposition")
+    rejected_list = "','".join(
+        (
+            "source_unknown",
+            SOURCE_DISABLED,
+            "bad_signature",
+            "stale_timestamp",
+            "future_timestamp",
+            "invalid_timestamp",
+            INVALID_BODY,
+            DUPLICATE,
+        )
+    )
+    return db.execute(
+        text(
+            f"""
+            SELECT id, source_id, source_name, event_id, dedupe_key, event_type,
+                   signed_at, disposition, reason, remote_addr, received_at
+            FROM ingestion_attempts
+            WHERE (CAST(:source_id AS UUID) IS NULL
+                   OR source_id = CAST(:source_id AS UUID))
+              AND (CAST(:disposition AS TEXT) IS NULL
+                   OR disposition = CAST(:disposition AS TEXT))
+              AND (CAST(:dedupe_key AS TEXT) IS NULL
+                   OR dedupe_key = CAST(:dedupe_key AS TEXT))
+              AND (NOT :rejected_only
+                   OR disposition IN ('{rejected_list}'))
+            ORDER BY received_at DESC, id DESC
+            LIMIT :limit
+            """
+        ),
+        {
+            "source_id": str(source_id) if source_id else None,
+            "disposition": disposition,
+            "dedupe_key": dedupe_key,
+            "rejected_only": rejected_only,
+            "limit": limit,
+        },
+    ).mappings().all()
+
+
 # --- Receipt ingestion and reconciliation ---------------------------------
 
 RECONCILE_STATES = ("awaiting", "acknowledged", "receipt_failed", "timed_out")
+
 
 # Only copies whose transport finished but were never acknowledged inside the
 # agreed window may be sent back out. They keep their original destination_seq,

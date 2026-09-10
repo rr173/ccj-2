@@ -2,7 +2,7 @@
 
 这是一个接收事件、按事件类型分发给订阅地址，把事件按顺序推送到外部 Webhook，并对推送结果做**回执对账**的系统：
 
-- **ingest-api**：登记接收地址（含订阅的事件类型）、接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**接入回执**、查询事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（支持只重投某一笔事件中尚未认的那些副本）。
+- **ingest-api**：登记**事件来源**（发放只属于它的签名密钥、可停用/可换钥）、登记接收地址（含订阅的事件类型）、**验签 + 发送时间校验后**接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**接入回执**、查询**入口准入记录（含每一条被拒事件）**、事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（支持只重投某一笔事件中尚未认的那些副本）。
 - **worker**：负责真正的 HTTP 投递、重试、熔断隔离、崩溃恢复。
 - **reconciler**：独立的对账进程，周期性把超过约定时间仍未收到回执的副本标记为 `timed_out`（可查，不算认）。
 - **PostgreSQL**：作为任务队列和事实来源，用行锁和每地址单调序号保证同一个接收地址严格 FIFO。
@@ -10,6 +10,40 @@
 前三个服务使用同一个镜像但启动命令不同，可以独立水平扩缩：回执接入（在 ingest-api 里）和对账（reconciler）都不在外发 worker 进程内，两边互不影响。
 
 ## 关键语义
+
+### 0. 来源登记、密钥签名与准入（入口）
+
+外部系统要往这里丢事件，得先登记来源并拿到一把只属于它的密钥：
+
+- `POST /v1/sources`，body 为 `{"name": "<唯一名称>"}`。返回 `id` 和一次性展示的 `secret`——之后再查（`GET /v1/sources[/{id}]`）不会再返回密钥，请当场保存。
+- 每次提交事件都必须带头：
+  - `X-Source-Id`：登记时拿到的来源 id；
+  - `X-Signed-At`：**发送时刻**的 Unix 秒级时间戳；
+  - `X-Signature`：`hex(HMAC_SHA256(secret, "<X-Signed-At>." + 原始请求体))`（可选 `sha256=` 前缀）。签名覆盖的是未经解析的原始字节，用常量时间比较。
+- 可以用 `python3 scripts/push_event.py --register <name>` 登记，用 `python3 scripts/push_event.py --source-id ... --secret ... ...` 签名发送。
+
+**对不上、太旧、重复，都不能收成新事件，并且能查到被拒了：**
+
+| 情况 | HTTP | 准入记录 disposition |
+|---|---:|---|
+| 没带/乱填来源 id、来源没登记 | 401 | `source_unknown` |
+| 没带签名，或签名和该来源密钥对不上（报文被改也算） | 401 | `bad_signature` |
+| `X-Signed-At` 不是数字时间戳 | 401 | `invalid_timestamp` |
+| 发送时间旧于 `INGEST_MAX_AGE_SECONDS`（默认 300 秒，防重放） | 401 | `stale_timestamp` |
+| 发送时间超前于服务时钟 `INGEST_MAX_FUTURE_SKEW_SECONDS`（默认 60 秒） | 401 | `future_timestamp` |
+| 来源已停用 | 403 | `source_disabled` |
+| 报文不是合法 JSON / 不符事件 schema | 422 | `invalid_body` |
+| 同一 `dedupe_key` 再送一次（即便换一个来源送） | 200 | `duplicate`（返回原事件，`duplicate: true`，不新建事件、不二次扇出） |
+
+- **每一次入口尝试都落 `ingestion_attempts` 表**，包括所有被拒的。用 `GET /v1/ingestion/attempts?rejected_only=true` 或按 `source_id` / `disposition` / `dedupe_key` 过滤即可查到"谁、什么时间、因为什么被拒"。被拒记录的 `event_id` 为空——它从未成为事件，轨迹/对账里绝不会把它写成"已收下/已发出"。
+- 错误响应形如 `{"detail": {"error": "...", "disposition": "bad_signature"}}`，与日志中的处置一一对应。
+
+**对上密钥且时间新鲜的，才按现在的类型分发（见第 1 节）**。几个边界：
+
+- **没人订的类型对上了也要照收**：事件正常持久化，状态 `unrouted`，准入记录为 `unrouted`；不会投出任何副本，也不会写成已发出。之后补订只对新事件生效。
+- **停用来源只关入口**：`POST /v1/sources/{id}/disable` 之后，新来的事件一律 `source_disabled` 拒收；**已经收下、已经排进各地址队列的副本不受影响，继续按原队列往外打，不会被从队列里拿掉**。`POST .../enable` 可恢复。
+- **换密钥后只认新的**：`POST /v1/sources/{id}/rotate-key` 当场覆盖密钥并返回新 `secret`（旧密钥不保留）。换钥后拿旧密钥签的事件立即 `bad_signature` 被拒，不需要重启或等待。
+- 事件记录带 `source_id`，事件响应和 trace 里可查它来自哪个来源。
 
 ### 1. 按事件类型分发（发布/订阅）
 
@@ -136,6 +170,60 @@ API 也可以独立增加副本，但 Compose 文件中默认将 API 的 8000 �
 
 ## API 示例
 
+### 登记事件来源并取得密钥（入口鉴权）
+
+```bash
+curl -s http://localhost:8000/v1/sources \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"billing-system"}'
+```
+
+返回示例（`secret` **只在登记和换钥时返回这一次**，请立即保存）：
+
+```json
+{
+  "id": "7a2c...",
+  "name": "billing-system",
+  "status": "active",
+  "disabled_at": null,
+  "key_rotated_at": "2026-09-10T06:00:00Z",
+  "created_at": "2026-09-10T06:00:00Z",
+  "secret": "A1b2...只显示这一次"
+}
+```
+
+停用/恢复/换钥，以及查询入口准入记录：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/sources/7a2c.../disable     # 只关入口
+curl -s -X POST http://localhost:8000/v1/sources/7a2c.../enable      # 恢复
+curl -s -X POST http://localhost:8000/v1/sources/7a2c.../rotate-key  # 旧密钥立即失效
+curl -s 'http://localhost:8000/v1/ingestion/attempts?rejected_only=true'
+```
+
+提交事件时必须用来源密钥对 `<发送时间戳>.<原始报文>` 做 HMAC-SHA256，并带三个头。手工签名示例：
+
+```bash
+SECRET='A1b2...'; SOURCE='7a2c...'
+BODY='{"event_type":"paid","dedupe_key":"order-1001-paid","payload":{"order_id":"1001"}}'
+TS=$(date +%s)
+SIG=$(printf '%s' "$TS.$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | awk '{print $2}')
+curl -s http://localhost:8000/v1/events \
+  -H 'Content-Type: application/json' \
+  -H "X-Source-Id: $SOURCE" -H "X-Signed-At: $TS" -H "X-Signature: $SIG" \
+  -d "$BODY"
+```
+
+或直接用辅助脚本（密钥也可用 `EVENT_SOURCE_SECRET` 环境变量传入）：
+
+```bash
+python3 scripts/push_event.py --register billing
+python3 scripts/push_event.py --source-id 7a2c... --secret "$SECRET" \
+  --event-type paid --dedupe-key order-1001-paid --payload '{"order_id":"1001"}'
+```
+
+对不上密钥、发送时间太旧/太超前、来源已停用、同一 `dedupe_key` 重放，都不会成为新事件；都会带相应 `disposition` 出现在 `/v1/ingestion/attempts` 中。
+
 ### 登记接收地址并声明订阅的事件类型
 
 ```bash
@@ -165,25 +253,23 @@ curl -s http://localhost:8000/v1/destinations \
 
 ### 提交事件
 
-```bash
-curl -s http://localhost:8000/v1/events \
-  -H 'Content-Type: application/json' \
-  -d '{
+> 下面只列 body 字段。`POST /v1/events` 现在**必须**带来源签名头（`X-Source-Id` / `X-Signed-At` / `X-Signature`），完整签名请求见上方"登记事件来源并取得密钥"或 `scripts/push_event.py`；不签名会以 `source_unknown` / `bad_signature` 被拒。
+
+```
+body: {
     "event_type": "paid",
     "dedupe_key": "order-1001-paid",
     "payload": {
       "order_id": "1001",
       "event_type": "paid"
     }
-  }'
+  }
 ```
 
 约定最早外发时间（可选；没到点不会打出去，到点后按各地址原队列顺序投）：
 
-```bash
-curl -s http://localhost:8000/v1/events \
-  -H 'Content-Type: application/json' \
-  -d '{
+```
+body（同样要配合签名头发送）: {
     "event_type": "paid",
     "dedupe_key": "order-1002-paid",
     "not_before": "2026-09-10T08:00:00Z",
@@ -191,12 +277,13 @@ curl -s http://localhost:8000/v1/events \
       "order_id": "1002",
       "event_type": "paid"
     }
-  }'
+  }
 ```
 
 响应中包含：
 
 - `id`：事件 ID
+- `source_id`：把事件送进来的已登记来源（入口准入前的历史事件可能为 `null`）
 - `event_type` / `dedupe_key` / `payload`：事件本体
 - `not_before`：约定的最早外发时间（未定时为 `null`）；`cancelled_at`：取消时间（未取消为 `null`）
 - `status`：`unrouted`（没有地址订该类型）、`pending`（至少一份副本未投完）、`delivered`（全部副本已收到传输层 2xx，但不一定已对上回执）、`cancelled`（未打出前已取消，剩余副本永不再投）
@@ -373,10 +460,14 @@ python3 scripts/mock_receiver.py --port 9000 \
 | `RECEIPT_TIMEOUT_SECONDS` | `300` | 回执对账时限：副本投妥后等待回执的约定时间，超时记为 `timed_out`（Worker 侧配置） |
 | `RECONCILE_SWEEP_INTERVAL_SECONDS` | `5` | reconciler 扫描超时副本的间隔 |
 | `RECEIPT_DELIVERY_GRACE_SECONDS` | `2` | 回执比投递结果先到时，回执接口等待 Worker 落库投递结果的宽限（API 侧配置） |
+| `INGEST_MAX_AGE_SECONDS` | `300` | 入口签名时间戳最多允许比服务时钟旧多少秒，超出按 `stale_timestamp` 拒（防重放窗口） |
+| `INGEST_MAX_FUTURE_SKEW_SECONDS` | `60` | 入口签名时间戳最多允许超前服务时钟多少秒，超出按 `future_timestamp` 拒 |
 
 ## 数据表概览
 
-- `events`：事件本体（类型、去重键、负载、最早外发时间 `not_before`、取消时间 `cancelled_at`），一条事件一行，与地址无关。
+- `event_sources`：登记的外部事件来源、状态（`disabled_at` 为空即启用）、当前签名密钥与最近换钥时间。密钥只在登记/换钥的响应里明文出现一次。
+- `ingestion_attempts`：入口准入日志，每次事件推送一行（含全部被拒的），带处置结果（`accepted` / `unrouted` / `duplicate` / `source_unknown` / `source_disabled` / `bad_signature` / `stale_timestamp` / `future_timestamp` / `invalid_timestamp` / `invalid_body`）、发送时间、拒因；被拒记录没有 `event_id`，不会在任何轨迹里显示成已收/已发。
+- `events`：事件本体（来源 `source_id`、类型、去重键、负载、最早外发时间 `not_before`、取消时间 `cancelled_at`），一条事件一行，与地址无关。
 - `destination_subscriptions`：地址订阅的事件类型集合。
 - `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled`）、下次尝试时间、最早外发时间 `not_before`、租约信息和对账状态（`reconcile_state`、对账时限、回执结果、重投次数）；Worker 只消费这张表。
 - `delivery_attempts`：每次 HTTP 投递尝试的审计轨迹（关联事件与副本）。
@@ -394,7 +485,7 @@ python3 scripts/mock_receiver.py --port 9000 \
 当前 Compose 配置适合开发和小规模部署。上生产前建议补充：
 
 1. API 前增加负载均衡器和 HTTPS。
-2. 为登记地址、提交事件和恢复接口增加认证/鉴权。
+2. 为登记地址、**来源登记/停用/换钥**、提交事件之外的管理接口增加管理员鉴权（事件入口本身已要求来源密钥签名）；生产环境建议对 `event_sources.secret` 做静态加密（KMS/信封加密），而不是明文落库，并将签名比较保持为常量时间。
 3. 使用托管 PostgreSQL，设置备份、连接数上限和慢查询监控。
 4. 增加 Prometheus 指标：待投递数、投递延迟、失败率、隔离地址数、Worker 心跳、超时未对账副本数、迟到回执数。
 5. 将 `CREATE TABLE IF NOT EXISTS` 替换为 Alembic 迁移，便于后续表结构变更。

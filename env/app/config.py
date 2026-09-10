@@ -30,6 +30,15 @@ class Settings(BaseSettings):
     reconcile_sweep_interval_seconds: float = 5.0
     receipt_delivery_grace_seconds: float = 2.0
 
+    # Inbound source authentication settings. Every event POST must carry a
+    # source id, a send timestamp and an HMAC signature made with that
+    # source's secret.
+    # How old (or how far in the future) the signed send timestamp is allowed
+    # to be. Older events look like replays; future-dated ones look like a
+    # sender clock that is wrong (or an attempted replay window abuse).
+    ingest_max_age_seconds: float = 300.0
+    ingest_max_future_skew_seconds: float = 60.0
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -22,6 +22,10 @@ services:
       DB_POOL_SIZE: "${DB_POOL_SIZE:-10}"
       DB_MAX_OVERFLOW: "${DB_MAX_OVERFLOW:-5}"
       RECEIPT_DELIVERY_GRACE_SECONDS: "${RECEIPT_DELIVERY_GRACE_SECONDS:-2}"
+      # Inbound source authentication: event pushes must be HMAC-signed with a
+      # send timestamp inside this freshness window.
+      INGEST_MAX_AGE_SECONDS: "${INGEST_MAX_AGE_SECONDS:-300}"
+      INGEST_MAX_FUTURE_SKEW_SECONDS: "${INGEST_MAX_FUTURE_SKEW_SECONDS:-60}"
     ports:
       - "8000:8000"
     depends_on:

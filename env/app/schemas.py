@@ -96,6 +96,9 @@ class EventRescheduleIn(BaseModel):
 
 class EventOut(BaseModel):
     id: UUID
+    # Registered external source that pushed this event in (null only for
+    # events created before inbound source authentication existed).
+    source_id: UUID | None = None
     event_type: str
     dedupe_key: str
     payload: dict[str, Any]
@@ -233,3 +236,59 @@ class RecoveryOut(BaseModel):
     destination: DestinationOut
     recovered: bool
     pending_deliveries_reset: int | None = None
+
+
+# --- Inbound event sources ---------------------------------------------------
+
+MAX_SOURCE_NAME_LENGTH = 128
+
+
+class SourceIn(BaseModel):
+    # A human-readable, unique name for the external system pushing events in.
+    name: str = Field(..., min_length=1, max_length=MAX_SOURCE_NAME_LENGTH)
+
+
+class SourceOut(BaseModel):
+    """Registered source metadata. The secret is never returned here."""
+
+    id: UUID
+    name: str
+    status: str  # active | disabled
+    disabled_at: datetime | None = None
+    key_rotated_at: datetime
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class SourceCreatedOut(SourceOut):
+    # The secret is shown exactly once — on registration or key rotation.
+    # It cannot be retrieved afterwards.
+    secret: str
+
+
+class SourceRotatedOut(BaseModel):
+    source: SourceCreatedOut
+    # Old signatures stop matching immediately after rotation.
+    previous_key_rotated_at: datetime
+
+
+class IngestionAttemptOut(BaseModel):
+    id: int
+    source_id: UUID | None = None
+    source_name: str | None = None
+    event_id: UUID | None = None
+    dedupe_key: str | None = None
+    event_type: str | None = None
+    signed_at: datetime | None = None
+    # accepted: stored and fanned out to current subscribers;
+    # unrouted: stored but no destination subscribes to the type;
+    # duplicate: same dedupe_key seen again, no new event was created;
+    # source_unknown / source_disabled / bad_signature / stale_timestamp /
+    # future_timestamp / invalid_timestamp / invalid_body: rejected at entry.
+    disposition: str
+    reason: str | None = None
+    remote_addr: str | None = None
+    received_at: datetime
+
+    model_config = {"from_attributes": True}
