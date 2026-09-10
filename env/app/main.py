@@ -7,13 +7,20 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, s
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.confirmation import (
+    DESTINATION_CONFIRM_COLUMNS,
+    apply_echo,
+    arm_round,
+)
 from app.db import engine, get_db
 from app.ingest_auth import (
     ACCEPTED,
     DUPLICATE,
     INVALID_BODY,
+    PENDING_CONFIRMATION,
     SOURCE_DISABLED,
     UNROUTED,
     AdmissionError,
@@ -26,9 +33,13 @@ from app.models import init_db
 from app.receipts import ingest_receipt
 from app.schemas import (
     BulkRequeueOut,
+    ConfirmationAttemptOut,
+    ConfirmationIn,
+    ConfirmationOut,
     DeliveryOut,
     DestinationIn,
     DestinationOut,
+    DestinationPatchIn,
     EventBulkRequeueOut,
     EventIn,
     EventOut,
@@ -39,6 +50,7 @@ from app.schemas import (
     ReceiptOut,
     ReconciliationSummaryOut,
     RecoveryOut,
+    ReissueChallengeOut,
     RequeueOut,
     SourceCreatedOut,
     SourceIn,
@@ -55,7 +67,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Event Ingest Service",
-    version="2.3.0",
+    version="2.4.0",
     lifespan=lifespan,
 )
 
@@ -92,10 +104,20 @@ def destination_response(db: Session, destination: RowMapping) -> dict:
     return result
 
 
-def event_status(cancelled_at, delivery_count: int, delivered_count: int) -> str:
+def event_status(
+    cancelled_at,
+    delivery_count: int,
+    delivered_count: int,
+    superseded_count: int,
+) -> str:
     if cancelled_at is not None:
         return "cancelled"
     if delivery_count == 0:
+        # No live copies: either nothing subscribed at all, or every copy was
+        # abandoned because its destination moved before it could be sent.
+        # Either way nothing is still going out.
+        if superseded_count > 0:
+            return "superseded"
         return "unrouted"
     if delivered_count >= delivery_count:
         return "delivered"
@@ -112,10 +134,16 @@ def event_reconcile_status(delivery_count: int, acknowledged_count: int) -> str:
 
 def event_response(event: RowMapping | dict[str, Any]) -> dict:
     result = dict(event)
+    superseded_count = result.get("superseded_count", 0) or 0
+    # delivery_count counts live copies only — superseded copies never went
+    # out and must not be described as still pending or as delivered.
+    result["delivery_count"] = result["delivery_count"] - superseded_count
+    result["superseded_count"] = superseded_count
     result["status"] = event_status(
         result.get("cancelled_at"),
         result["delivery_count"],
         result["delivered_count"],
+        superseded_count,
     )
     result["reconcile_status"] = event_reconcile_status(
         result["delivery_count"], result["acknowledged_count"]
@@ -132,7 +160,9 @@ EVENT_WITH_COUNTS_SQL = """
            COUNT(d.id)::int AS delivery_count,
            COUNT(d.id) FILTER (WHERE d.status = 'delivered')::int AS delivered_count,
            COUNT(d.id) FILTER (WHERE d.reconcile_state = 'acknowledged')::int
-               AS acknowledged_count
+               AS acknowledged_count,
+           COUNT(d.id) FILTER (WHERE d.status = 'superseded')::int
+               AS superseded_count
     FROM events e
     LEFT JOIN deliveries d ON d.event_id = e.id
     WHERE {where}
@@ -147,17 +177,53 @@ EVENT_WITH_COUNTS_SQL = """
 )
 def register_destination(body: DestinationIn, db: Session = Depends(get_db)):
     url = str(body.url)
-    destination = db.execute(
-        text(
-            """
-            INSERT INTO destinations (url)
-            VALUES (:url)
-            ON CONFLICT (url) DO UPDATE SET url = EXCLUDED.url
-            RETURNING id, url, status, failure_count, recoverable_at, created_at
-            """
-        ),
+    existing = db.execute(
+        text("SELECT id FROM destinations WHERE url = :url"),
         {"url": url},
-    ).mappings().one()
+    ).mappings().first()
+    is_new = existing is None
+    if is_new:
+        try:
+            destination = db.execute(
+                text(
+                    f"""
+                    INSERT INTO destinations (url)
+                    VALUES (:url)
+                    RETURNING {DESTINATION_CONFIRM_COLUMNS}
+                    """
+                ),
+                {"url": url},
+            ).mappings().one()
+        except IntegrityError:
+            # Concurrent registration of the same URL: fall back to the
+            # existing row (registration stays idempotent, handshake not re-armed).
+            db.rollback()
+            existing = db.execute(
+                text("SELECT id FROM destinations WHERE url = :url"),
+                {"url": url},
+            ).mappings().one()
+            destination = db.execute(
+                text(
+                    f"""
+                    SELECT {DESTINATION_CONFIRM_COLUMNS}
+                    FROM destinations WHERE id = :destination_id
+                    """
+                ),
+                {"destination_id": existing["id"]},
+            ).mappings().one()
+            is_new = False
+    else:
+        # Re-registering the same URL is idempotent and never re-arms the
+        # handshake; only a URL change (PATCH) does that.
+        destination = db.execute(
+            text(
+                f"""
+                SELECT {DESTINATION_CONFIRM_COLUMNS}
+                FROM destinations WHERE id = :destination_id
+                """
+            ),
+            {"destination_id": existing["id"]},
+        ).mappings().one()
 
     if body.event_types is not None:
         db.execute(
@@ -184,6 +250,101 @@ def register_destination(body: DestinationIn, db: Session = Depends(get_db)):
                 ],
             )
 
+    # A brand-new destination starts unconfirmed: arm its first challenge
+    # round before any event can fan out to it.
+    if is_new:
+        destination = arm_round(
+            db, str(destination["id"]), bump_generation=False
+        )
+
+    result = destination_response(db, destination)
+    db.commit()
+    return result
+
+
+@app.patch("/v1/destinations/{destination_id}", response_model=DestinationOut)
+def update_destination(
+    destination_id: UUID,
+    body: DestinationPatchIn,
+    db: Session = Depends(get_db),
+):
+    # Re-locating (new url) re-arms the handshake under a new generation:
+    # queued copies aimed at the old location become superseded, copies already
+    # out or in flight are left alone. Subscription-only edits never re-arm.
+    if body.url is None and body.event_types is None:
+        raise HTTPException(
+            status_code=422,
+            detail="provide a url and/or event_types to update",
+        )
+
+    destination = db.execute(
+        text(
+            f"""
+            SELECT {DESTINATION_CONFIRM_COLUMNS}
+            FROM destinations
+            WHERE id = CAST(:destination_id AS UUID)
+            FOR UPDATE
+            """
+        ),
+        {"destination_id": destination_id},
+    ).mappings().first()
+    if destination is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="destination not found")
+
+    new_url = str(body.url) if body.url is not None else None
+    relocated = new_url is not None and new_url != destination["url"]
+    if relocated:
+        clash = db.execute(
+            text("SELECT id FROM destinations WHERE url = :url"),
+            {"url": new_url},
+        ).first()
+        if clash is not None:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="another destination is already registered with this url",
+            )
+
+    if relocated:
+        db.execute(
+            text(
+                """
+                UPDATE destinations SET url = :url
+                WHERE id = CAST(:destination_id AS UUID)
+                """
+            ),
+            {"url": new_url, "destination_id": str(destination_id)},
+        )
+
+    if body.event_types is not None:
+        db.execute(
+            text(
+                """
+                DELETE FROM destination_subscriptions
+                WHERE destination_id = :destination_id
+                """
+            ),
+            {"destination_id": str(destination_id)},
+        )
+        if body.event_types:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO destination_subscriptions (destination_id, event_type)
+                    VALUES (:destination_id, :event_type)
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                [
+                    {"destination_id": str(destination_id), "event_type": event_type}
+                    for event_type in body.event_types
+                ],
+            )
+
+    if relocated:
+        destination = arm_round(db, str(destination_id), bump_generation=True)
+
     result = destination_response(db, destination)
     db.commit()
     return result
@@ -193,8 +354,8 @@ def register_destination(body: DestinationIn, db: Session = Depends(get_db)):
 def get_destination(destination_id: UUID, db: Session = Depends(get_db)):
     destination = db.execute(
         text(
-            """
-            SELECT id, url, status, failure_count, recoverable_at, created_at
+            f"""
+            SELECT {DESTINATION_CONFIRM_COLUMNS}
             FROM destinations
             WHERE id = CAST(:destination_id AS UUID)
             """
@@ -204,6 +365,132 @@ def get_destination(destination_id: UUID, db: Session = Depends(get_db)):
     if destination is None:
         raise HTTPException(status_code=404, detail="destination not found")
     return destination_response(db, destination)
+
+
+@app.post(
+    "/v1/destinations/{destination_id}/confirm",
+    response_model=ConfirmationOut,
+)
+def confirm_destination(
+    destination_id: UUID,
+    request: Request,
+    body: ConfirmationIn | None = None,
+    db: Session = Depends(get_db),
+):
+    # The echo can come in the JSON body or in a header (a receiver answering
+    # the probe callback by proxying the value). Empty/whitespace echoes are a
+    # wrong answer, not a server error.
+    header_challenge = request.headers.get("X-Confirmation-Challenge", "").strip()
+    challenge = body.challenge.strip() if body and body.challenge else header_challenge
+    if not challenge:
+        raise HTTPException(status_code=400, detail="missing challenge echo")
+
+    outcome = apply_echo(db, str(destination_id), challenge)
+    if outcome["destination"] is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="destination not found")
+    disposition = outcome["disposition"]
+    destination = outcome["destination"]
+    if disposition == "invalid":
+        db.commit()
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "challenge did not match the outstanding round",
+                "disposition": "invalid",
+            },
+        )
+    if disposition == "expired":
+        db.commit()
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "error": "confirmation round expired before the echo arrived; "
+                         "a new round has been issued",
+                "disposition": "expired",
+            },
+        )
+    db.commit()
+    return {
+        "destination_id": destination["id"],
+        "confirmation_state": destination["confirmation_state"],
+        "confirmed_at": destination["confirmed_at"],
+        "confirmation_round": destination["confirmation_round"],
+        "disposition": disposition,
+        "challenge_expires_at": destination["challenge_expires_at"],
+    }
+
+
+@app.post(
+    "/v1/destinations/{destination_id}/reissue-challenge",
+    response_model=ReissueChallengeOut,
+)
+def reissue_challenge(destination_id: UUID, db: Session = Depends(get_db)):
+    destination = db.execute(
+        text(
+            f"""
+            SELECT {DESTINATION_CONFIRM_COLUMNS}
+            FROM destinations
+            WHERE id = CAST(:destination_id AS UUID)
+            FOR UPDATE
+            """
+        ),
+        {"destination_id": destination_id},
+    ).mappings().first()
+    if destination is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="destination not found")
+    if destination["confirmation_state"] == "confirmed":
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="destination is already confirmed",
+        )
+    destination = arm_round(db, str(destination_id), bump_generation=False)
+    db.commit()
+    return {
+        "destination_id": destination["id"],
+        "confirmation_state": destination["confirmation_state"],
+        "confirmation_round": destination["confirmation_round"],
+        "challenge_expires_at": destination["challenge_expires_at"],
+        "reissued": True,
+    }
+
+
+@app.get(
+    "/v1/destinations/{destination_id}/confirmation-attempts",
+    response_model=list[ConfirmationAttemptOut],
+)
+def list_confirmation_attempts(
+    destination_id: UUID,
+    kind: str | None = None,
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    destination = db.execute(
+        text(
+            "SELECT 1 FROM destinations WHERE id = CAST(:destination_id AS UUID)"
+        ),
+        {"destination_id": str(destination_id)},
+    ).first()
+    if destination is None:
+        raise HTTPException(status_code=404, detail="destination not found")
+    if kind is not None and kind not in ("challenge", "echo", "expired"):
+        raise HTTPException(status_code=422, detail="invalid kind")
+    return db.execute(
+        text(
+            """
+            SELECT id, destination_id, confirmation_round, kind, result,
+                   status_code, response_excerpt, error, created_at
+            FROM confirmation_attempts
+            WHERE destination_id = CAST(:destination_id AS UUID)
+              AND (CAST(:kind AS TEXT) IS NULL OR kind = CAST(:kind AS TEXT))
+            ORDER BY created_at DESC, id DESC
+            LIMIT :limit
+            """
+        ),
+        {"destination_id": str(destination_id), "kind": kind, "limit": limit},
+    ).mappings().all()
 
 
 # --- Inbound event sources: registration, rotation, enable/disable ----------
@@ -474,23 +761,44 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
         result["duplicate"] = True
         return result, 200
 
-    # Fan out to the destinations subscribed to this type right now. Each gets
-    # its own queued copy with the next per-destination sequence number, so
-    # one destination's backlog, retries or isolation never affect the others.
-    # Destinations are locked in id order to keep concurrent fan-outs
-    # deadlock-free. The schedule gate (not_before) is copied onto every
-    # delivery; each copy keeps its queue position while it waits for its time.
+    # Fan out to the destinations subscribed to this type *and confirmed*
+    # right now. A still-unconfirmed subscriber gets no delivery row at all:
+    # the event is stored, but nothing can be reported as sent to it, and once
+    # it later completes its handshake it only receives events ingested after
+    # that point — old events are never backfilled. Each confirmed subscriber
+    # gets its own queued copy with the next per-destination sequence number,
+    # so one destination's backlog, retries or isolation never affect the
+    # others. Destinations are locked in id order to keep concurrent fan-outs
+    # deadlock-free. The confirmation gate is rechecked inside the INSERT: if
+    # a concurrent URL change re-arms that destination between the two
+    # statements the row is not created. The schedule gate (not_before) is
+    # copied onto every delivery; each copy keeps its queue position while it
+    # waits for its time.
     subscribers = db.execute(
         text(
             """
-            SELECT destination_id
-            FROM destination_subscriptions
-            WHERE event_type = :event_type
-            ORDER BY destination_id
+            SELECT s.destination_id
+            FROM destination_subscriptions s
+            JOIN destinations d ON d.id = s.destination_id
+            WHERE s.event_type = :event_type
+              AND d.confirmation_state = 'confirmed'
+            ORDER BY s.destination_id
+            FOR UPDATE OF d
             """
         ),
         {"event_type": body.event_type},
     ).all()
+
+    total_subscribers = db.execute(
+        text(
+            """
+            SELECT COUNT(*)::int AS count
+            FROM destination_subscriptions
+            WHERE event_type = :event_type
+            """
+        ),
+        {"event_type": body.event_type},
+    ).mappings().one()["count"]
 
     for row in subscribers:
         db.execute(
@@ -500,14 +808,15 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
                     UPDATE destinations
                     SET next_event_seq = next_event_seq + 1
                     WHERE id = :destination_id
-                    RETURNING id, next_event_seq
+                      AND confirmation_state = 'confirmed'
+                    RETURNING id, next_event_seq, confirmation_generation
                 )
                 INSERT INTO deliveries
                     (event_id, destination_id, event_type, dedupe_key, payload,
-                     destination_seq, not_before)
+                     destination_seq, not_before, confirmation_generation)
                 SELECT :event_id, id, :event_type, :dedupe_key,
                        CAST(:payload AS JSONB), next_event_seq,
-                       CAST(:not_before AS TIMESTAMPTZ)
+                       CAST(:not_before AS TIMESTAMPTZ), confirmation_generation
                 FROM bumped
                 """
             ),
@@ -522,9 +831,14 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
         )
 
     signed_at = source["signed_at"]
-    # No subscribers: still accepted and persisted (the event is "unrouted"),
-    # but the disposition makes explicit that nothing was sent out.
-    disposition = UNROUTED if not subscribers else ACCEPTED
+    # No confirmed subscribers: still accepted and persisted. The disposition
+    # says which case this is without ever describing the event as sent:
+    # - nobody subscribes to this type at all        -> unrouted
+    # - subscribers exist but none has confirmed yet -> pending_confirmation
+    if not subscribers:
+        disposition = UNROUTED if total_subscribers == 0 else PENDING_CONFIRMATION
+    else:
+        disposition = ACCEPTED
     log_attempt(
         db,
         disposition=disposition,
@@ -540,6 +854,7 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     result["delivery_count"] = len(subscribers)
     result["delivered_count"] = 0
     result["acknowledged_count"] = 0
+    result["superseded_count"] = 0
     return event_response(result), 201
 
 
@@ -559,7 +874,8 @@ def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
                    d.destination_seq, d.status, d.attempts, d.next_attempt_at,
                    d.not_before, d.last_error, d.created_at, d.updated_at,
                    d.delivered_at, d.reconcile_state, d.reconcile_deadline,
-                   d.reconciled_at, d.receipt_result, d.requeue_count
+                   d.reconciled_at, d.receipt_result, d.requeue_count,
+                   d.confirmation_generation
             FROM deliveries d
             JOIN destinations dest ON dest.id = d.destination_id
             WHERE d.event_id = CAST(:event_id AS UUID)
@@ -809,8 +1125,8 @@ def requeue_event_unreconciled(event_id: UUID, db: Session = Depends(get_db)):
 def recover_destination(destination_id: UUID, db: Session = Depends(get_db)):
     destination = db.execute(
         text(
-            """
-            SELECT id, url, status, failure_count, recoverable_at, created_at
+            f"""
+            SELECT {DESTINATION_CONFIRM_COLUMNS}
             FROM destinations
             WHERE id = CAST(:destination_id AS UUID)
             FOR UPDATE
@@ -845,13 +1161,13 @@ def recover_destination(destination_id: UUID, db: Session = Depends(get_db)):
         reset_count = reset["count"]
         destination = db.execute(
             text(
-                """
+                f"""
                 UPDATE destinations
                 SET status = 'active',
                     failure_count = 0,
                     recoverable_at = NULL
                 WHERE id = CAST(:destination_id AS UUID)
-                RETURNING id, url, status, failure_count, recoverable_at, created_at
+                RETURNING {DESTINATION_CONFIRM_COLUMNS}
                 """
             ),
             {"destination_id": destination_id},
@@ -871,6 +1187,7 @@ def recover_destination(destination_id: UUID, db: Session = Depends(get_db)):
 INGESTION_DISPOSITIONS = (
     ACCEPTED,
     UNROUTED,
+    PENDING_CONFIRMATION,
     DUPLICATE,
     "source_unknown",
     SOURCE_DISABLED,
@@ -942,10 +1259,23 @@ RECONCILE_STATES = ("awaiting", "acknowledged", "receipt_failed", "timed_out")
 
 # Only copies whose transport finished but were never acknowledged inside the
 # agreed window may be sent back out. They keep their original destination_seq,
-# so they rejoin the per-destination queue at their original position.
+# so they rejoin the per-destination queue at their original position. Two
+# extra gates follow from the activation handshake:
+#  * the destination must currently be confirmed — requeuing while it is still
+#    unconfirmed would deliver before the handshake, which is forbidden;
+#  * the copy's generation must match the current one — after a URL change an
+#    old timed-out copy belongs to the old location and must not be resent to
+#    the new one (it was never going to be backfilled).
 REQUEUEABLE_WHERE = """
     status = 'delivered'
     AND reconcile_state IN ('timed_out', 'receipt_failed')
+    AND EXISTS (
+        SELECT 1
+        FROM destinations dest
+        WHERE dest.id = deliveries.destination_id
+          AND dest.confirmation_state = 'confirmed'
+          AND dest.confirmation_generation = deliveries.confirmation_generation
+    )
 """
 
 REQUEUE_SET_SQL = """
@@ -1058,7 +1388,8 @@ def list_reconciliation_deliveries(
                    d.destination_seq, d.status, d.attempts, d.next_attempt_at,
                    d.not_before, d.last_error, d.created_at, d.updated_at,
                    d.delivered_at, d.reconcile_state, d.reconcile_deadline,
-                   d.reconciled_at, d.receipt_result, d.requeue_count
+                   d.reconciled_at, d.receipt_result, d.requeue_count,
+                   d.confirmation_generation
             FROM deliveries d
             JOIN destinations dest ON dest.id = d.destination_id
             WHERE d.reconcile_state = :reconcile_state
@@ -1094,9 +1425,12 @@ def requeue_delivery(delivery_id: UUID, db: Session = Depends(get_db)):
         existing = db.execute(
             text(
                 """
-                SELECT status, reconcile_state
-                FROM deliveries
-                WHERE id = CAST(:delivery_id AS UUID)
+                SELECT d.status, d.reconcile_state, d.confirmation_generation,
+                       dest.confirmation_state AS destination_state,
+                       dest.confirmation_generation AS destination_generation
+                FROM deliveries d
+                JOIN destinations dest ON dest.id = d.destination_id
+                WHERE d.id = CAST(:delivery_id AS UUID)
                 """
             ),
             {"delivery_id": str(delivery_id)},
@@ -1104,6 +1438,24 @@ def requeue_delivery(delivery_id: UUID, db: Session = Depends(get_db)):
         if existing is None:
             db.rollback()
             raise HTTPException(status_code=404, detail="delivery not found")
+        if existing["destination_state"] != "confirmed":
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "destination has not completed its activation handshake; "
+                    "deliveries cannot be sent to it yet"
+                ),
+            )
+        if existing["confirmation_generation"] != existing["destination_generation"]:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "destination changed location after this copy was fanned "
+                    "out; old copies are not resent to the new location"
+                ),
+            )
         db.rollback()
         raise HTTPException(
             status_code=409,

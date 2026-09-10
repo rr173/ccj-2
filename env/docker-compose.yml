@@ -55,6 +55,14 @@ services:
       FAILURE_THRESHOLD: "${FAILURE_THRESHOLD:-5}"
       QUARANTINE_SECONDS: "${QUARANTINE_SECONDS:-900}"
       RECEIPT_TIMEOUT_SECONDS: "${RECEIPT_TIMEOUT_SECONDS:-300}"
+      # Activation handshake probes. Keep CONFIRMATION_ENABLED=true only on a
+      # single logical worker process group; extra worker replicas can set it
+      # false so probes are sent from one confirmer thread.
+      CONFIRM_TIMEOUT_SECONDS: "${CONFIRM_TIMEOUT_SECONDS:-300}"
+      CONFIRM_BACKOFF_BASE_SECONDS: "${CONFIRM_BACKOFF_BASE_SECONDS:-2}"
+      CONFIRM_BACKOFF_MAX_SECONDS: "${CONFIRM_BACKOFF_MAX_SECONDS:-60}"
+      CONFIRM_POLL_INTERVAL_SECONDS: "${CONFIRM_POLL_INTERVAL_SECONDS:-1}"
+      CONFIRMATION_ENABLED: "${CONFIRMATION_ENABLED:-true}"
     depends_on:
       postgres:
         condition: service_healthy

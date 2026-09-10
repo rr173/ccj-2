@@ -12,10 +12,57 @@ SCHEMA_STATEMENTS = [
         next_event_seq BIGINT NOT NULL DEFAULT 0,
         recoverable_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        -- Activation handshake. A freshly registered (or re-located)
+        -- destination starts 'pending': the confirmer sends it a one-time
+        -- challenge and it only becomes 'confirmed' once the challenge is
+        -- echoed back correctly before the round deadline. No event is ever
+        -- fanned out to, or claimed for, a destination that is not confirmed.
+        confirmation_state TEXT NOT NULL DEFAULT 'pending',
+        challenge_token TEXT,
+        challenge_expires_at TIMESTAMPTZ,
+        confirmed_at TIMESTAMPTZ,
+        -- Bumped on every re-arm (registration / URL change). Deliveries copy
+        -- the generation they were fanned out under; after a URL change the
+        -- claim gate refuses older-generation copies, so queued events never
+        -- move to the new location and a failed in-flight copy is not retried.
+        confirmation_generation BIGINT NOT NULL DEFAULT 1,
+        -- Round number increments each time a new challenge is issued; the
+        -- per-round attempt count drives probe backoff within one round.
+        confirmation_round BIGINT NOT NULL DEFAULT 1,
+        confirmation_attempt_count INTEGER NOT NULL DEFAULT 0,
+        next_probe_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         CHECK (status IN ('active', 'isolated')),
         CHECK (failure_count >= 0),
-        CHECK (next_event_seq >= 0)
+        CHECK (next_event_seq >= 0),
+        CHECK (confirmation_state IN ('pending', 'confirmed')),
+        CHECK (confirmation_generation >= 1),
+        CHECK (confirmation_round >= 1),
+        CHECK (confirmation_attempt_count >= 0)
     )
+    """,
+    # Audit trail of the activation handshake for each destination:
+    # every challenge probe sent, every echo received (correct or not), and
+    # every round that expired unanswered. Nothing here creates deliveries.
+    """
+    CREATE TABLE IF NOT EXISTS confirmation_attempts (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        destination_id UUID NOT NULL REFERENCES destinations(id) ON DELETE CASCADE,
+        confirmation_round BIGINT NOT NULL,
+        kind TEXT NOT NULL,
+        result TEXT NOT NULL,
+        status_code INTEGER,
+        response_excerpt TEXT,
+        error TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CHECK (kind IN ('challenge', 'echo', 'expired')),
+        CHECK (result IN (
+            'sent', 'confirmed', 'failed', 'invalid', 'expired'
+        ))
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS confirmation_attempts_destination_idx
+        ON confirmation_attempts (destination_id, created_at DESC, id DESC)
     """,
     # Pre-pub/sub databases stored per-destination copies in "events". Rename
     # it to "deliveries" so in-flight rows keep their queue/lease state; the
@@ -76,9 +123,17 @@ SCHEMA_STATEMENTS = [
         receipt_result TEXT,
         receipt_id UUID,
         requeue_count INTEGER NOT NULL DEFAULT 0,
+        -- Generation of the destination's activation handshake this copy was
+        -- fanned out under. A URL change re-arms confirmation and bumps the
+        -- destination generation; older copies then fail the claim gate and
+        -- queued ones are moved to the terminal 'superseded' state so nothing
+        -- more is sent to the old location and nothing old is backfilled.
+        confirmation_generation BIGINT NOT NULL DEFAULT 1,
         UNIQUE (destination_id, destination_seq),
         UNIQUE (destination_id, dedupe_key),
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled')),
+        -- superseded: the destination changed location before this copy was
+        -- sent; it never goes out and is not retried or backfilled.
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded')),
         CHECK (attempts >= 0),
         CHECK (destination_seq >= 0),
         CHECK (reconcile_state IN ('none', 'awaiting', 'acknowledged', 'receipt_failed', 'timed_out')),
@@ -138,6 +193,7 @@ SCHEMA_STATEMENTS = [
         CHECK (disposition IN (
             'accepted',
             'unrouted',
+            'pending_confirmation',
             'duplicate',
             'source_unknown',
             'source_disabled',
@@ -290,7 +346,7 @@ SCHEMA_STATEMENTS = [
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled'))
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded'))
     """,
     # Idempotent upgrades for databases created before inbound source auth.
     # Every newly accepted event belongs to the registered source that pushed
@@ -311,6 +367,75 @@ SCHEMA_STATEMENTS = [
     """,
     """
     CREATE INDEX IF NOT EXISTS events_source_idx ON events (source_id)
+    """,
+    # Idempotent upgrades for databases created before destination activation
+    # handshakes. The detection, column additions and backfill live in one
+    # DO block: only when the columns do not yet exist do we add them, and any
+    # destination rows present at that moment predate the handshake feature —
+    # they have already been receiving events, so they are treated as
+    # confirmed and keep their queue. On later service restarts the columns
+    # already exist, so freshly registered 'pending' destinations are never
+    # flipped to confirmed by a migration. (Fresh databases get the columns
+    # straight from CREATE TABLE above and take no branch here.)
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'destinations' AND column_name = 'confirmation_state'
+        ) THEN
+            ALTER TABLE destinations
+                ADD COLUMN confirmation_state TEXT NOT NULL DEFAULT 'pending';
+            ALTER TABLE destinations ADD COLUMN challenge_token TEXT;
+            ALTER TABLE destinations ADD COLUMN challenge_expires_at TIMESTAMPTZ;
+            ALTER TABLE destinations ADD COLUMN confirmed_at TIMESTAMPTZ;
+            ALTER TABLE destinations
+                ADD COLUMN confirmation_generation BIGINT NOT NULL DEFAULT 1;
+            ALTER TABLE destinations
+                ADD COLUMN confirmation_round BIGINT NOT NULL DEFAULT 1;
+            ALTER TABLE destinations
+                ADD COLUMN confirmation_attempt_count INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE destinations
+                ADD COLUMN next_probe_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
+            UPDATE destinations
+            SET confirmation_state = 'confirmed',
+                confirmed_at = now(),
+                challenge_token = NULL,
+                challenge_expires_at = NULL;
+        END IF;
+    END $$
+    """,
+    "ALTER TABLE destinations DROP CONSTRAINT IF EXISTS destinations_confirmation_state_check",
+    """
+    ALTER TABLE destinations ADD CONSTRAINT destinations_confirmation_state_check
+        CHECK (confirmation_state IN ('pending', 'confirmed'))
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS destinations_probe_idx
+        ON destinations (next_probe_at)
+        WHERE confirmation_state = 'pending'
+    """,
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS confirmation_generation BIGINT NOT NULL DEFAULT 1",
+    # Widen the status check on upgraded databases (the constraint may carry
+    # either auto-generated name, including one inherited from the legacy
+    # events table rename).
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_status_check",
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded'))
+    """,
+    # Widen the ingestion disposition check to include pending_confirmation.
+    "ALTER TABLE ingestion_attempts DROP CONSTRAINT IF EXISTS ingestion_attempts_disposition_check",
+    """
+    ALTER TABLE ingestion_attempts ADD CONSTRAINT ingestion_attempts_disposition_check
+        CHECK (disposition IN (
+            'accepted', 'unrouted', 'pending_confirmation', 'duplicate',
+            'source_unknown', 'source_disabled', 'bad_signature',
+            'stale_timestamp', 'future_timestamp', 'invalid_timestamp',
+            'invalid_body'
+        ))
     """,
 ]
 

@@ -2,8 +2,8 @@
 
 这是一个接收事件、按事件类型分发给订阅地址，把事件按顺序推送到外部 Webhook，并对推送结果做**回执对账**的系统：
 
-- **ingest-api**：登记**事件来源**（发放只属于它的签名密钥、可停用/可换钥）、登记接收地址（含订阅的事件类型）、**验签 + 发送时间校验后**接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**接入回执**、查询**入口准入记录（含每一条被拒事件）**、事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（支持只重投某一笔事件中尚未认的那些副本）。
-- **worker**：负责真正的 HTTP 投递、重试、熔断隔离、崩溃恢复。
+- **ingest-api**：登记**事件来源**（发放只属于它的签名密钥、可停用/可换钥）、登记接收地址（含订阅的事件类型；**地址得先完成一次上线握手确认才会收到投递**，换接收位置要重新确认）、**验签 + 发送时间校验后**接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**接入回执与确认应答**、查询**入口准入记录（含每一条被拒事件，以及"收了但还没确认、一份没发"的事件）**、事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（支持只重投某一笔事件中尚未认的那些副本）。
+- **worker**：负责真正的 HTTP 投递、重试、熔断隔离、崩溃恢复，以及向未确认地址发送上线握手请求（confirmer 线程）。
 - **reconciler**：独立的对账进程，周期性把超过约定时间仍未收到回执的副本标记为 `timed_out`（可查，不算认）。
 - **PostgreSQL**：作为任务队列和事实来源，用行锁和每地址单调序号保证同一个接收地址严格 FIFO。
 
@@ -38,19 +38,31 @@
 - **每一次入口尝试都落 `ingestion_attempts` 表**，包括所有被拒的。用 `GET /v1/ingestion/attempts?rejected_only=true` 或按 `source_id` / `disposition` / `dedupe_key` 过滤即可查到"谁、什么时间、因为什么被拒"。被拒记录的 `event_id` 为空——它从未成为事件，轨迹/对账里绝不会把它写成"已收下/已发出"。
 - 错误响应形如 `{"detail": {"error": "...", "disposition": "bad_signature"}}`，与日志中的处置一一对应。
 
-**对上密钥且时间新鲜的，才按现在的类型分发（见第 1 节）**。几个边界：
+**对上密钥且时间新鲜的，才按现在的类型和确认状态分发（见第 1 节）**。几个边界：
 
 - **没人订的类型对上了也要照收**：事件正常持久化，状态 `unrouted`，准入记录为 `unrouted`；不会投出任何副本，也不会写成已发出。之后补订只对新事件生效。
+- **有人订但地址还没完成上线确认也要照收**：事件正常持久化，但不生成任何投递副本，准入记录为 `pending_confirmation`；等该地址确认之后也只接新事件，已收下的旧事件不补投。
 - **停用来源只关入口**：`POST /v1/sources/{id}/disable` 之后，新来的事件一律 `source_disabled` 拒收；**已经收下、已经排进各地址队列的副本不受影响，继续按原队列往外打，不会被从队列里拿掉**。`POST .../enable` 可恢复。
 - **换密钥后只认新的**：`POST /v1/sources/{id}/rotate-key` 当场覆盖密钥并返回新 `secret`（旧密钥不保留）。换钥后拿旧密钥签的事件立即 `bad_signature` 被拒，不需要重启或等待。
 - 事件记录带 `source_id`，事件响应和 trace 里可查它来自哪个来源。
 
-### 1. 按事件类型分发（发布/订阅）
+### 1. 按事件类型分发（发布/订阅）与上线确认
 
 - 登记地址时用 `event_types` 声明它关心哪些事件类型；不传或传 `null` 表示保持现状（新地址则为不订任何类型），传列表（含空列表）则整体替换订阅集合。
-- 提交事件时带 `event_type`，不再需要指定地址。入库的那一刻按当前订阅快照**扇出**：每个订了该类型的地址各得到一份独立的投递副本（delivery），各排各的队。
-- **没人订的类型**：事件照常接收并持久化，状态为 `unrouted`，可以通过轨迹接口查到它一条都没投出去——不会写成成功。之后有地址补订该类型，也只从**下一条**新事件开始接收，不会把已入库的旧事件补投给它。
-- 同一地址的重复登记是幂等的；重复提交同一 `dedupe_key` 的事件返回原事件并带 `duplicate: true`，不会重复扇出。
+- **接收地址得先完成一次上线确认（握手），对上之后才准往它那里打。** 新登记（或换了接收位置）的地址状态是 `pending`：系统向该地址发一个带一次性 `challenge` 的确认请求，对方得在约定时限（`CONFIRM_TIMEOUT_SECONDS`，默认 300 秒）内把 challenge 原样对上，地址才变成 `confirmed`。对上有两种方式：
+  - 在确认请求的 2xx 响应体里回 `{"echo": "<challenge>"}`；
+  - 或由接收方回调 `POST /v1/destinations/{id}/confirm`（body `{"challenge": "<challenge>"}`，也可用 `X-Confirmation-Challenge` 头）。
+- 提交事件时带 `event_type`，不再需要指定地址。入库的那一刻按当前订阅快照**扇出**：每个**订了该类型且已确认**的地址各得到一份独立的投递副本（delivery），各排各的队。确认闸门的边界：
+  - **没对上之前，事件还是照收**：事件正常持久化，但**不会给该地址生成副本**——既不会在轨迹/对账里写成"已发给这个地址"，更不会真打过去。这种情况的准入记录是 `pending_confirmation`（有人订但还没确认），区别于压根没人订的 `unrouted`。
+  - **对上之后只接新事件**：确认只对此后入库的事件生效；确认之前收下的旧事件不会被补投（本来就没有副本，无从补起）。
+  - **确认错过点了或回错了**：回错 challenge 记为 `invalid`、不改变未确认状态；一轮时限内没对上，这一轮作废（记 `expired`）并自动开一个全新 challenge 的新一轮。无论哪种，旧事件都不会在之后确认成功时被补走，只接新一轮确认之后的新事件。也可调 `POST /v1/destinations/{id}/reissue-challenge` 主动换一个新 challenge。
+  - 确认请求与事件投递是两种消息：确认请求带 `X-Message-Type: activation_challenge` 头，body 的 `type` 为 `activation_challenge`，接收方应据此区分，不要当成业务事件。
+- **换接收位置要重新对确认**：`PATCH /v1/destinations/{id}`（body `{"url": "..."}`，可同时带 `event_types`）改 URL 后地址立即回到 `pending`、确认代号 `confirmation_generation` 加一、开新一轮握手；
+  - 没对上之前不能再往原来那个位置打：worker 的领取闸门同时要求地址已确认且副本的代号与当前代号一致，旧代号副本不会被送到新 URL；
+  - 已经排进队列、还没打出去的旧代号副本置为终态 `superseded`（永不再投、也不补投），事件状态相应地可显示为 `superseded`（所有副本都被取代、没有任何一份在打）；
+  - **已经打出去的不用收回来**：换位置时正在投（`in_flight`）或已投妥的副本保持原样；正在投的那次若拿到 2xx 就算交给了旧位置（回执对账照常），若失败则直接置 `superseded`，不会重试、也不会计入新位置的失败/隔离计数。
+- **没人订的类型对上了也要照收**：即使存在已确认地址，只要没有任何地址订阅该事件类型，事件照常接收、持久化，状态为 `unrouted`——不会因为地址确认过了就把它当成已发出。之后补订只对新事件生效。
+- 同一地址的重复登记是幂等的（同一 URL 再次 `POST` 不会重新握手）；重复提交同一 `dedupe_key` 的事件返回原事件并带 `duplicate: true`，不会重复扇出。
 
 ### 2. 同一接收地址严格按进入顺序投递
 
@@ -135,7 +147,7 @@ HTTP 投递拿到 2xx 只说明“打出去了”，不代表对方处理完了�
 - `POST /v1/events/{event_id}/requeue-unreconciled`：只把这一笔事件中已经终态未对上的副本（`timed_out` / `receipt_failed`）按原地址批量重投；
 - `POST /v1/destinations/{destination_id}/requeue-unreconciled`：把该地址所有未对上的副本一次性重投。
 
-事件级重投只选择未认副本：已经 `acknowledged` 的副本不会再打，仍在传输或仍处于本轮等待回执窗口的副本也不会被提前重打。重投**保留原来的 `destination_seq`**，每份副本回到自己原地址队列中原来的位置，按原顺序接着排；各地址仍互不等待。同时 Worker 的领取逻辑保证：只要某地址还有副本在投（`in_flight`），重投回来的副本就不会被领取——不会插到还在投的副本前面。重投成功后该副本重新进入 `awaiting`，等待新一轮回执。
+事件级重投只选择未认副本：已经 `acknowledged` 的副本不会再打，仍在传输或仍处于本轮等待回执窗口的副本也不会被提前重打。**重投还过确认闸门**：地址当前必须是 `confirmed`，且副本的确认代号与地址当前代号一致——地址还没对上确认、或该副本是换位置前的老副本时不能重投（老副本不会被打到新位置）。重投**保留原来的 `destination_seq`**，每份副本回到自己原地址队列中原来的位置，按原顺序接着排；各地址仍互不等待。同时 Worker 的领取逻辑保证：只要某地址还有副本在投（`in_flight`），重投回来的副本就不会被领取——不会插到还在投的副本前面。重投成功后该副本重新进入 `awaiting`，等待新一轮回执。
 
 #### 对账查询
 
@@ -232,7 +244,7 @@ curl -s http://localhost:8000/v1/destinations \
   -d '{"url":"https://example.com/webhook","event_types":["paid","refunded"]}'
 ```
 
-返回示例：
+返回示例（新地址**还没对上确认**，不会收到任何事件；字段以 `confirmation_` 开头）：
 
 ```json
 {
@@ -242,14 +254,61 @@ curl -s http://localhost:8000/v1/destinations \
   "failure_count": 0,
   "event_types": ["paid", "refunded"],
   "recoverable_at": null,
-  "created_at": "2026-09-09T00:00:00Z"
+  "created_at": "2026-09-09T00:00:00Z",
+  "confirmation_state": "pending",
+  "challenge_expires_at": "2026-09-09T00:05:00Z",
+  "confirmed_at": null,
+  "confirmation_generation": 1,
+  "confirmation_round": 1,
+  "next_probe_at": "2026-09-09T00:00:00Z"
 }
 ```
 
-重复登记同一 URL 是幂等的，返回同一个地址。再次登记时：
+登记后 worker 的 confirmer 会向该 URL 发确认请求（带头 `X-Message-Type: activation_challenge`）：
+
+```json
+{
+  "type": "activation_challenge",
+  "destination_id": "6f0d6e1f-363e-42b6-9f08-d8b2e1b30d8c",
+  "confirmation_round": 1,
+  "challenge": "8Kx...一次性随机串"
+}
+```
+
+接收方对上的两种方式：
+
+```bash
+# 1) 在确认请求的 2xx 响应体中原样回 echo（mock_receiver 默认就这样做）
+#    -> {"type":"activation_response","echo":"8Kx...一次性随机串"}
+
+# 2) 或由接收方主动回调（也可用 X-Confirmation-Challenge 头代替 body）
+curl -s -X POST \
+  http://localhost:8000/v1/destinations/6f0d6e1f-363e-42b6-9f08-d8b2e1b30d8c/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"challenge":"8Kx...一次性随机串"}'
+```
+
+对上后 `confirmation_state` 变 `confirmed`、`confirmed_at` 落时间，此后**新入库**的订阅事件才会扇出给它；回错 challenge 返回 400（`invalid`），这一轮超时没对上会自动换 challenge 开新一轮（对上迟到的旧 challenge 返回 410 `expired`，旧事件不补投）。握手过程可查：
+
+```bash
+curl -s http://localhost:8000/v1/destinations/<id>/confirmation-attempts  # 探测/应答/轮次过期记录
+curl -s -X POST http://localhost:8000/v1/destinations/<id>/reissue-challenge  # 主动换新 challenge
+```
+
+重复登记同一 URL 是幂等的，返回同一个地址，**不会**重新握手；再次登记时：
 
 - 传 `event_types` 列表 → 整体替换订阅集合（传 `[]` 表示退订全部）；
 - 不传 `event_types` → 保持现有订阅不变。
+
+换接收位置（URL）用 PATCH，会立即重新进入未确认并让代号加一：
+
+```bash
+curl -s -X PATCH http://localhost:8000/v1/destinations/<id> \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/new-webhook"}'
+```
+
+换位置后：没对上之前不会再往旧位置打；队列里还没打出的旧副本置为终态 `superseded`（不补投）；已经投妥或正在投的副本不收回。
 
 ### 提交事件
 
@@ -286,7 +345,7 @@ body（同样要配合签名头发送）: {
 - `source_id`：把事件送进来的已登记来源（入口准入前的历史事件可能为 `null`）
 - `event_type` / `dedupe_key` / `payload`：事件本体
 - `not_before`：约定的最早外发时间（未定时为 `null`）；`cancelled_at`：取消时间（未取消为 `null`）
-- `status`：`unrouted`（没有地址订该类型）、`pending`（至少一份副本未投完）、`delivered`（全部副本已收到传输层 2xx，但不一定已对上回执）、`cancelled`（未打出前已取消，剩余副本永不再投）
+- `status`：`unrouted`（没有任何地址订该类型）、`pending`（至少一份活跃副本未投完）、`delivered`（全部活跃副本已收到传输层 2xx，但不一定已对上回执）、`cancelled`（未打出前已取消，剩余副本永不再投）、`superseded`（所有副本都因地址换位置而被取代，没有一份打出去，也不补投）
 - `reconcile_status`：`pending`（还没有副本认）、`partially_acknowledged`（只认了一部分）、`acknowledged`（所有订阅地址的副本都认了）
 - `delivery_count` / `delivered_count`：扇出副本总数 / 已投妥数
 - `acknowledged_count` / `unacknowledged_count`：已对上成功回执的份数 / 还没对上的份数
@@ -429,6 +488,8 @@ Content-Type: application/json
 python3 scripts/mock_receiver.py --port 9000 --fail-times 3
 ```
 
+mock 接收方默认会在确认探测（`X-Message-Type: activation_challenge`）的 2xx 响应里原样回 echo，因此登记地址后它会被自动对上确认；加 `--no-auto-confirm` 可保持未确认状态（用确认接口手工对上，或观察轮次超时换新 challenge）。
+
 让它同时自动回执（处理成功后回调回执接口）：
 
 ```bash
@@ -462,23 +523,31 @@ python3 scripts/mock_receiver.py --port 9000 \
 | `RECEIPT_DELIVERY_GRACE_SECONDS` | `2` | 回执比投递结果先到时，回执接口等待 Worker 落库投递结果的宽限（API 侧配置） |
 | `INGEST_MAX_AGE_SECONDS` | `300` | 入口签名时间戳最多允许比服务时钟旧多少秒，超出按 `stale_timestamp` 拒（防重放窗口） |
 | `INGEST_MAX_FUTURE_SKEW_SECONDS` | `60` | 入口签名时间戳最多允许超前服务时钟多少秒，超出按 `future_timestamp` 拒 |
+| `CONFIRM_TIMEOUT_SECONDS` | `300` | 一轮上线确认的时限：challenge 发出后多久内没对上就作废、开新一轮 |
+| `CONFIRM_BACKOFF_BASE_SECONDS` | `2` | 确认探测失败后重试退避的起始间隔（指数退避） |
+| `CONFIRM_BACKOFF_MAX_SECONDS` | `60` | 确认探测重试退避上限 |
+| `CONFIRM_POLL_INTERVAL_SECONDS` | `1` | confirmer 线程没有待确认地址时的轮询间隔 |
+| `CONFIRMATION_ENABLED` | `true` | worker 进程内是否运行发确认探测的 confirmer 线程；多 worker 副本时只保留一个为 true |
 
 ## 数据表概览
 
 - `event_sources`：登记的外部事件来源、状态（`disabled_at` 为空即启用）、当前签名密钥与最近换钥时间。密钥只在登记/换钥的响应里明文出现一次。
-- `ingestion_attempts`：入口准入日志，每次事件推送一行（含全部被拒的），带处置结果（`accepted` / `unrouted` / `duplicate` / `source_unknown` / `source_disabled` / `bad_signature` / `stale_timestamp` / `future_timestamp` / `invalid_timestamp` / `invalid_body`）、发送时间、拒因；被拒记录没有 `event_id`，不会在任何轨迹里显示成已收/已发。
+- `ingestion_attempts`：入口准入日志，每次事件推送一行（含全部被拒的），带处置结果（`accepted` / `unrouted` / `pending_confirmation` / `duplicate` / `source_unknown` / `source_disabled` / `bad_signature` / `stale_timestamp` / `future_timestamp` / `invalid_timestamp` / `invalid_body`）、发送时间、拒因；被拒记录没有 `event_id`，不会在任何轨迹里显示成已收/已发。`pending_confirmation` 的事件有 `event_id`（确实收下了），但当时没有生成任何副本。
 - `events`：事件本体（来源 `source_id`、类型、去重键、负载、最早外发时间 `not_before`、取消时间 `cancelled_at`），一条事件一行，与地址无关。
 - `destination_subscriptions`：地址订阅的事件类型集合。
-- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled`）、下次尝试时间、最早外发时间 `not_before`、租约信息和对账状态（`reconcile_state`、对账时限、回执结果、重投次数）；Worker 只消费这张表。
+- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled` / `superseded`）、下次尝试时间、最早外发时间 `not_before`、租约信息、对账状态（`reconcile_state`、对账时限、回执结果、重投次数）和**确认代号 `confirmation_generation`**（换位置后老代号排队副本置 `superseded`，领取闸门也会挡住老代号副本）；Worker 只消费这张表。
 - `delivery_attempts`：每次 HTTP 投递尝试的审计轨迹（关联事件与副本）。
+- `confirmation_attempts`：上线握手轨迹，一行对应一次确认探测（`challenge`）、应答（`echo`，含回错的 `invalid`）或轮次过期（`expired`），带轮次号、HTTP 状态码、响应片段或错误信息。
 - `receipts`：接收方回执日志，一条回执一行，含处置结果（`applied`/`duplicate`/`late`/`orphan`/`premature`）与匹配到的副本；重复、迟到、查无副本的回执都留在这里可查。
-- `destinations`：接收地址、状态、连续失败次数、隔离可恢复时间、该地址下一个序号。
+- `destinations`：接收地址、状态、连续失败次数、隔离可恢复时间、该地址下一个序号，以及上线确认状态（`confirmation_state`、当前 challenge 与时限、确认时间、确认代号/轮次号、下次探测时间）。
 
 ## 从一对一模型升级
 
 表结构通过 `init_db` 幂等迁移：旧的按地址存事件的 `events` 表会自动改名为 `deliveries`（未投完的行原样保留，Worker 会接着投），并新建逻辑事件表 `events` 与订阅表 `destination_subscriptions`。老数据里的历史投递没有对应的逻辑事件，其 `event_id` 为 `NULL`，不影响继续投递。
 
 回执对账的列（`reconcile_state` 等）和 `receipts` 表同样以幂等方式补齐。升级前已投妥的历史副本 `reconcile_state` 为 `none`，不会要求补回执；如果接收方对这些老副本补发回执，仍会按 `applied` 正常对账。
+
+上线握手相关的列（`confirmation_state`、`challenge_token`、`confirmation_generation` 等）和 `confirmation_attempts` 表也由 `init_db` 幂等补齐。**升级前已存在的接收地址一律视为 `confirmed`**（它们此前一直在收事件），队列里未投完的副本代号为第 1 代、与地址当前代号一致，会接着投；只有升级后新登记或换位置的地址才从 `pending` 开始。
 
 ## 生产化建议
 

@@ -59,10 +59,37 @@ class Handler(BaseHTTPRequestHandler):
     receipt_result = "success"
     receipt_delay = 0.0
     response_delay = 0.0
+    # When true, activation challenges are answered by echoing the challenge
+    # straight back in the probe's 2xx response, which confirms the
+    # destination immediately. When false, challenges get a 200 without an
+    # echo so the handshake stays pending (use the confirm API manually).
+    auto_confirm = True
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib API
         length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(length) or b"{}")
+
+        # Activation handshake probe: it is not an event delivery — answer
+        # with the challenge echo and never treat it as processed business.
+        if self.headers.get("X-Message-Type") == "activation_challenge" or (
+            body.get("type") == "activation_challenge"
+        ):
+            if self.response_delay > 0:
+                time.sleep(self.response_delay)
+            challenge = body.get("challenge")
+            if self.auto_confirm and challenge:
+                self._write(
+                    200,
+                    {
+                        "type": "activation_response",
+                        "destination_id": body.get("destination_id"),
+                        "echo": challenge,
+                    },
+                )
+            else:
+                self._write(200, {"type": "activation_response", "received": True})
+            return
+
         key = self.headers.get("Idempotency-Key")
         destination = body.get("destination_id") or "unknown"
         counter[destination] += 1
@@ -122,12 +149,18 @@ def main() -> None:
     parser.add_argument("--receipt-result", default="success", choices=["success", "failure"])
     parser.add_argument("--receipt-delay", type=float, default=0.0)
     parser.add_argument("--response-delay", type=float, default=0.0)
+    parser.add_argument(
+        "--no-auto-confirm",
+        action="store_true",
+        help="answer activation probes without echoing the challenge (stay pending)",
+    )
     args = parser.parse_args()
     Handler.fail_times = args.fail_times
     Handler.receipt_url = args.receipt_url
     Handler.receipt_result = args.receipt_result
     Handler.receipt_delay = args.receipt_delay
     Handler.response_delay = args.response_delay
+    Handler.auto_confirm = not args.no_auto_confirm
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"mock receiver listening on http://{args.host}:{args.port}")
     server.serve_forever()

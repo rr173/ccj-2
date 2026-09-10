@@ -52,6 +52,34 @@ class DestinationIn(BaseModel):
         return normalized
 
 
+class DestinationPatchIn(BaseModel):
+    # Re-locating a destination (new url) re-arms the activation handshake:
+    # it becomes unconfirmed immediately, queued copies aimed at the old
+    # location are superseded (never sent, not backfilled later) and copies
+    # already sent or in flight are left alone. None keeps the current url.
+    url: HttpUrl | None = None
+    # As on registration: None leaves subscriptions untouched, a list
+    # (including the empty list) replaces the whole set.
+    event_types: list[str] | None = None
+
+    @field_validator("event_types")
+    @classmethod
+    def normalize_event_types(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        normalized: list[str] = []
+        for item in value:
+            event_type = _normalize_event_type(item)
+            if event_type not in normalized:
+                normalized.append(event_type)
+        if len(normalized) > MAX_EVENT_TYPES_PER_DESTINATION:
+            raise ValueError(
+                f"a destination can subscribe to at most "
+                f"{MAX_EVENT_TYPES_PER_DESTINATION} event types"
+            )
+        return normalized
+
+
 class DestinationOut(BaseModel):
     id: UUID
     url: str
@@ -60,6 +88,18 @@ class DestinationOut(BaseModel):
     event_types: list[str] = []
     recoverable_at: datetime | None = None
     created_at: datetime
+    # Activation handshake:
+    # pending: not confirmed yet — events are ingested but nothing is fanned
+    #          out to this destination (old events are never backfilled);
+    # confirmed: the last challenge round was answered correctly in time.
+    confirmation_state: str = "pending"
+    # When the current unconfirmed round expires; null once confirmed.
+    challenge_expires_at: datetime | None = None
+    confirmed_at: datetime | None = None
+    # Bumped whenever confirmation is re-armed (registration / URL change).
+    confirmation_generation: int = 1
+    confirmation_round: int = 1
+    next_probe_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 
@@ -127,6 +167,10 @@ class EventOut(BaseModel):
     cancelled_at: datetime | None = None
     created_at: datetime
     duplicate: bool = False
+    # Fanned-out copies abandoned because their destination changed location
+    # before they could be sent. They never went out and are not retried or
+    # backfilled; they are excluded from delivery_count above.
+    superseded_count: int = 0
 
 
 class DeliveryOut(BaseModel):
@@ -137,7 +181,9 @@ class DeliveryOut(BaseModel):
     destination_seq: int
     # pending: queued (possibly waiting for not_before); in_flight: being
     # delivered right now; delivered: transport 2xx; cancelled: the event was
-    # cancelled before this copy went out — terminal, it will never be sent.
+    # cancelled before this copy went out — terminal, it will never be sent;
+    # superseded: the destination changed location before this copy was sent
+    # — terminal, it never went out and is not retried or backfilled.
     status: str
     attempts: int
     next_attempt_at: datetime
@@ -154,6 +200,10 @@ class DeliveryOut(BaseModel):
     reconciled_at: datetime | None = None
     receipt_result: str | None = None
     requeue_count: int = 0
+    # Destination activation generation this copy was fanned out under.
+    # A URL change bumps the destination generation; older copies then fail
+    # the claim gate and queued ones become superseded.
+    confirmation_generation: int = 1
 
     model_config = {"from_attributes": True}
 
@@ -281,8 +331,10 @@ class IngestionAttemptOut(BaseModel):
     dedupe_key: str | None = None
     event_type: str | None = None
     signed_at: datetime | None = None
-    # accepted: stored and fanned out to current subscribers;
+    # accepted: stored and fanned out to current confirmed subscribers;
     # unrouted: stored but no destination subscribes to the type;
+    # pending_confirmation: stored, but every subscriber was still unconfirmed
+    #   at ingest time — no copies created, nothing sent;
     # duplicate: same dedupe_key seen again, no new event was created;
     # source_unknown / source_disabled / bad_signature / stale_timestamp /
     # future_timestamp / invalid_timestamp / invalid_body: rejected at entry.
@@ -290,5 +342,55 @@ class IngestionAttemptOut(BaseModel):
     reason: str | None = None
     remote_addr: str | None = None
     received_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# --- Destination activation handshake ---------------------------------------
+
+class ConfirmationIn(BaseModel):
+    # Echo of the challenge token delivered in the handshake probe. It may
+    # also arrive as the X-Confirmation-Challenge header (used by receivers
+    # that answer by HTTP 2xx on the probe itself).
+    challenge: str = Field(..., min_length=1, max_length=256)
+
+
+class ConfirmationOut(BaseModel):
+    destination_id: UUID
+    confirmation_state: str  # confirmed | pending
+    confirmed_at: datetime | None = None
+    confirmation_round: int
+    # What this call did:
+    # confirmed: challenge matched before the deadline, destination is live;
+    # already_confirmed: the destination had finished an earlier round;
+    # invalid: challenge did not match this round;
+    # expired: the round deadline passed; a fresh round was issued.
+    disposition: str
+    challenge_expires_at: datetime | None = None
+
+
+class ReissueChallengeOut(BaseModel):
+    destination_id: UUID
+    confirmation_state: str
+    confirmation_round: int
+    challenge_expires_at: datetime
+    reissued: bool
+
+
+class ConfirmationAttemptOut(BaseModel):
+    id: int
+    destination_id: UUID
+    confirmation_round: int
+    # challenge: a probe sent to the destination's URL;
+    # echo: an answer received at the confirmation endpoint;
+    # expired: a round ended without a correct answer.
+    kind: str
+    # sent (probe dispatched) | confirmed (probe echoed 2xx or echo matched) |
+    # failed (transport/non-2xx probe) | invalid (wrong echo) | expired.
+    result: str
+    status_code: int | None = None
+    response_excerpt: str | None = None
+    error: str | None = None
+    created_at: datetime
 
     model_config = {"from_attributes": True}

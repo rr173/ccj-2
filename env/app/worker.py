@@ -13,6 +13,11 @@ from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.confirmation import (
+    apply_echo,
+    expire_due_rounds,
+    log_confirmation_attempt,
+)
 from app.config import settings
 from app.db import SessionLocal, build_engine
 from app.models import init_db
@@ -75,7 +80,8 @@ CLAIM_SQL = text(
                    GREATEST(
                        e.next_attempt_at,
                        COALESCE(e.not_before, '-infinity'::timestamptz)
-                   ) AS delivery_due_at
+                   ) AS delivery_due_at,
+                   e.confirmation_generation AS delivery_generation
             FROM deliveries e
             WHERE e.destination_id = d.id
               AND e.status IN ('pending', 'in_flight')
@@ -88,6 +94,13 @@ CLAIM_SQL = text(
                 d.status = 'active'
              OR (d.status = 'isolated' AND d.recoverable_at <= now())
         )
+          -- Nothing is ever sent to a destination that has not completed its
+          -- activation handshake, and an older-generation copy (fanned out
+          -- before a URL change) can never be delivered to the new location.
+          -- The head itself must be a current-generation confirmed copy; such
+          -- a stale head is cleaned up by the supersede step below.
+          AND d.confirmation_state = 'confirmed'
+          AND oldest.delivery_generation = d.confirmation_generation
           -- A requeued (unreconciled) copy re-enters the queue with its
           -- original, smaller destination_seq. Never claim any copy for a
           -- destination while another copy of it is still in flight: the
@@ -111,7 +124,8 @@ CLAIM_SQL = text(
             updated_at = now()
         FROM candidate_destination d,
         LATERAL (
-            SELECT id, status, next_attempt_at, not_before
+            SELECT id, status, next_attempt_at, not_before,
+                   confirmation_generation
             FROM deliveries
             WHERE destination_id = d.id
               AND status IN ('pending', 'in_flight')
@@ -123,6 +137,7 @@ CLAIM_SQL = text(
           AND picked.status = 'pending'
           AND picked.next_attempt_at <= now()
           AND (picked.not_before IS NULL OR picked.not_before <= now())
+          AND picked.confirmation_generation = d.confirmation_generation
         RETURNING
             e.*,
             CASE
@@ -150,10 +165,35 @@ CLAIM_SQL = text(
         e.destination_seq,
         e.attempts,
         e.claim_token,
+        e.confirmation_generation,
         d.url AS destination_url,
         e.recovered_destination
     FROM claimed_event e
     JOIN candidate_destination d ON d.id = e.destination_id
+    """
+)
+
+# Old-generation pending copies (fanned out before the destination moved to a
+# new URL) are never delivered to the new location and are never backfilled:
+# move them to the terminal superseded state. An in-flight copy that was
+# already talking to the old URL is not touched here — its result path decides
+# whether it completes or is superseded.
+SUPERSEDE_STALE_SQL = text(
+    """
+    WITH stale AS (
+        SELECT e.id
+        FROM deliveries e
+        JOIN destinations d ON d.id = e.destination_id
+        WHERE e.status = 'pending'
+          AND e.confirmation_generation < d.confirmation_generation
+        ORDER BY e.destination_id, e.destination_seq
+        LIMIT 200
+    )
+    UPDATE deliveries e
+    SET status = 'superseded',
+        updated_at = now()
+    FROM stale
+    WHERE e.id = stale.id
     """
 )
 
@@ -214,6 +254,27 @@ FAILURE_SQL = text(
         END
     FROM failed_event fe
     WHERE d.id = fe.destination_id
+    """
+)
+
+# A copy that was already in flight toward the old URL when the destination
+# moved must not be retried (the old location must not receive anything more):
+# a failed call ends the copy in the terminal superseded state instead of going
+# back on the queue, and the transport failure is not charged against the new
+# destination.
+SUPERSEDE_FAILED_SQL = text(
+    """
+    UPDATE deliveries
+    SET status = 'superseded',
+        claim_token = NULL,
+        claimed_at = NULL,
+        lease_until = NULL,
+        last_error = CONCAT('superseded after location change; last error: ',
+                            COALESCE(:error, '(none)')),
+        updated_at = now()
+    WHERE id = :delivery_id
+      AND status = 'in_flight'
+      AND claim_token = :claim_token
     """
 )
 
@@ -447,6 +508,25 @@ def record_result(
         if should_isolate:
             recoverable_at = utc_now() + timedelta(seconds=settings.quarantine_seconds)
 
+    # A destination that changed location while this HTTP call was in flight
+    # is no longer the generation this copy belongs to. A 2xx still counts as
+    # handed off to the old URL (it is not taken back); a failure must not be
+    # retried and must not count against the new location's failure tally.
+    generation_row = db.execute(
+        text(
+            """
+            SELECT confirmation_state, confirmation_generation
+            FROM destinations
+            WHERE id = CAST(:destination_id AS UUID)
+            """
+        ),
+        {"destination_id": claim["destination_id"]},
+    ).mappings().first()
+    stale_generation = (
+        generation_row is None
+        or generation_row["confirmation_generation"] != claim["confirmation_generation"]
+    )
+
     if result["success"]:
         updated = db.execute(
             EVENT_SUCCESS_SQL,
@@ -461,6 +541,21 @@ def record_result(
         db.execute(
             DESTINATION_SUCCESS_SQL,
             {"destination_id": claim["destination_id"]},
+        )
+    elif stale_generation:
+        updated = db.execute(
+            SUPERSEDE_FAILED_SQL,
+            {
+                "delivery_id": claim["delivery_id"],
+                "claim_token": claim["claim_token"],
+                "error": result["error"],
+            },
+        )
+        if updated.rowcount != 1:
+            raise StaleClaimError(f"delivery {claim['delivery_id']} is no longer owned by this worker")
+        logger.info(
+            "superseded failed in-flight delivery_id=%s after destination location change",
+            claim["delivery_id"],
         )
     else:
         updated = db.execute(
@@ -483,7 +578,7 @@ def record_result(
     )
 
     db.commit()
-    if should_isolate:
+    if should_isolate and not stale_generation:
         logger.warning(
             "destination_id=%s isolated after delivery_id=%s failed %s times",
             claim["destination_id"],
@@ -498,6 +593,10 @@ def claim_next_event(db: Session) -> RowMapping | None:
     # its lease never expires and it keeps holding the destination's head;
     # only a dead worker stops heartbeating and becomes eligible to take over.
     db.execute(REAP_SQL)
+    # Abandon queued copies of earlier confirmation generations (the
+    # destination changed location): they must never go to the new URL and
+    # must not block its head as pending forever.
+    db.execute(SUPERSEDE_STALE_SQL)
     result = db.execute(
         CLAIM_SQL,
         {
@@ -588,6 +687,180 @@ def worker_loop(stop_event: threading.Event) -> None:
             client.close()
 
 
+# --- Activation handshake (confirmer) --------------------------------------
+
+
+def confirmation_backoff_delay(attempt_count: int) -> float:
+    base = settings.confirm_backoff_base_seconds
+    maximum = settings.confirm_backoff_max_seconds
+    delay = min(maximum, base * (2 ** max(0, attempt_count - 1)))
+    return delay + random.uniform(0, delay * 0.25)
+
+
+def send_confirmation_probe(
+    client: httpx.Client,
+    *,
+    url: str,
+    destination_id: str,
+    challenge: str,
+    round_no: int,
+) -> dict[str, Any]:
+    body = {
+        "type": "activation_challenge",
+        "destination_id": destination_id,
+        "confirmation_round": round_no,
+        "challenge": challenge,
+        "challenge_expires_at": None,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        # Lets a receiver route this apart from event deliveries and answer
+        # by simply echoing the challenge from its 2xx response.
+        "X-Message-Type": "activation_challenge",
+        "X-Confirmation-Round": str(round_no),
+    }
+    started = utc_now()
+    try:
+        response = client.post(url, json=body, headers=headers)
+        finished = utc_now()
+        excerpt = truncate(
+            response.content.decode(response.encoding or "utf-8", errors="replace")
+        )
+        echo = None
+        try:
+            parsed = response.json()
+            if isinstance(parsed, dict):
+                echo = parsed.get("echo") or parsed.get("challenge")
+        except Exception:  # noqa: BLE001 - any non-JSON body is just "no echo"
+            echo = None
+        return {
+            "started_at": started,
+            "finished_at": finished,
+            "success": 200 <= response.status_code < 300,
+            "status_code": response.status_code,
+            "response_excerpt": excerpt,
+            "error": None if 200 <= response.status_code < 300 else f"HTTP {response.status_code}",
+            "echo": echo,
+        }
+    except Exception as exc:
+        return {
+            "started_at": started,
+            "finished_at": utc_now(),
+            "success": False,
+            "status_code": None,
+            "response_excerpt": None,
+            "error": truncate(f"{type(exc).__name__}: {exc}"),
+            "echo": None,
+        }
+
+
+def process_confirmation_once(db: Session, client: httpx.Client) -> bool:
+    # First, close out rounds that expired unanswered and arm fresh ones.
+    expired = expire_due_rounds(db)
+    if expired:
+        db.commit()
+        logger.info("re-armed %s expired confirmation rounds", expired)
+
+    # claim_next needs a delay that reflects the count after the increment;
+    # fetch the row first to size the backoff, then schedule the next probe.
+    claimed = db.execute(
+        text(
+            """
+            SELECT id, url, challenge_token, challenge_expires_at,
+                   confirmation_round, confirmation_attempt_count
+            FROM destinations
+            WHERE confirmation_state = 'pending'
+              AND next_probe_at <= now()
+            ORDER BY next_probe_at ASC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+            """
+        )
+    ).mappings().first()
+    if claimed is None:
+        db.commit()
+        return expired > 0
+
+    destination_id = str(claimed["id"])
+    next_attempt = claimed["confirmation_attempt_count"] + 1
+    delay = confirmation_backoff_delay(next_attempt)
+    db.execute(
+        text(
+            """
+            UPDATE destinations
+            SET confirmation_attempt_count = :attempt_count,
+                next_probe_at = now() + make_interval(secs => :delay_seconds)
+            WHERE id = CAST(:destination_id AS UUID)
+            """
+        ),
+        {
+            "attempt_count": next_attempt,
+            "delay_seconds": delay,
+            "destination_id": destination_id,
+        },
+    )
+    round_no = claimed["confirmation_round"]
+    challenge = claimed["challenge_token"]
+    url = claimed["url"]
+    db.commit()
+
+    result = send_confirmation_probe(
+        client,
+        url=url,
+        destination_id=destination_id,
+        challenge=challenge,
+        round_no=round_no,
+    )
+
+    db2 = SessionLocal()
+    try:
+        log_confirmation_attempt(
+            db2,
+            destination_id=destination_id,
+            confirmation_round=round_no,
+            kind="challenge",
+            result="sent" if result["success"] else "failed",
+            status_code=result["status_code"],
+            response_excerpt=result["response_excerpt"],
+            error=result["error"],
+        )
+        # The receiver answered the probe directly with a matching echo.
+        if result["success"] and isinstance(result["echo"], str) and result["echo"]:
+            outcome = apply_echo(db2, destination_id, result["echo"])
+            if outcome["disposition"] == "confirmed":
+                logger.info(
+                    "destination_id=%s confirmed by probe echo", destination_id
+                )
+        db2.commit()
+    except SQLAlchemyError:
+        db2.rollback()
+        logger.exception("failed to record confirmation probe result")
+    finally:
+        db2.close()
+    return True
+
+
+def confirmer_loop(stop_event: threading.Event) -> None:
+    client = httpx.Client(timeout=settings.http_timeout_seconds)
+    while not stop_event.is_set():
+        db = SessionLocal()
+        try:
+            did_work = process_confirmation_once(db, client)
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception("confirmer database error; retrying")
+            did_work = False
+        except Exception:  # noqa: BLE001 - keep the confirmer alive
+            db.rollback()
+            logger.exception("unexpected confirmer error")
+            did_work = False
+        finally:
+            db.close()
+        if not did_work:
+            stop_event.wait(settings.confirm_poll_interval_seconds)
+    client.close()
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -604,6 +877,16 @@ def main() -> None:
         threading.Thread(target=worker_loop, args=(stop_event,), name=f"worker-{i}")
         for i in range(max(1, settings.worker_concurrency))
     ]
+    # Exactly one confirmer thread per worker process. Scale worker replicas
+    # horizontally and set CONFIRMATION_ENABLED=false on all but one process
+    # if duplicate probes to a destination are undesirable (they are harmless:
+    # only a correct echo changes state).
+    if settings.confirmation_enabled:
+        threads.append(
+            threading.Thread(
+                target=confirmer_loop, args=(stop_event,), name="confirmer"
+            )
+        )
     for thread in threads:
         thread.start()
 

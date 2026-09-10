@@ -30,6 +30,18 @@ class Settings(BaseSettings):
     reconcile_sweep_interval_seconds: float = 5.0
     receipt_delivery_grace_seconds: float = 2.0
 
+    # Destination activation handshake settings. A newly registered or
+    # re-located destination starts unconfirmed; the confirmer probes it with
+    # a one-time challenge that must be echoed back correctly before the round
+    # deadline. Probes use their own exponential backoff inside a round; an
+    # unanswered round expires and a fresh challenge round begins.
+    confirm_timeout_seconds: float = 300.0
+    confirm_backoff_base_seconds: float = 2.0
+    confirm_backoff_max_seconds: float = 60.0
+    confirm_poll_interval_seconds: float = 1.0
+    # Set false for extra worker replicas so only one process sends probes.
+    confirmation_enabled: bool = True
+
     # Inbound source authentication settings. Every event POST must carry a
     # source id, a send timestamp and an HMAC signature made with that
     # source's secret.

@@ -36,6 +36,10 @@ SIGNATURE_HEADER = "X-Signature"
 # Dispositions stored in ingestion_attempts.
 ACCEPTED = "accepted"
 UNROUTED = "unrouted"
+# The event was accepted and stored, but every subscriber was still waiting
+# to complete its activation handshake: no delivery rows were created, so it
+# was not written as "sent" and can never be backfilled after confirmation.
+PENDING_CONFIRMATION = "pending_confirmation"
 DUPLICATE = "duplicate"
 SOURCE_UNKNOWN = "source_unknown"
 SOURCE_DISABLED = "source_disabled"
