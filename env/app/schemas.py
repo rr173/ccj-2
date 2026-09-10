@@ -90,6 +90,20 @@ class DestinationPatchIn(BaseModel):
         return normalized
 
 
+class DestinationPauseIn(BaseModel):
+    # Operator-marked "not receiving" window for this address. paused_from
+    # defaults to "right now" (database clock) when omitted; paused_until
+    # omitted means "not receiving until explicitly resumed". At least one of
+    # the two must be provided — clearing the window is POST .../resume.
+    paused_from: datetime | None = None
+    paused_until: datetime | None = None
+
+    @field_validator("paused_from", "paused_until")
+    @classmethod
+    def normalize_window(cls, value: datetime | None) -> datetime | None:
+        return _normalize_optional_datetime(value)
+
+
 class DestinationOut(BaseModel):
     id: UUID
     url: str
@@ -113,8 +127,23 @@ class DestinationOut(BaseModel):
     # True: a shadow that receives copies but whose receipts never decide the
     # whole event's acknowledgement. False (default): a for-real subscriber.
     observe_only: bool = False
+    # Operator-marked "not receiving" window ([paused_from, paused_until);
+    # both null = no window, paused_until null = "until explicitly resumed".
+    # While `paused` is true the worker never claims this destination's
+    # copies: they wait in their original queue positions, nothing is
+    # attempted (so nothing counts toward failure isolation) and no reconcile
+    # countdown runs for them. Other destinations are unaffected.
+    paused_from: datetime | None = None
+    paused_until: datetime | None = None
+    paused: bool = False
 
     model_config = {"from_attributes": True}
+
+
+class DestinationResumeOut(BaseModel):
+    destination: DestinationOut
+    # False when the address had no window to clear (idempotent resume).
+    resumed: bool
 
 
 class EventIn(BaseModel):

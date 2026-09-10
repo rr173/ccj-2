@@ -44,6 +44,8 @@ from app.schemas import (
     DestinationIn,
     DestinationOut,
     DestinationPatchIn,
+    DestinationPauseIn,
+    DestinationResumeOut,
     EventBulkRequeueOut,
     EventIn,
     EventOut,
@@ -72,7 +74,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Event Ingest Service",
-    version="2.6.0",
+    version="2.7.0",
     lifespan=lifespan,
 )
 
@@ -1495,6 +1497,131 @@ def recover_destination(destination_id: UUID, db: Session = Depends(get_db)):
         "recovered": recovered,
         "pending_deliveries_reset": reset_count if recovered else None,
     }
+
+
+# --- Operator-marked "not receiving" windows ---------------------------------
+#
+# An operator can mark a stretch of time during which a destination receives
+# nothing (maintenance window, receiver-side freeze). The window is a
+# claim-time gate only: queued copies keep their per-destination queue
+# positions and wait, no attempt is made while the window is in effect (so
+# the pause can never be charged as consecutive failures or trigger
+# isolation), and the reconcile countdown of a waiting copy only starts when
+# it is really sent after the window — never from submit time. Other
+# destinations subscribed to the same event types keep draining normally.
+# Copies already in flight when the window opens finish their HTTP call
+# normally: what was really sent is not taken back.
+
+
+@app.post("/v1/destinations/{destination_id}/pause", response_model=DestinationOut)
+def pause_destination(
+    destination_id: UUID, body: DestinationPauseIn, db: Session = Depends(get_db)
+):
+    # An empty body is a mistake, not a window: at least one bound must be
+    # named. Explicit nulls are fine — {"paused_from": null} marks "from now
+    # until explicitly resumed". Clearing the window is POST .../resume.
+    if not ({"paused_from", "paused_until"} & body.model_fields_set):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "provide paused_from and/or paused_until to mark a "
+                "not-receiving window; use /resume to clear one"
+            ),
+        )
+    destination = db.execute(
+        text(
+            f"""
+            SELECT {DESTINATION_CONFIRM_COLUMNS}
+            FROM destinations
+            WHERE id = CAST(:destination_id AS UUID)
+            FOR UPDATE
+            """
+        ),
+        {"destination_id": destination_id},
+    ).mappings().first()
+    if destination is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="destination not found")
+
+    # A missing start means "from right now" (database clock, so every
+    # service agrees on when the window opened).
+    now = db.execute(text("SELECT now() AS now")).mappings().one()["now"]
+    paused_from = body.paused_from if body.paused_from is not None else now
+    if body.paused_until is not None and body.paused_until <= paused_from:
+        db.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail="paused_until must be later than paused_from",
+        )
+    if body.paused_until is not None and body.paused_until <= now:
+        # A window that is already over can never take effect; it almost
+        # always means a client clock/timezone mistake, so refuse it loudly.
+        db.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail="paused_until is already in the past",
+        )
+
+    # Setting a new window replaces the old one wholesale; queued copies are
+    # never touched — they simply become claimable again when it ends.
+    destination = db.execute(
+        text(
+            f"""
+            UPDATE destinations
+            SET paused_from = CAST(:paused_from AS TIMESTAMPTZ),
+                paused_until = CAST(:paused_until AS TIMESTAMPTZ)
+            WHERE id = CAST(:destination_id AS UUID)
+            RETURNING {DESTINATION_CONFIRM_COLUMNS}
+            """
+        ),
+        {
+            "destination_id": destination_id,
+            "paused_from": paused_from,
+            "paused_until": body.paused_until,
+        },
+    ).mappings().one()
+    result = destination_response(db, destination)
+    db.commit()
+    return result
+
+
+@app.post(
+    "/v1/destinations/{destination_id}/resume",
+    response_model=DestinationResumeOut,
+)
+def resume_destination(destination_id: UUID, db: Session = Depends(get_db)):
+    destination = db.execute(
+        text(
+            f"""
+            SELECT {DESTINATION_CONFIRM_COLUMNS}
+            FROM destinations
+            WHERE id = CAST(:destination_id AS UUID)
+            FOR UPDATE
+            """
+        ),
+        {"destination_id": destination_id},
+    ).mappings().first()
+    if destination is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="destination not found")
+    # Idempotent: clearing a window that is not there changes nothing and
+    # just reports resumed=false, like /recover on an active address.
+    had_window = destination["paused_from"] is not None
+    if had_window:
+        destination = db.execute(
+            text(
+                f"""
+                UPDATE destinations
+                SET paused_from = NULL, paused_until = NULL
+                WHERE id = CAST(:destination_id AS UUID)
+                RETURNING {DESTINATION_CONFIRM_COLUMNS}
+                """
+            ),
+            {"destination_id": destination_id},
+        ).mappings().one()
+    result = destination_response(db, destination)
+    db.commit()
+    return {"destination": result, "resumed": had_window}
 
 
 # --- Inbound admission log --------------------------------------------------

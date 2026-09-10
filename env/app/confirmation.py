@@ -48,11 +48,15 @@ INSERT_CONFIRMATION_ATTEMPT_SQL = text(
 )
 
 # Columns returned whenever a destination's handshake state is selected.
+# `paused` is computed with the database clock: true while the operator-marked
+# "not receiving" window [paused_from, paused_until) is in effect right now.
 DESTINATION_CONFIRM_COLUMNS = (
     "id, url, status, failure_count, recoverable_at, created_at, "
     "confirmation_state, challenge_token, challenge_expires_at, confirmed_at, "
     "confirmation_generation, confirmation_round, confirmation_attempt_count, "
-    "next_probe_at, observe_only"
+    "next_probe_at, observe_only, paused_from, paused_until, "
+    "(paused_from IS NOT NULL AND paused_from <= now() "
+    " AND (paused_until IS NULL OR paused_until > now())) AS paused"
 )
 
 

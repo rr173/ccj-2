@@ -102,6 +102,17 @@ CLAIM_SQL = text(
           -- a stale head is cleaned up by the supersede step below.
           AND d.confirmation_state = 'confirmed'
           AND oldest.delivery_generation = d.confirmation_generation
+          -- A destination inside its operator-marked "not receiving" window
+          -- is skipped entirely: its copies keep their queue positions and
+          -- wait, no attempt is made (so the pause can never be charged as
+          -- consecutive failures or trigger isolation), no reconcile
+          -- countdown runs for them, and other destinations subscribed to
+          -- the same types keep draining normally.
+          AND (
+                d.paused_from IS NULL
+             OR d.paused_from > now()
+             OR (d.paused_until IS NOT NULL AND d.paused_until <= now())
+          )
           -- A requeued (unreconciled) copy re-enters the queue with its
           -- original, smaller destination_seq. Never claim any copy for a
           -- destination while another copy of it is still in flight: the

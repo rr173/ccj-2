@@ -38,13 +38,28 @@ SCHEMA_STATEMENTS = [
         -- The flag is snapshotted onto each delivery at fan-out time, so a
         -- later toggle never rewrites the standing of already-created copies.
         observe_only BOOLEAN NOT NULL DEFAULT FALSE,
+        -- Operator-marked "not receiving" window [paused_from, paused_until).
+        -- While now() is inside the window the worker never claims this
+        -- destination's copies: they wait in their original queue positions,
+        -- no attempt is made (so the pause can never be charged as
+        -- consecutive failures or trigger isolation), no reconcile countdown
+        -- runs for them (it only starts when a copy is really sent), and
+        -- other destinations subscribed to the same types keep draining.
+        -- paused_until NULL with paused_from set means "not receiving until
+        -- explicitly resumed"; both NULL means no window.
+        paused_from TIMESTAMPTZ,
+        paused_until TIMESTAMPTZ,
         CHECK (status IN ('active', 'isolated')),
         CHECK (failure_count >= 0),
         CHECK (next_event_seq >= 0),
         CHECK (confirmation_state IN ('pending', 'confirmed')),
         CHECK (confirmation_generation >= 1),
         CHECK (confirmation_round >= 1),
-        CHECK (confirmation_attempt_count >= 0)
+        CHECK (confirmation_attempt_count >= 0),
+        CONSTRAINT destinations_pause_window_check CHECK (
+            (paused_until IS NULL OR paused_from IS NOT NULL)
+            AND (paused_until IS NULL OR paused_until > paused_from)
+        )
     )
     """,
     # Audit trail of the activation handshake for each destination:
@@ -572,6 +587,22 @@ SCHEMA_STATEMENTS = [
     """
     ALTER TABLE events ADD CONSTRAINT events_required_ack_count_check
         CHECK (required_ack_count IS NULL OR required_ack_count >= 0)
+    """,
+    # Idempotent upgrades for operator-marked "not receiving" windows. The
+    # window is a claim-time gate only: while it is in effect the destination
+    # is never picked, its copies keep their queue positions, nothing is
+    # attempted (nothing counts toward failure isolation) and no reconcile
+    # countdown runs. Existing destinations have no window (both columns
+    # null) and behave exactly as before.
+    "ALTER TABLE destinations ADD COLUMN IF NOT EXISTS paused_from TIMESTAMPTZ",
+    "ALTER TABLE destinations ADD COLUMN IF NOT EXISTS paused_until TIMESTAMPTZ",
+    "ALTER TABLE destinations DROP CONSTRAINT IF EXISTS destinations_pause_window_check",
+    """
+    ALTER TABLE destinations ADD CONSTRAINT destinations_pause_window_check
+        CHECK (
+            (paused_until IS NULL OR paused_from IS NOT NULL)
+            AND (paused_until IS NULL OR paused_until > paused_from)
+        )
     """,
 ]
 
