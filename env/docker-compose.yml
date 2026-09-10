@@ -21,6 +21,7 @@ services:
       DATABASE_URL: postgresql+psycopg://event:event@postgres:5432/events
       DB_POOL_SIZE: "${DB_POOL_SIZE:-10}"
       DB_MAX_OVERFLOW: "${DB_MAX_OVERFLOW:-5}"
+      RECEIPT_DELIVERY_GRACE_SECONDS: "${RECEIPT_DELIVERY_GRACE_SECONDS:-2}"
     ports:
       - "8000:8000"
     depends_on:
@@ -49,6 +50,23 @@ services:
       RETRY_BACKOFF_MAX_SECONDS: "${RETRY_BACKOFF_MAX_SECONDS:-3600}"
       FAILURE_THRESHOLD: "${FAILURE_THRESHOLD:-5}"
       QUARANTINE_SECONDS: "${QUARANTINE_SECONDS:-900}"
+      RECEIPT_TIMEOUT_SECONDS: "${RECEIPT_TIMEOUT_SECONDS:-300}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Reconciliation sweeper: flips deliveries whose receipt window expired from
+  # "awaiting" to "timed_out". Separate process from the outbound worker so
+  # receipt reconciliation scales independently of delivery throughput.
+  reconciler:
+    build: .
+    command: ["python", "-m", "app.reconciler"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://event:event@postgres:5432/events
+      DB_POOL_SIZE: "${RECONCILER_DB_POOL_SIZE:-2}"
+      DB_MAX_OVERFLOW: "${RECONCILER_DB_MAX_OVERFLOW:-1}"
+      RECONCILE_SWEEP_INTERVAL_SECONDS: "${RECONCILE_SWEEP_INTERVAL_SECONDS:-5}"
     depends_on:
       postgres:
         condition: service_healthy

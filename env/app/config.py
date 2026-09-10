@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     quarantine_seconds: int = 900
     max_response_body_bytes: int = 2048
 
+    # Receipt reconciliation settings
+    receipt_timeout_seconds: float = 300.0
+    reconcile_sweep_interval_seconds: float = 5.0
+    receipt_delivery_grace_seconds: float = 2.0
+
 
 @lru_cache
 def get_settings() -> Settings:

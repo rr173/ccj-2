@@ -80,6 +80,16 @@ CLAIM_SQL = text(
                 d.status = 'active'
              OR (d.status = 'isolated' AND d.recoverable_at <= now())
         )
+          -- A requeued (unreconciled) copy re-enters the queue with its
+          -- original, smaller destination_seq. Never claim any copy for a
+          -- destination while another copy of it is still in flight: the
+          -- requeued copy must not jump ahead of the one being delivered.
+          AND NOT EXISTS (
+                SELECT 1
+                FROM deliveries other_in_flight
+                WHERE other_in_flight.destination_id = d.id
+                  AND other_in_flight.status = 'in_flight'
+          )
         ORDER BY oldest.delivery_due_at
         LIMIT 1
         FOR UPDATE OF d SKIP LOCKED
@@ -147,7 +157,12 @@ EVENT_SUCCESS_SQL = text(
         lease_until = NULL,
         last_error = NULL,
         updated_at = now(),
-        delivered_at = now()
+        delivered_at = now(),
+        reconcile_state = 'awaiting',
+        reconcile_deadline = now() + make_interval(secs => :receipt_timeout_seconds),
+        reconciled_at = NULL,
+        receipt_result = NULL,
+        receipt_id = NULL
     WHERE id = :delivery_id
       AND status = 'in_flight'
       AND claim_token = :claim_token
@@ -429,6 +444,7 @@ def record_result(
             {
                 "delivery_id": claim["delivery_id"],
                 "claim_token": claim["claim_token"],
+                "receipt_timeout_seconds": settings.receipt_timeout_seconds,
             },
         )
         if updated.rowcount != 1:

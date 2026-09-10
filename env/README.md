@@ -1,12 +1,13 @@
 # 事件外发系统
 
-这是一个接收事件、按事件类型分发给订阅地址，并把事件按顺序推送到外部 Webhook 的两服务系统：
+这是一个接收事件、按事件类型分发给订阅地址，把事件按顺序推送到外部 Webhook，并对推送结果做**回执对账**的系统：
 
-- **ingest-api**：只负责登记接收地址（含订阅的事件类型）、接收事件、查询事件投递轨迹和人工恢复隔离地址。
+- **ingest-api**：登记接收地址（含订阅的事件类型）、接收事件、**接入回执**、查询事件投递轨迹与对账情况、人工恢复隔离地址、把超时未对上的副本重投。
 - **worker**：负责真正的 HTTP 投递、重试、熔断隔离、崩溃恢复。
+- **reconciler**：独立的对账进程，周期性把超过约定时间仍未收到回执的副本标记为 `timed_out`（可查，不算认）。
 - **PostgreSQL**：作为任务队列和事实来源，用行锁和每地址单调序号保证同一个接收地址严格 FIFO。
 
-两个服务使用同一个镜像但启动命令不同，可以独立水平扩缩。
+前三个服务使用同一个镜像但启动命令不同，可以独立水平扩缩：回执接入（在 ingest-api 里）和对账（reconciler）都不在外发 worker 进程内，两边互不影响。
 
 ## 关键语义
 
@@ -57,6 +58,36 @@
 
 这样“慢响应”和“真宕机”被区分开：慢不会导致重复外发，宕机仍能从未成功处续投。
 
+### 6. 回执对账
+
+HTTP 投递拿到 2xx 只说明“打出去了”，不代表对方处理完了。对账语义：
+
+- 副本投妥后进入 `awaiting` 对账状态，并写入约定对账时限 `reconcile_deadline`（投妥时间 + `RECEIPT_TIMEOUT_SECONDS`，默认 300 秒）。
+- 接收方处理完后回调 `POST /v1/receipts`，带上它拿到的 `destination_id`、`dedupe_key` 和处理结果 `result`（`success` / `failure`）。系统按 `(destination_id, dedupe_key)` 定位唯一副本：
+  - 在时限内匹配上 → 副本记为 `acknowledged`（result=success）或 `receipt_failed`（result=failure），这才算**对方认了**；
+  - 时限内没等到 → reconciler 把副本标记为 `timed_out`。**超时不是认**，可以通过对账查询接口全部查出来；
+  - 过了时限才到的回执记为 `late`：写入回执日志可查询，但**不会**把已经超时的副本改回认了；
+  - 同一条回执重复送来只认一次：副本已被对账过的后续回执记为 `duplicate`，幂等返回，不重复生效；
+  - 查无此副本的回执记为 `orphan`，副本还在传输中就提前到的回执记为 `premature`，都留在回执日志里可查。
+- 回执接入（ingest-api 的接口）和对账扫描（reconciler 进程）都不在外发 worker 进程里，可以各自独立扩缩。
+- 回执结果（包括失败回执）不影响地址的失败计数与隔离状态——隔离只看传输层投递结果。
+
+#### 超时/失败副本的重投
+
+`timed_out` 或 `receipt_failed` 的副本可以丢回原地址重投：
+
+- `POST /v1/deliveries/{delivery_id}/requeue`：重投单个副本；
+- `POST /v1/destinations/{destination_id}/requeue-unreconciled`：把该地址所有未对上的副本一次性重投。
+
+重投**保留原来的 `destination_seq`**，副本回到原地址队列中它原来的位置，按原顺序接着排；同时 Worker 的领取逻辑保证：只要该地址还有副本在投（`in_flight`），重投回来的副本就不会被领取——不会插到还在投的副本前面。重投成功后该副本重新进入 `awaiting`，等待新一轮回执。
+
+#### 对账查询
+
+- `GET /v1/reconciliations/summary`：各对账状态的副本数量；
+- `GET /v1/reconciliations/deliveries?reconcile_state=timed_out&destination_id=...`：列出指定状态（默认 `timed_out`）的副本明细；
+- `GET /v1/receipts?disposition=late&destination_id=...`：回执日志，可按处置结果（`applied`/`duplicate`/`late`/`orphan`/`premature`）过滤；
+- `GET /v1/events/{event_id}/trace`：每条副本附带 `reconcile_state`、对账时限、回执结果，以及该事件命中的全部回执记录。
+
 ## 快速启动
 
 ```bash
@@ -67,13 +98,16 @@ docker compose up --build
 
 - API：`http://localhost:8000`
 - OpenAPI：`http://localhost:8000/docs`
-- PostgreSQL：仅 Compose 内部暴露给两个服务
+- PostgreSQL：仅 Compose 内部暴露给几个服务
 
 独立扩缩示例：
 
 ```bash
 # 扩 Worker；每个实例默认 4 个投递线程
 WORKER_CONCURRENCY=8 docker compose up --build --scale worker=3
+
+# 回执接入随 ingest-api 扩，对账扫描单独扩
+docker compose up --build --scale reconciler=2
 ```
 
 API 也可以独立增加副本，但 Compose 文件中默认将 API 的 8000 端口固定发布到宿主机。多副本时建议改为反向代理/负载均衡器访问服务发现名 `ingest-api:8000`，不要直接对多副本绑定同一个宿主机端口。
@@ -136,7 +170,50 @@ curl -s http://localhost:8000/v1/events \
 curl -s http://localhost:8000/v1/events/<event_id>/trace
 ```
 
-返回事件当前状态、每个地址的副本（`deliveries`：状态、序号、已尝试次数、下次尝试时间、最近错误）和全部投递尝试（`attempts`：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息；若某次调用是在租约丢失后返回的，会带 `lost_lease: true`）。没人订的事件在这里能看到 `status: "unrouted"` 且 `deliveries` 为空——是明确的“没送出去”，不是成功。
+返回事件当前状态、每个地址的副本（`deliveries`：状态、序号、已尝试次数、下次尝试时间、最近错误、对账状态 `reconcile_state`、对账时限 `reconcile_deadline`、回执结果 `receipt_result`）、全部投递尝试（`attempts`：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息；若某次调用是在租约丢失后返回的，会带 `lost_lease: true`）和该事件命中的回执（`receipts`）。没人订的事件在这里能看到 `status: "unrouted"` 且 `deliveries` 为空——是明确的“没送出去”，不是成功。
+
+### 回执接入（接收方回调）
+
+接收方处理完一条副本后，在约定的对账时限内回调：
+
+```bash
+curl -s http://localhost:8000/v1/receipts \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "destination_id": "<登记地址时返回的 id>",
+    "dedupe_key": "order-1001-paid",
+    "result": "success"
+  }'
+```
+
+响应里的 `disposition` 说明这条回执被如何处置：
+
+- `applied`：在时限内匹配到待对账副本，已按 `result` 记为 `acknowledged` / `receipt_failed`；
+- `duplicate`：同一条回执重复送来，只认一次，幂等返回；
+- `late`：过了对账时限才到，只记录、不把已超时的副本改成认了；
+- `orphan`：按 `(destination_id, dedupe_key)` 查无此副本；
+- `premature`：副本还在传输中（回执比投递结果先到了）。
+
+无论哪种处置，回执都会落进回执日志，可用 `GET /v1/receipts` 查询。
+
+### 对账查询与重投
+
+```bash
+# 各对账状态的副本数量
+curl -s http://localhost:8000/v1/reconciliations/summary
+
+# 约定时间内没对上的副本（默认 reconcile_state=timed_out）
+curl -s 'http://localhost:8000/v1/reconciliations/deliveries?reconcile_state=timed_out'
+
+# 迟到的回执
+curl -s 'http://localhost:8000/v1/receipts?disposition=late'
+
+# 重投单个超时副本（保留原 destination_seq，回到原地址队列原位置）
+curl -s -X POST http://localhost:8000/v1/deliveries/<delivery_id>/requeue
+
+# 把某地址所有没对上的副本一次性重投
+curl -s -X POST http://localhost:8000/v1/destinations/<destination_id>/requeue-unreconciled
+```
 
 ### 立即恢复隔离地址
 
@@ -179,7 +256,24 @@ X-Delivery-Id: 9c2f0a4e-7b1d-4e55-9a3c-2f8d6c1a0b22
 }
 ```
 
-接收方只有返回 2xx 才算成功。请在接收方用 `Idempotency-Key` 做幂等表或唯一约束。
+接收方只有返回 2xx 才算**传输成功**。请在接收方用 `Idempotency-Key` 做幂等表或唯一约束。
+
+传输成功不等于对方认了：接收方处理完业务后，还需要在约定时限（`RECEIPT_TIMEOUT_SECONDS`，默认 300 秒）内回调回执接口：
+
+```http
+POST /v1/receipts HTTP/1.1
+Content-Type: application/json
+
+{
+  "destination_id": "1c4f8a2b-....",
+  "dedupe_key": "order-1001-paid",
+  "result": "success"
+}
+```
+
+- `destination_id` 和 `dedupe_key` 直接取投递请求体里的同名字段（`dedupe_key` 也即 `Idempotency-Key` 头）；`result` 为 `success` 或 `failure`。
+- 回执按 `(destination_id, dedupe_key)` 对账：时限内对上才算认；重复回执只认一次；超时后到的回执只记为迟到，不会把副本改回认了。
+- 回执接口可以安全重试：接收方收不到回执响应时直接重发同一条回执即可，服务端幂等。
 
 ## 本地手工验证
 
@@ -189,7 +283,16 @@ X-Delivery-Id: 9c2f0a4e-7b1d-4e55-9a3c-2f8d6c1a0b22
 python3 scripts/mock_receiver.py --port 9000 --fail-times 3
 ```
 
-在 Linux + Docker Desktop/bridge 网络下，容器内通常可用 `http://172.17.0.1:9000/` 访问宿主机进程；不同环境请替换为实际可达地址。注册该地址（记得带上 `event_types`）后连续提交多条对应类型的事件，再用 `/v1/events/{id}/trace` 查看每份副本的每次尝试。
+让它同时自动回执（处理成功后回调回执接口）：
+
+```bash
+python3 scripts/mock_receiver.py --port 9000 \
+  --receipt-url http://localhost:8000/v1/receipts
+# 观察迟到回执：把回执延迟到对账时限之后
+# RECEIPT_TIMEOUT_SECONDS=20 python3 ... (服务端) + --receipt-delay 30 (接收方)
+```
+
+在 Linux + Docker Desktop/bridge 网络下，容器内通常可用 `http://172.17.0.1:9000/` 访问宿主机进程；不同环境请替换为实际可达地址。注册该地址（记得带上 `event_types`）后连续提交多条对应类型的事件，再用 `/v1/events/{id}/trace` 查看每份副本的每次尝试与对账状态；用 `/v1/reconciliations/summary`、`/v1/reconciliations/deliveries?reconcile_state=timed_out` 和 `/v1/receipts?disposition=late` 观察对账结果。
 
 ## 环境变量
 
@@ -208,18 +311,24 @@ python3 scripts/mock_receiver.py --port 9000 --fail-times 3
 | `FAILURE_THRESHOLD` | `5` | 连续失败多少次后隔离地址 |
 | `QUARANTINE_SECONDS` | `900` | 自动隔离时长 |
 | `MAX_RESPONSE_BODY_BYTES` | `2048` | 轨迹表保存响应体片段的最大长度 |
+| `RECEIPT_TIMEOUT_SECONDS` | `300` | 回执对账时限：副本投妥后等待回执的约定时间，超时记为 `timed_out`（Worker 侧配置） |
+| `RECONCILE_SWEEP_INTERVAL_SECONDS` | `5` | reconciler 扫描超时副本的间隔 |
+| `RECEIPT_DELIVERY_GRACE_SECONDS` | `2` | 回执比投递结果先到时，回执接口等待 Worker 落库投递结果的宽限（API 侧配置） |
 
 ## 数据表概览
 
 - `events`：事件本体（类型、去重键、负载），一条事件一行，与地址无关。
 - `destination_subscriptions`：地址订阅的事件类型集合。
-- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态、下次尝试时间和租约信息；Worker 只消费这张表。
+- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态、下次尝试时间、租约信息和对账状态（`reconcile_state`、对账时限、回执结果、重投次数）；Worker 只消费这张表。
 - `delivery_attempts`：每次 HTTP 投递尝试的审计轨迹（关联事件与副本）。
+- `receipts`：接收方回执日志，一条回执一行，含处置结果（`applied`/`duplicate`/`late`/`orphan`/`premature`）与匹配到的副本；重复、迟到、查无副本的回执都留在这里可查。
 - `destinations`：接收地址、状态、连续失败次数、隔离可恢复时间、该地址下一个序号。
 
 ## 从一对一模型升级
 
 表结构通过 `init_db` 幂等迁移：旧的按地址存事件的 `events` 表会自动改名为 `deliveries`（未投完的行原样保留，Worker 会接着投），并新建逻辑事件表 `events` 与订阅表 `destination_subscriptions`。老数据里的历史投递没有对应的逻辑事件，其 `event_id` 为 `NULL`，不影响继续投递。
+
+回执对账的列（`reconcile_state` 等）和 `receipts` 表同样以幂等方式补齐。升级前已投妥的历史副本 `reconcile_state` 为 `none`，不会要求补回执；如果接收方对这些老副本补发回执，仍会按 `applied` 正常对账。
 
 ## 生产化建议
 
@@ -228,5 +337,5 @@ python3 scripts/mock_receiver.py --port 9000 --fail-times 3
 1. API 前增加负载均衡器和 HTTPS。
 2. 为登记地址、提交事件和恢复接口增加认证/鉴权。
 3. 使用托管 PostgreSQL，设置备份、连接数上限和慢查询监控。
-4. 增加 Prometheus 指标：待投递数、投递延迟、失败率、隔离地址数、Worker 心跳。
+4. 增加 Prometheus 指标：待投递数、投递延迟、失败率、隔离地址数、Worker 心跳、超时未对账副本数、迟到回执数。
 5. 将 `CREATE TABLE IF NOT EXISTS` 替换为 Alembic 迁移，便于后续表结构变更。

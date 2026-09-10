@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
@@ -77,6 +77,8 @@ class EventOut(BaseModel):
     status: str
     delivery_count: int
     delivered_count: int
+    # How many fanned-out copies have been acknowledged by a matching receipt.
+    acknowledged_count: int = 0
     created_at: datetime
     duplicate: bool = False
 
@@ -94,6 +96,13 @@ class DeliveryOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     delivered_at: datetime | None = None
+    # Reconciliation lifecycle of this copy:
+    # none -> awaiting -> acknowledged | receipt_failed | timed_out
+    reconcile_state: str = "none"
+    reconcile_deadline: datetime | None = None
+    reconciled_at: datetime | None = None
+    receipt_result: str | None = None
+    requeue_count: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -115,10 +124,55 @@ class DeliveryAttemptOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ReceiptIn(BaseModel):
+    # The receiver echoes back the destination_id and dedupe_key it was given
+    # in the delivery, plus whether its own processing succeeded.
+    destination_id: UUID
+    dedupe_key: str = Field(..., min_length=1, max_length=256)
+    result: Literal["success", "failure"]
+
+
+class ReceiptOut(BaseModel):
+    id: UUID
+    destination_id: UUID
+    dedupe_key: str
+    result: str
+    delivery_id: UUID | None = None
+    # applied: matched a delivery still inside its reconciliation window;
+    # duplicate: the delivery was already reconciled, counted exactly once;
+    # late: arrived after the reconcile deadline, recorded but NOT applied;
+    # orphan: no delivery exists for (destination_id, dedupe_key);
+    # premature: the delivery has not completed transport yet.
+    disposition: str
+    received_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ReconciliationSummaryOut(BaseModel):
+    awaiting: int = 0
+    acknowledged: int = 0
+    receipt_failed: int = 0
+    timed_out: int = 0
+
+
+class RequeueOut(BaseModel):
+    delivery_id: UUID
+    destination_id: UUID
+    destination_seq: int
+    requeued: bool
+
+
+class BulkRequeueOut(BaseModel):
+    destination_id: UUID
+    requeued_count: int
+
+
 class EventTraceOut(BaseModel):
     event: EventOut
     deliveries: list[DeliveryOut]
     attempts: list[DeliveryAttemptOut]
+    receipts: list[ReceiptOut] = []
 
 
 class RecoveryOut(BaseModel):

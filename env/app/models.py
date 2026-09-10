@@ -67,11 +67,35 @@ SCHEMA_STATEMENTS = [
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         delivered_at TIMESTAMPTZ,
+        reconcile_state TEXT NOT NULL DEFAULT 'none',
+        reconcile_deadline TIMESTAMPTZ,
+        reconciled_at TIMESTAMPTZ,
+        receipt_result TEXT,
+        receipt_id UUID,
+        requeue_count INTEGER NOT NULL DEFAULT 0,
         UNIQUE (destination_id, destination_seq),
         UNIQUE (destination_id, dedupe_key),
         CHECK (status IN ('pending', 'in_flight', 'delivered')),
         CHECK (attempts >= 0),
-        CHECK (destination_seq >= 0)
+        CHECK (destination_seq >= 0),
+        CHECK (reconcile_state IN ('none', 'awaiting', 'acknowledged', 'receipt_failed', 'timed_out')),
+        CHECK (requeue_count >= 0)
+    )
+    """,
+    # One row per callback receipt sent by a receiver. The disposition records
+    # how the receipt was judged at ingestion time, so late/duplicate/orphan
+    # receipts stay visible instead of being silently dropped.
+    """
+    CREATE TABLE IF NOT EXISTS receipts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        destination_id UUID NOT NULL REFERENCES destinations(id),
+        dedupe_key TEXT NOT NULL,
+        result TEXT NOT NULL,
+        delivery_id UUID REFERENCES deliveries(id),
+        disposition TEXT NOT NULL,
+        received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CHECK (result IN ('success', 'failure')),
+        CHECK (disposition IN ('applied', 'duplicate', 'late', 'orphan', 'premature'))
     )
     """,
     """
@@ -154,6 +178,35 @@ SCHEMA_STATEMENTS = [
     """
     CREATE INDEX IF NOT EXISTS destination_subscriptions_type_idx
         ON destination_subscriptions (event_type, destination_id)
+    """,
+    # Idempotent upgrades for databases created before receipt reconciliation.
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS reconcile_state TEXT NOT NULL DEFAULT 'none'",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS reconcile_deadline TIMESTAMPTZ",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS receipt_result TEXT",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS receipt_id UUID",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS requeue_count INTEGER NOT NULL DEFAULT 0",
+    """
+    CREATE INDEX IF NOT EXISTS deliveries_reconcile_due_idx
+        ON deliveries (reconcile_deadline)
+        WHERE reconcile_state = 'awaiting'
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS deliveries_reconcile_state_idx
+        ON deliveries (reconcile_state, destination_id)
+        WHERE reconcile_state <> 'none'
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS receipts_destination_dedupe_idx
+        ON receipts (destination_id, dedupe_key)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS receipts_disposition_idx
+        ON receipts (disposition, received_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS receipts_delivery_idx
+        ON receipts (delivery_id)
     """,
 ]
 
