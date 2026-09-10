@@ -266,12 +266,19 @@ FAILURE_SQL = text(
         RETURNING destination_id
     )
     UPDATE destinations d
-    SET failure_count = failure_count + 1,
+    -- The parked copy is out of the queue, so it must not keep the address's
+    -- later copies behind a quarantine wall either: its death resets the
+    -- address failure tally and lets the next queued copy act as the probe.
+    -- If that probe keeps failing the normal threshold re-isolates the
+    -- address; other destinations are untouched either way.
+    SET failure_count = CASE WHEN :dead_letter THEN 0 ELSE failure_count + 1 END,
         status = CASE
+            WHEN :dead_letter THEN 'active'
             WHEN failure_count + 1 >= :failure_threshold THEN 'isolated'
             ELSE status
         END,
         recoverable_at = CASE
+            WHEN :dead_letter THEN NULL
             WHEN failure_count + 1 >= :failure_threshold THEN :recoverable_at
             ELSE recoverable_at
         END

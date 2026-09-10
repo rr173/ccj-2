@@ -375,7 +375,7 @@ SCHEMA_STATEMENTS = [
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded'))
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered'))
     """,
     # Idempotent upgrades for databases created before inbound source auth.
     # Every newly accepted event belongs to the registered source that pushed
@@ -448,12 +448,14 @@ SCHEMA_STATEMENTS = [
     "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS confirmation_generation BIGINT NOT NULL DEFAULT 1",
     # Widen the status check on upgraded databases (the constraint may carry
     # either auto-generated name, including one inherited from the legacy
-    # events table rename).
+    # events table rename). The dead-letter migration below widens it once
+    # more to include 'dead_lettered'; keep this set aligned so re-running
+    # init_db on a database that already has dead-lettered rows validates.
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_status_check",
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded'))
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered'))
     """,
     # Widen the ingestion disposition check to include pending_confirmation.
     "ALTER TABLE ingestion_attempts DROP CONSTRAINT IF EXISTS ingestion_attempts_disposition_check",

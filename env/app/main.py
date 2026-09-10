@@ -36,6 +36,8 @@ from app.schemas import (
     ConfirmationAttemptOut,
     ConfirmationIn,
     ConfirmationOut,
+    DeadLetterReviveOut,
+    DeadLetterSummaryOut,
     DeliveryOut,
     DestinationIn,
     DestinationOut,
@@ -67,7 +69,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Event Ingest Service",
-    version="2.4.0",
+    version="2.5.0",
     lifespan=lifespan,
 )
 
@@ -109,6 +111,8 @@ def event_status(
     delivery_count: int,
     delivered_count: int,
     superseded_count: int,
+    pending_count: int = 0,
+    dead_lettered_count: int = 0,
 ) -> str:
     if cancelled_at is not None:
         return "cancelled"
@@ -119,6 +123,14 @@ def event_status(
         if superseded_count > 0:
             return "superseded"
         return "unrouted"
+    if pending_count > 0:
+        return "pending"
+    if dead_lettered_count > 0:
+        # Every live copy stopped: at least one is parked in the dead-letter
+        # area and nothing is queued or in flight. It is not "delivered" — the
+        # parked copies never completed — and it only leaves this state when a
+        # copy is manually revived (which puts it back to pending).
+        return "dead_lettered"
     if delivered_count >= delivery_count:
         return "delivered"
     return "pending"
@@ -135,15 +147,20 @@ def event_reconcile_status(delivery_count: int, acknowledged_count: int) -> str:
 def event_response(event: RowMapping | dict[str, Any]) -> dict:
     result = dict(event)
     superseded_count = result.get("superseded_count", 0) or 0
+    dead_lettered_count = result.get("dead_lettered_count", 0) or 0
+    pending_count = result.get("pending_count", 0) or 0
     # delivery_count counts live copies only — superseded copies never went
     # out and must not be described as still pending or as delivered.
     result["delivery_count"] = result["delivery_count"] - superseded_count
     result["superseded_count"] = superseded_count
+    result["dead_lettered_count"] = dead_lettered_count
     result["status"] = event_status(
         result.get("cancelled_at"),
         result["delivery_count"],
         result["delivered_count"],
         superseded_count,
+        pending_count,
+        dead_lettered_count,
     )
     result["reconcile_status"] = event_reconcile_status(
         result["delivery_count"], result["acknowledged_count"]
@@ -159,10 +176,15 @@ EVENT_WITH_COUNTS_SQL = """
            e.not_before, e.cancelled_at,
            COUNT(d.id)::int AS delivery_count,
            COUNT(d.id) FILTER (WHERE d.status = 'delivered')::int AS delivered_count,
+           COUNT(d.id) FILTER (
+               WHERE d.status IN ('pending', 'in_flight')
+           )::int AS pending_count,
            COUNT(d.id) FILTER (WHERE d.reconcile_state = 'acknowledged')::int
                AS acknowledged_count,
            COUNT(d.id) FILTER (WHERE d.status = 'superseded')::int
-               AS superseded_count
+               AS superseded_count,
+           COUNT(d.id) FILTER (WHERE d.status = 'dead_lettered')::int
+               AS dead_lettered_count
     FROM events e
     LEFT JOIN deliveries d ON d.event_id = e.id
     WHERE {where}
@@ -853,8 +875,10 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     result = dict(event)
     result["delivery_count"] = len(subscribers)
     result["delivered_count"] = 0
+    result["pending_count"] = len(subscribers)
     result["acknowledged_count"] = 0
     result["superseded_count"] = 0
+    result["dead_lettered_count"] = 0
     return event_response(result), 201
 
 
@@ -871,11 +895,13 @@ def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
         text(
             """
             SELECT d.id, d.event_id, d.destination_id, dest.url AS destination_url,
-                   d.destination_seq, d.status, d.attempts, d.next_attempt_at,
+                   d.destination_seq, d.dedupe_key, d.event_type, d.status, d.attempts,
+                   d.next_attempt_at,
                    d.not_before, d.last_error, d.created_at, d.updated_at,
                    d.delivered_at, d.reconcile_state, d.reconcile_deadline,
                    d.reconciled_at, d.receipt_result, d.requeue_count,
-                   d.confirmation_generation
+                   d.consecutive_failures, d.dead_letter_reason,
+                   d.dead_lettered_at, d.confirmation_generation
             FROM deliveries d
             JOIN destinations dest ON dest.id = d.destination_id
             WHERE d.event_id = CAST(:event_id AS UUID)
@@ -1293,6 +1319,32 @@ REQUEUE_SET_SQL = """
     updated_at = now()
 """
 
+# Revive a parked copy out of the dead-letter area. Unlike a normal requeue
+# this is the only thing that can touch a 'dead_lettered' row, and it starts
+# the copy's budgets fresh (the failure streak and the requeue-cycle counter
+# reset so a parked copy is not immediately parked again). The copy keeps its
+# original destination_seq, so it re-enters the per-destination queue at its
+# original position; the worker additionally refuses to claim anything while
+# another copy of that destination is in flight, so a revived copy never jumps
+# ahead of one currently being delivered.
+DEAD_LETTER_REVIVE_SQL = """
+    status = 'pending',
+    reconcile_state = 'none',
+    reconcile_deadline = NULL,
+    reconciled_at = NULL,
+    receipt_result = NULL,
+    receipt_id = NULL,
+    claim_token = NULL,
+    claimed_at = NULL,
+    lease_until = NULL,
+    next_attempt_at = now(),
+    consecutive_failures = 0,
+    requeue_count = 0,
+    dead_letter_reason = NULL,
+    dead_lettered_at = NULL,
+    updated_at = now()
+"""
+
 
 @app.post("/v1/receipts", response_model=ReceiptOut)
 def receive_receipt(body: ReceiptIn, db: Session = Depends(get_db)):
@@ -1385,11 +1437,13 @@ def list_reconciliation_deliveries(
         text(
             """
             SELECT d.id, d.event_id, d.destination_id, dest.url AS destination_url,
-                   d.destination_seq, d.status, d.attempts, d.next_attempt_at,
+                   d.destination_seq, d.dedupe_key, d.event_type, d.status, d.attempts,
+                   d.next_attempt_at,
                    d.not_before, d.last_error, d.created_at, d.updated_at,
                    d.delivered_at, d.reconcile_state, d.reconcile_deadline,
                    d.reconciled_at, d.receipt_result, d.requeue_count,
-                   d.confirmation_generation
+                   d.consecutive_failures, d.dead_letter_reason,
+                   d.dead_lettered_at, d.confirmation_generation
             FROM deliveries d
             JOIN destinations dest ON dest.id = d.destination_id
             WHERE d.reconcile_state = :reconcile_state
@@ -1505,3 +1559,171 @@ def requeue_unreconciled(destination_id: UUID, db: Session = Depends(get_db)):
     ).mappings().all()
     db.commit()
     return {"destination_id": destination_id, "requeued_count": len(requeued)}
+
+
+# --- Dead-letter area -------------------------------------------------------
+#
+# A copy arrives here in exactly two ways:
+#  * its own consecutive transport failures reached MAX_DELIVERY_ATTEMPTS
+#    (reason delivery_attempts_exhausted, put here by the worker);
+#  * it was handed off (2xx) but its receipt kept not matching after
+#    MAX_REQUEUE_CYCLES requeues — a deadline timeout
+#    (receipt_timeout_exhausted, put here by the reconciler) or a failure
+#    receipt on the last allowed cycle (receipt_failure_exhausted, put here by
+#    the receipt endpoint).
+# Parked copies are never claimed, never block later copies of the same
+# address, are never treated as acknowledged, and only leave via an explicit
+# manual revive that puts them back at their original queue position.
+
+DEAD_LETTER_REASONS = (
+    "delivery_attempts_exhausted",
+    "receipt_timeout_exhausted",
+    "receipt_failure_exhausted",
+)
+
+
+@app.get("/v1/dead-letters/summary", response_model=DeadLetterSummaryOut)
+def dead_letter_summary(db: Session = Depends(get_db)):
+    rows = db.execute(
+        text(
+            """
+            SELECT dead_letter_reason, COUNT(*)::int AS count
+            FROM deliveries
+            WHERE status = 'dead_lettered'
+            GROUP BY dead_letter_reason
+            """
+        )
+    ).mappings().all()
+    counts = {row["dead_letter_reason"]: row["count"] for row in rows}
+    return {
+        "total": sum(counts.values()),
+        "delivery_attempts_exhausted": counts.get("delivery_attempts_exhausted", 0),
+        "receipt_timeout_exhausted": counts.get("receipt_timeout_exhausted", 0),
+        "receipt_failure_exhausted": counts.get("receipt_failure_exhausted", 0),
+    }
+
+
+@app.get("/v1/dead-letters", response_model=list[DeliveryOut])
+def list_dead_letters(
+    destination_id: UUID | None = None,
+    event_id: UUID | None = None,
+    reason: str | None = None,
+    dedupe_key: str | None = None,
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    # Every parked copy stays answerable here: which copy (id/dedupe_key/event),
+    # which address (destination id + url) and why/when it went in.
+    if reason is not None and reason not in DEAD_LETTER_REASONS:
+        raise HTTPException(status_code=422, detail="invalid dead_letter_reason")
+    return db.execute(
+        text(
+            """
+            SELECT d.id, d.event_id, d.destination_id, dest.url AS destination_url,
+                   d.destination_seq, d.dedupe_key, d.event_type, d.status, d.attempts,
+                   d.next_attempt_at,
+                   d.not_before, d.last_error, d.created_at, d.updated_at,
+                   d.delivered_at, d.reconcile_state, d.reconcile_deadline,
+                   d.reconciled_at, d.receipt_result, d.requeue_count,
+                   d.consecutive_failures, d.dead_letter_reason,
+                   d.dead_lettered_at, d.confirmation_generation
+            FROM deliveries d
+            JOIN destinations dest ON dest.id = d.destination_id
+            WHERE d.status = 'dead_lettered'
+              AND (CAST(:destination_id AS UUID) IS NULL
+                   OR d.destination_id = CAST(:destination_id AS UUID))
+              AND (CAST(:event_id AS UUID) IS NULL
+                   OR d.event_id = CAST(:event_id AS UUID))
+              AND (CAST(:reason AS TEXT) IS NULL
+                   OR d.dead_letter_reason = CAST(:reason AS TEXT))
+              AND (CAST(:dedupe_key AS TEXT) IS NULL
+                   OR d.dedupe_key = CAST(:dedupe_key AS TEXT))
+            ORDER BY d.dead_lettered_at DESC, d.id DESC
+            LIMIT :limit
+            """
+        ),
+        {
+            "destination_id": str(destination_id) if destination_id else None,
+            "event_id": str(event_id) if event_id else None,
+            "reason": reason,
+            "dedupe_key": dedupe_key,
+            "limit": limit,
+        },
+    ).mappings().all()
+
+
+@app.post("/v1/dead-letters/{delivery_id}/revive", response_model=DeadLetterReviveOut)
+def revive_dead_letter(delivery_id: UUID, db: Session = Depends(get_db)):
+    # Lock the copy and its destination so a concurrent revive/requeue/claim
+    # decision cannot interleave.
+    existing = db.execute(
+        text(
+            """
+            SELECT d.id, d.status, d.dead_letter_reason,
+                   dest.confirmation_state AS destination_state,
+                   dest.confirmation_generation AS destination_generation,
+                   d.confirmation_generation AS delivery_generation
+            FROM deliveries d
+            JOIN destinations dest ON dest.id = d.destination_id
+            WHERE d.id = CAST(:delivery_id AS UUID)
+            FOR UPDATE OF d
+            """
+        ),
+        {"delivery_id": str(delivery_id)},
+    ).mappings().first()
+    if existing is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="delivery not found")
+    if existing["status"] != "dead_lettered":
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "delivery is not in the dead-letter area "
+                f"(current status: {existing['status']})"
+            ),
+        )
+    # Same confirmation gate as a normal requeue: never send before the
+    # handshake, never send an old-location copy to a new URL.
+    if existing["destination_state"] != "confirmed":
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "destination has not completed its activation handshake; "
+                "the copy cannot be sent to it yet"
+            ),
+        )
+    if existing["delivery_generation"] != existing["destination_generation"]:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "destination changed location after this copy was fanned out; "
+                "old copies are not resent to the new location"
+            ),
+        )
+
+    revived = db.execute(
+        text(
+            f"""
+            UPDATE deliveries
+            SET {DEAD_LETTER_REVIVE_SQL}
+            WHERE id = CAST(:delivery_id AS UUID)
+              AND status = 'dead_lettered'
+            RETURNING id, destination_id, destination_seq, dead_letter_reason
+            """
+        ),
+        {"delivery_id": str(delivery_id)},
+    ).mappings().first()
+    if revived is None:  # pragma: no cover - the row was locked above
+        db.rollback()
+        raise HTTPException(status_code=409, detail="revive lost a concurrent update")
+    db.commit()
+    return {
+        "delivery_id": revived["id"],
+        "destination_id": revived["destination_id"],
+        "destination_seq": revived["destination_seq"],
+        "dead_letter_reason": existing["dead_letter_reason"],
+        "revived": True,
+    }

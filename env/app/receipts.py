@@ -15,6 +15,7 @@ explicit disposition so nothing is silently treated as acknowledged:
 - premature  — the delivery exists but has not completed transport yet
 """
 
+import logging
 import time
 from uuid import UUID, uuid4
 
@@ -23,9 +24,11 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 
+logger = logging.getLogger("receipts")
+
 LOCK_DELIVERY_SQL = text(
     """
-    SELECT id, status, reconcile_state,
+    SELECT id, status, reconcile_state, requeue_count,
            (reconcile_deadline IS NOT NULL AND reconcile_deadline < now())
                AS reconcile_expired
     FROM deliveries
@@ -123,6 +126,7 @@ def ingest_receipt(db: Session, destination_id: UUID, dedupe_key: str, result: s
 
     receipt_id = uuid4()
     delivery_id = delivery["id"] if delivery is not None else None
+    parked_dead_letter = False
 
     if delivery is None:
         disposition = "orphan"
@@ -147,6 +151,22 @@ def ingest_receipt(db: Session, destination_id: UUID, dedupe_key: str, result: s
                     },
                 )
                 disposition = "applied"
+                # The receiver explicitly failed this copy for the last
+                # allowed requeue cycle: park it instead of leaving another
+                # receipt_failed copy that operators must chase forever.
+                if (
+                    result == "failure"
+                    and delivery["status"] == "delivered"
+                    and delivery["requeue_count"] >= settings.max_requeue_cycles
+                ):
+                    parked = db.execute(
+                        PARK_FAILED_RECEIPT_SQL,
+                        {
+                            "delivery_id": str(delivery_id),
+                            "max_requeue_cycles": settings.max_requeue_cycles,
+                        },
+                    ).rowcount
+                    parked_dead_letter = bool(parked)
         elif state == "none" and delivery["status"] == "delivered":
             # Delivered before reconciliation existed (pre-upgrade row): accept
             # the receipt so legacy deliveries can still be reconciled.
@@ -185,4 +205,13 @@ def ingest_receipt(db: Session, destination_id: UUID, dedupe_key: str, result: s
         },
     ).mappings().one()
     db.commit()
+    if parked_dead_letter:
+        logger.warning(
+            "delivery_id=%s destination_id=%s dedupe_key=%s moved to dead letter "
+            "after failure receipt exhausted %s requeue cycles",
+            delivery_id,
+            destination_id,
+            dedupe_key,
+            settings.max_requeue_cycles,
+        )
     return receipt

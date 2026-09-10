@@ -171,6 +171,10 @@ class EventOut(BaseModel):
     # before they could be sent. They never went out and are not retried or
     # backfilled; they are excluded from delivery_count above.
     superseded_count: int = 0
+    # Copies parked in the dead-letter area (transport failures exhausted, or
+    # receipts kept not matching after redelivery). They never go out on their
+    # own and are not acked; a manual revive puts them back in queue.
+    dead_lettered_count: int = 0
 
 
 class DeliveryOut(BaseModel):
@@ -179,11 +183,19 @@ class DeliveryOut(BaseModel):
     destination_id: UUID
     destination_url: str | None = None
     destination_seq: int
+    # Idempotency key / business key of the copy (matches the event's
+    # dedupe_key); included so a dead-letter row identifies "which copy"
+    # without a second lookup.
+    dedupe_key: str
+    event_type: str | None = None
     # pending: queued (possibly waiting for not_before); in_flight: being
     # delivered right now; delivered: transport 2xx; cancelled: the event was
     # cancelled before this copy went out — terminal, it will never be sent;
     # superseded: the destination changed location before this copy was sent
-    # — terminal, it never went out and is not retried or backfilled.
+    # — terminal, it never went out and is not retried or backfilled;
+    # dead_lettered: repeated transport failures (or repeatedly unmatched
+    # receipts after redelivery) gave up on this one copy — terminal until a
+    # manual revive puts it back at its original queue position.
     status: str
     attempts: int
     next_attempt_at: datetime
@@ -200,6 +212,15 @@ class DeliveryOut(BaseModel):
     reconciled_at: datetime | None = None
     receipt_result: str | None = None
     requeue_count: int = 0
+    # Consecutive transport failures for this copy (reset by a 2xx or a
+    # manual revive). When it reaches the limit the copy is dead-lettered.
+    consecutive_failures: int = 0
+    # Dead-letter area:
+    # null while the copy is live; when parked, one of
+    # delivery_attempts_exhausted / receipt_timeout_exhausted /
+    # receipt_failure_exhausted. dead_lettered_at says when it was parked.
+    dead_letter_reason: str | None = None
+    dead_lettered_at: datetime | None = None
     # Destination activation generation this copy was fanned out under.
     # A URL change bumps the destination generation; older copies then fail
     # the claim gate and queued ones become superseded.
@@ -255,6 +276,26 @@ class ReconciliationSummaryOut(BaseModel):
     acknowledged: int = 0
     receipt_failed: int = 0
     timed_out: int = 0
+
+
+# --- Dead-letter area --------------------------------------------------------
+
+
+class DeadLetterSummaryOut(BaseModel):
+    total: int = 0
+    delivery_attempts_exhausted: int = 0
+    receipt_timeout_exhausted: int = 0
+    receipt_failure_exhausted: int = 0
+
+
+class DeadLetterReviveOut(BaseModel):
+    delivery_id: UUID
+    destination_id: UUID
+    destination_seq: int
+    # Previous dead-letter reason, kept in the response so the operator sees
+    # why the copy had been parked.
+    dead_letter_reason: str
+    revived: bool
 
 
 class RequeueOut(BaseModel):

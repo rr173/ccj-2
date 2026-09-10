@@ -22,6 +22,9 @@ services:
       DB_POOL_SIZE: "${DB_POOL_SIZE:-10}"
       DB_MAX_OVERFLOW: "${DB_MAX_OVERFLOW:-5}"
       RECEIPT_DELIVERY_GRACE_SECONDS: "${RECEIPT_DELIVERY_GRACE_SECONDS:-2}"
+      # Failure receipts on the last allowed redelivery cycle park the copy
+      # in the dead-letter area; this must match the reconciler/worker value.
+      MAX_REQUEUE_CYCLES: "${MAX_REQUEUE_CYCLES:-3}"
       # Inbound source authentication: event pushes must be HMAC-signed with a
       # send timestamp inside this freshness window.
       INGEST_MAX_AGE_SECONDS: "${INGEST_MAX_AGE_SECONDS:-300}"
@@ -54,7 +57,14 @@ services:
       RETRY_BACKOFF_MAX_SECONDS: "${RETRY_BACKOFF_MAX_SECONDS:-3600}"
       FAILURE_THRESHOLD: "${FAILURE_THRESHOLD:-5}"
       QUARANTINE_SECONDS: "${QUARANTINE_SECONDS:-900}"
+      MAX_RESPONSE_BODY_BYTES: "${MAX_RESPONSE_BODY_BYTES:-2048}"
       RECEIPT_TIMEOUT_SECONDS: "${RECEIPT_TIMEOUT_SECONDS:-300}"
+      # A copy failing this many times in a row is parked in the dead-letter
+      # area instead of being retried forever. The requeue-cycle limit below
+      # is mirrored here so every component agrees on the budget even though
+      # the worker itself only parks transport-failed copies.
+      MAX_DELIVERY_ATTEMPTS: "${MAX_DELIVERY_ATTEMPTS:-10}"
+      MAX_REQUEUE_CYCLES: "${MAX_REQUEUE_CYCLES:-3}"
       # Activation handshake probes. Keep CONFIRMATION_ENABLED=true only on a
       # single logical worker process group; extra worker replicas can set it
       # false so probes are sent from one confirmer thread.
@@ -69,8 +79,9 @@ services:
     restart: unless-stopped
 
   # Reconciliation sweeper: flips deliveries whose receipt window expired from
-  # "awaiting" to "timed_out". Separate process from the outbound worker so
-  # receipt reconciliation scales independently of delivery throughput.
+  # "awaiting" to "timed_out". Copies whose requeue cycles are exhausted are
+  # parked in the dead-letter area instead. Separate process from the outbound
+  # worker so receipt reconciliation scales independently of delivery throughput.
   reconciler:
     build: .
     command: ["python", "-m", "app.reconciler"]
@@ -80,6 +91,9 @@ services:
       DB_MAX_OVERFLOW: "${RECONCILER_DB_MAX_OVERFLOW:-1}"
       RECONCILE_SWEEP_INTERVAL_SECONDS: "${RECONCILE_SWEEP_INTERVAL_SECONDS:-5}"
       RECEIPT_TIMEOUT_SECONDS: "${RECEIPT_TIMEOUT_SECONDS:-300}"
+      # After this many redeliveries a copy that still times out is parked in
+      # the dead-letter area; must match the worker/API value.
+      MAX_REQUEUE_CYCLES: "${MAX_REQUEUE_CYCLES:-3}"
     depends_on:
       postgres:
         condition: service_healthy
