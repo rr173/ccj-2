@@ -162,12 +162,28 @@ class EventOut(BaseModel):
     # cancelled: the event was cancelled before anything was sent; its
     # remaining copies will never go out.
     status: str
-    # Whole-event receipt state. Only success receipts on every fanned-out copy
-    # make the whole event acknowledged:
-    # pending: no copy has a receipt outcome yet;
-    # partially_acknowledged: at least one copy is acknowledged and another is not;
-    # acknowledged: every fanned-out copy is acknowledged.
+    # Whole-event receipt state. Decided by for-real copies only:
+    # pending: no for-real copy has a success receipt yet;
+    # partially_acknowledged: at least one for-real copy is acknowledged but
+    #   the event's requirement is not yet met;
+    # acknowledged: the required number of for-real copies
+    #   (required_ack_count below) carried matching success receipts — once
+    #   reached, later timeouts/failure receipts/dead-letters of the remaining
+    #   copies can never move it back.
     reconcile_status: str = "pending"
+    # Type-wide acknowledgement threshold ("认完门槛") configured right now,
+    # if any. Null means the default rule (every for-real copy). Observe-only
+    # ("shadow") copies never count.
+    ack_threshold: int | None = None
+    # This event's own snapshot: how many for-real success receipts are enough
+    # for it (the configured threshold capped at the for-real subscribers
+    # present at ingest time; otherwise every fanned-out for-real copy). A zero
+    # snapshot (unrouted / shadow-only / pending-confirmation) never reads as
+    # acknowledged.
+    required_ack_count: int = 0
+    # True once acknowledged_count reached required_ack_count; the standing is
+    # monotonic afterwards.
+    acknowledged_quorum: bool = False
     delivery_count: int
     delivered_count: int
     # How many fanned-out copies have been acknowledged by a matching success receipt.
@@ -343,6 +359,10 @@ class EventBulkRequeueOut(BaseModel):
     event_id: UUID
     requeued_count: int
     deliveries: list[RequeueOut]
+    # True when the event has already reached its acknowledgement requirement
+    # (per-type threshold or all for-real copies): the whole-event list is
+    # deliberately not pulled and requeued_count stays 0.
+    already_acknowledged: bool = False
 
 
 class EventTraceOut(BaseModel):
@@ -462,5 +482,38 @@ class ConfirmationAttemptOut(BaseModel):
     response_excerpt: str | None = None
     error: str | None = None
     created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# --- Per-event-type acknowledgement threshold ("认完门槛") -----------------
+
+
+class AckThresholdIn(BaseModel):
+    # Number of FOR-REAL destinations whose matching success receipts are
+    # enough to mark an event of this type acknowledged as a whole.
+    # Observe-only ("shadow") copies never count. The effective requirement
+    # for an event is this value capped at the number of for-real confirmed
+    # subscribers present when the event is ingested, snapshotted onto the
+    # event. Must be >= 1; only the type-wide threshold can be changed later,
+    # never the snapshot of an already-accepted event.
+    #
+    # The field is required (an empty body is a 422, not an accidental clear)
+    # but may be explicitly null: {"ack_threshold": null} on PUT clears a
+    # configured threshold and restores the default all-for-real rule, same as
+    # DELETE on the resource.
+    ack_threshold: int | None = Field(..., ge=1, le=2_147_483_647)
+
+
+class AckThresholdOut(BaseModel):
+    event_type: str
+    # Configured threshold; null on a response to a clear request means the
+    # type now uses the default all-for-real rule.
+    ack_threshold: int | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    # False when this response reports that no threshold is configured (after a
+    # clear, or from the upsert endpoint when the row was deleted).
+    configured: bool = True
 
     model_config = {"from_attributes": True}

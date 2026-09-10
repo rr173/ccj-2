@@ -32,6 +32,8 @@ from app.ingest_auth import (
 from app.models import init_db
 from app.receipts import ingest_receipt
 from app.schemas import (
+    AckThresholdIn,
+    AckThresholdOut,
     BulkRequeueOut,
     ConfirmationAttemptOut,
     ConfirmationIn,
@@ -59,6 +61,7 @@ from app.schemas import (
     SourceOut,
     SourceRotatedOut,
 )
+from app.schemas import MAX_EVENT_TYPE_LENGTH
 
 
 @asynccontextmanager
@@ -69,7 +72,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Event Ingest Service",
-    version="2.5.0",
+    version="2.6.0",
     lifespan=lifespan,
 )
 
@@ -156,11 +159,26 @@ def event_status(
     return "pending"
 
 
-def event_reconcile_status(live_count: int, acknowledged_count: int) -> str:
+def event_reconcile_status(
+    live_count: int,
+    acknowledged_count: int,
+    required_ack_count: int | None = None,
+) -> str:
     # Only for-real copies decide whether the whole event is acknowledged: a
     # shadow's success receipt can never complete it, and a shadow's timeout
     # or failure receipt can never drag an otherwise-acknowledged event back.
-    if live_count > 0 and acknowledged_count >= live_count:
+    #
+    # A per-type acknowledgement threshold ("认完门槛") snapshots how many
+    # for-real success receipts are enough: once that many match, the whole
+    # event is acknowledged for good. The decision is monotonic — it only
+    # looks at the acknowledged count, which never decreases — so timeouts,
+    # failure receipts or dead-letter parking of the remaining copies can
+    # never move an acknowledged event back to pending/partially acknowledged.
+    # No threshold (legacy rows / unconfigured types) keeps the old rule:
+    # every live for-real copy must be acknowledged.
+    if required_ack_count is None:
+        required_ack_count = live_count
+    if required_ack_count > 0 and acknowledged_count >= required_ack_count:
         return "acknowledged"
     if acknowledged_count > 0:
         return "partially_acknowledged"
@@ -202,10 +220,31 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
         shadow_dead_lettered_count,
         shadow_superseded_count,
     )
+    required_ack_count = result.get("required_ack_count")
+    # No configured threshold (legacy rows) means "every live for-real copy".
+    # Cap at live_count as well: a for-real copy that never went out because
+    # its destination relocated (terminal 'superseded') is not among the live
+    # copies and so cannot be part of the required number either. A zero
+    # effective requirement (unrouted / shadow-only / pending-confirmation)
+    # still never reads as acknowledged.
+    if required_ack_count is None:
+        required_ack_count = live_count
+    required_ack_count = min(required_ack_count, live_count)
+    result["required_ack_count"] = required_ack_count
     result["reconcile_status"] = event_reconcile_status(
-        live_count, result["acknowledged_count"]
+        live_count,
+        result["acknowledged_count"],
+        required_ack_count,
+    )
+    result["acknowledged_quorum"] = (
+        required_ack_count > 0
+        and result["acknowledged_count"] >= required_ack_count
     )
     result["unacknowledged_count"] = live_count - result["acknowledged_count"]
+    # The type-wide threshold as configured right now (null = no threshold);
+    # required_ack_count above is this event's own ingest-time snapshot.
+    result["ack_threshold"] = result.get("configured_ack_threshold")
+    result.pop("configured_ack_threshold", None)
     shadow_acknowledged = result.get("shadow_acknowledged_count", 0) or 0
     result["shadow_acknowledged_count"] = shadow_acknowledged
     result["shadow_unacknowledged_count"] = shadow_live_count - shadow_acknowledged
@@ -215,6 +254,8 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
 EVENT_WITH_COUNTS_SQL = """
     SELECT e.id, e.source_id, e.event_type, e.dedupe_key, e.payload, e.created_at,
            e.not_before, e.cancelled_at,
+           e.required_ack_count,
+           t.ack_threshold AS configured_ack_threshold,
            -- For-real copies decide the whole event's transport/reconcile
            -- standing; observe-only ("shadow") copies are counted separately
            -- and can never change it.
@@ -252,8 +293,9 @@ EVENT_WITH_COUNTS_SQL = """
            )::int AS shadow_dead_lettered_count
     FROM events e
     LEFT JOIN deliveries d ON d.event_id = e.id
+    LEFT JOIN event_type_ack_thresholds t ON t.event_type = e.event_type
     WHERE {where}
-    GROUP BY e.id
+    GROUP BY e.id, t.ack_threshold
 """
 
 
@@ -841,15 +883,34 @@ async def create_event(request: Request, response: Response, db: Session = Depen
 
 def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     payload = json.dumps(body.payload)
+    # Resolve the per-type acknowledgement threshold ("认完门槛") before the
+    # event row is written. None means "every fanned-out for-real copy must
+    # acknowledge". The effective required count is computed after fan-out
+    # below and capped at the for-real subscribers actually present, so a
+    # threshold larger than the current subscriber list can never make the
+    # event un-finishable.
+    ack_threshold = db.execute(
+        text(
+            """
+            SELECT ack_threshold
+            FROM event_type_ack_thresholds
+            WHERE event_type = :event_type
+            """
+        ),
+        {"event_type": body.event_type},
+    ).mappings().first()
+    ack_threshold = ack_threshold["ack_threshold"] if ack_threshold else None
     event = db.execute(
         text(
             """
-            INSERT INTO events (source_id, event_type, dedupe_key, payload, not_before)
+            INSERT INTO events (source_id, event_type, dedupe_key, payload,
+                                not_before, required_ack_count)
             VALUES (CAST(:source_id AS UUID), :event_type, :dedupe_key,
-                    CAST(:payload AS JSONB), CAST(:not_before AS TIMESTAMPTZ))
+                    CAST(:payload AS JSONB), CAST(:not_before AS TIMESTAMPTZ),
+                    CAST(:required_ack_count AS INTEGER))
             ON CONFLICT (dedupe_key) DO NOTHING
             RETURNING id, source_id, event_type, dedupe_key, payload, not_before,
-                      cancelled_at, created_at
+                      cancelled_at, created_at, required_ack_count
             """
         ),
         {
@@ -858,6 +919,9 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
             "dedupe_key": body.dedupe_key,
             "payload": payload,
             "not_before": body.not_before,
+            # Filled in after fan-out below; the row stays inside this
+            # transaction so nobody can observe the placeholder.
+            "required_ack_count": 0,
         },
     ).mappings().first()
 
@@ -928,6 +992,9 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
         {"event_type": body.event_type},
     ).mappings().one()["count"]
 
+    real_subscribers = [row for row in subscribers if not row[1]]
+    shadow_subscribers = [row for row in subscribers if row[1]]
+
     for row in subscribers:
         db.execute(
             text(
@@ -961,6 +1028,31 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
             },
         )
 
+    # Snapshot this event's acknowledgement requirement onto the event row in
+    # the same transaction: a configured threshold capped at the current
+    # for-real confirmed subscribers, otherwise every for-real copy. Shadow
+    # subscribers never count toward it. A zero snapshot (unrouted /
+    # shadow-only / pending-confirmation) keeps reconcile_status pending —
+    # acknowledgement still requires at least one for-real success receipt.
+    required_ack_count = (
+        min(ack_threshold, len(real_subscribers))
+        if ack_threshold is not None
+        else len(real_subscribers)
+    )
+    db.execute(
+        text(
+            """
+            UPDATE events
+            SET required_ack_count = :required_ack_count
+            WHERE id = CAST(:event_id AS UUID)
+            """
+        ),
+        {
+            "event_id": event["id"],
+            "required_ack_count": required_ack_count,
+        },
+    )
+
     signed_at = source["signed_at"]
     # No confirmed subscribers: still accepted and persisted. The disposition
     # says which case this is without ever describing the event as sent:
@@ -981,9 +1073,9 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
         signed_at=signed_at,
     )
     db.commit()
-    real_subscribers = [row for row in subscribers if not row[1]]
-    shadow_subscribers = [row for row in subscribers if row[1]]
     result = dict(event)
+    result["required_ack_count"] = required_ack_count
+    result["configured_ack_threshold"] = ack_threshold
     result["delivery_count"] = len(real_subscribers)
     result["delivered_count"] = 0
     result["pending_count"] = len(real_subscribers)
@@ -1214,17 +1306,95 @@ def reschedule_event(
     response_model=EventBulkRequeueOut,
 )
 def requeue_event_unreconciled(event_id: UUID, db: Session = Depends(get_db)):
-    event_exists = db.execute(
-        text("SELECT 1 FROM events WHERE id = CAST(:event_id AS UUID)"),
+    event = db.execute(
+        text(
+            """
+            SELECT id
+            FROM events
+            WHERE id = CAST(:event_id AS UUID)
+            FOR UPDATE
+            """
+        ),
         {"event_id": str(event_id)},
-    ).first()
-    if event_exists is None:
+    ).mappings().first()
+    if event is None:
         db.rollback()
         raise HTTPException(status_code=404, detail="event not found")
 
-    # Only terminal receipt failures/timeouts are re-sent. Copies that are
-    # acknowledged stay untouched; copies still waiting for a receipt or still
-    # in transport are also left alone, so this endpoint never duplicates work.
+    # Lock the event's for-real delivery rows in a stable order before
+    # counting, so the quorum decision and the requeue are atomic against a
+    # receipt arriving in another transaction: a receipt application takes
+    # FOR UPDATE on its single delivery row and therefore serializes here
+    # (it never waits on another delivery, so the order cannot deadlock).
+    # Only non-superseded rows matter — a superseded copy never went out and
+    # is excluded from both the counts and the requirement. Shadow copies are
+    # deliberately not locked: they never participate in this decision.
+    db.execute(
+        text(
+            """
+            SELECT id
+            FROM deliveries
+            WHERE event_id = CAST(:event_id AS UUID)
+              AND NOT observe_only
+              AND status <> 'superseded'
+            ORDER BY destination_id, destination_seq
+            FOR UPDATE
+            """
+        ),
+        {"event_id": str(event_id)},
+    ).all()
+
+    # Once the event reached its acknowledgement requirement — every for-real
+    # copy by default, or the per-type threshold — the list is never pulled
+    # again: the unacknowledged copies keep their own lifecycle (they can
+    # still time out / fail / be dead-lettered / be requeued individually),
+    # but "re-throw what is still unacknowledged for the whole event" becomes
+    # a no-op. Observe-only copies are never in the counts here.
+    quorum = db.execute(
+        text(
+            """
+            SELECT
+                COUNT(d.id) FILTER (WHERE NOT d.observe_only)::int
+                    AS live_count,
+                COUNT(d.id) FILTER (
+                    WHERE NOT d.observe_only
+                      AND d.reconcile_state = 'acknowledged'
+                )::int AS acknowledged_count,
+                e.required_ack_count AS required_ack_count
+            FROM events e
+            LEFT JOIN deliveries d
+                   ON d.event_id = e.id
+                  AND d.status <> 'superseded'
+            WHERE e.id = CAST(:event_id AS UUID)
+            GROUP BY e.id, e.required_ack_count
+            """
+        ),
+        {"event_id": str(event_id)},
+    ).mappings().one()
+    # Null snapshot (legacy events) means "every live for-real copy"; cap at
+    # the current live count so copies that never went out after a location
+    # change ('superseded') are not held against the requirement.
+    required = quorum["required_ack_count"]
+    if required is None:
+        required = quorum["live_count"]
+    required = min(required, quorum["live_count"])
+    quorum_reached = (
+        required > 0 and quorum["acknowledged_count"] >= required
+    )
+    if quorum_reached:
+        db.commit()
+        return {
+            "event_id": event_id,
+            "requeued_count": 0,
+            "deliveries": [],
+            "already_acknowledged": True,
+        }
+
+    # Requirement not yet met: only terminal receipt failures/timeouts on
+    # FOR-REAL copies are re-sent. Copies that are acknowledged stay
+    # untouched; copies still waiting for a receipt or still in transport are
+    # also left alone, so this endpoint never duplicates work; observe-only
+    # ("shadow") copies are never on this whole-event list.
     requeued = db.execute(
         text(
             f"""
@@ -1262,6 +1432,7 @@ def requeue_event_unreconciled(event_id: UUID, db: Session = Depends(get_db)):
             }
             for row in requeued
         ],
+        "already_acknowledged": False,
     }
 
 
@@ -1394,6 +1565,153 @@ def list_ingestion_attempts(
             "limit": limit,
         },
     ).mappings().all()
+
+
+# --- Per-event-type acknowledgement thresholds ("认完门槛") -----------------
+#
+# A type threshold says: once this many FOR-REAL copies of an event of this
+# type carry matching success receipts, the whole event counts as acknowledged
+# and that standing never goes backwards. Observe-only ("shadow") copies never
+# count toward it. The requirement is snapshotted onto each event at ingest
+# time (and capped at the for-real confirmed subscribers then present), so
+# changing or deleting the threshold here only ever affects later events —
+# events already accepted keep their own snapshot. Types with no row keep the
+# default rule: every fanned-out for-real copy must be acknowledged.
+
+
+def _normalize_event_type_path(event_type: str) -> str:
+    normalized = event_type.strip()
+    if not normalized or len(normalized) > MAX_EVENT_TYPE_LENGTH:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "event_type must be a non-empty string of at most "
+                f"{MAX_EVENT_TYPE_LENGTH} characters"
+            ),
+        )
+    return normalized
+
+
+@app.get(
+    "/v1/event-types/ack-thresholds",
+    response_model=list[AckThresholdOut],
+)
+def list_ack_thresholds(
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    rows = db.execute(
+        text(
+            """
+            SELECT event_type, ack_threshold, created_at, updated_at
+            FROM event_type_ack_thresholds
+            ORDER BY event_type ASC
+            LIMIT :limit
+            """
+        ),
+        {"limit": limit},
+    ).mappings().all()
+    return rows
+
+
+@app.get(
+    "/v1/event-types/{event_type}/ack-threshold",
+    response_model=AckThresholdOut,
+)
+def get_ack_threshold(event_type: str, db: Session = Depends(get_db)):
+    event_type = _normalize_event_type_path(event_type)
+    row = db.execute(
+        text(
+            """
+            SELECT event_type, ack_threshold, created_at, updated_at
+            FROM event_type_ack_thresholds
+            WHERE event_type = :event_type
+            """
+        ),
+        {"event_type": event_type},
+    ).mappings().first()
+    if row is None:
+        # No configured threshold: the type uses the default all-for-real rule.
+        return {
+            "event_type": event_type,
+            "ack_threshold": None,
+            "created_at": None,
+            "updated_at": None,
+            "configured": False,
+        }
+    return dict(row) | {"configured": True}
+
+
+@app.put(
+    "/v1/event-types/{event_type}/ack-threshold",
+    response_model=AckThresholdOut,
+)
+def set_ack_threshold(
+    event_type: str,
+    body: AckThresholdIn,
+    db: Session = Depends(get_db),
+):
+    event_type = _normalize_event_type_path(event_type)
+    if body.ack_threshold is None:
+        # {"ack_threshold": null} on PUT clears the configured threshold and
+        # restores the default all-for-real rule for later events.
+        db.execute(
+            text(
+                """
+                DELETE FROM event_type_ack_thresholds
+                WHERE event_type = :event_type
+                """
+            ),
+            {"event_type": event_type},
+        )
+        db.commit()
+        return {
+            "event_type": event_type,
+            "ack_threshold": None,
+            "created_at": None,
+            "updated_at": None,
+            "configured": False,
+        }
+    row = db.execute(
+        text(
+            """
+            INSERT INTO event_type_ack_thresholds (event_type, ack_threshold)
+            VALUES (:event_type, :ack_threshold)
+            ON CONFLICT (event_type) DO UPDATE
+                SET ack_threshold = EXCLUDED.ack_threshold,
+                    updated_at = now()
+            RETURNING event_type, ack_threshold, created_at, updated_at
+            """
+        ),
+        {"event_type": event_type, "ack_threshold": body.ack_threshold},
+    ).mappings().one()
+    db.commit()
+    return dict(row) | {"configured": True}
+
+
+@app.delete(
+    "/v1/event-types/{event_type}/ack-threshold",
+    response_model=AckThresholdOut,
+)
+def clear_ack_threshold(event_type: str, db: Session = Depends(get_db)):
+    event_type = _normalize_event_type_path(event_type)
+    db.execute(
+        text(
+            """
+            DELETE FROM event_type_ack_thresholds
+            WHERE event_type = :event_type
+            """
+        ),
+        {"event_type": event_type},
+    )
+    db.commit()
+    return {
+        "event_type": event_type,
+        "ack_threshold": None,
+        "created_at": None,
+        "updated_at": None,
+        "configured": False,
+    }
 
 
 # --- Receipt ingestion and reconciliation ---------------------------------

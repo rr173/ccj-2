@@ -2,7 +2,7 @@
 
 这是一个接收事件、按事件类型分发给订阅地址，把事件按顺序推送到外部 Webhook，并对推送结果做**回执对账**的系统：
 
-- **ingest-api**：登记**事件来源**（发放只属于它的签名密钥、可停用/可换钥）、登记接收地址（含订阅的事件类型；可把任一地址标成**只跟着看 `observe_only`**——照样收副本、按它自己的生命周期外发/重试/隔离/死信，但它的回执认不认、超时或进死信都不影响整笔算不算认完；**地址得先完成一次上线握手确认才会收到投递**，换接收位置要重新确认）、**验签 + 发送时间校验后**接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**接入回执与确认应答**、查询**入口准入记录（含每一条被拒事件，以及"收了但还没确认、一份没发"的事件）**、事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（支持只重投某一笔事件中尚未认的那些**当真**副本，只跟着看的副本不在名单内）。
+- **ingest-api**：登记**事件来源**（发放只属于它的签名密钥、可停用/可换钥）、登记接收地址（含订阅的事件类型；可把任一地址标成**只跟着看 `observe_only`**——照样收副本、按它自己的生命周期外发/重试/隔离/死信，但它的回执认不认、超时或进死信都不影响整笔算不算认完；**地址得先完成一次上线握手确认才会收到投递**，换接收位置要重新确认）、**按事件类型设定认完门槛**（当真副本认够份数整笔即认完且终态不可逆，影子副本不凑数；没定门槛的类型仍要求所有当真副本都认）、**验签 + 发送时间校验后**接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**接入回执与确认应答**、查询**入口准入记录（含每一条被拒事件，以及"收了但还没确认、一份没发"的事件）**、事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（整笔重投在认够门槛后不再拉名单；没认够时只重投某一笔事件中尚未认的那些**当真**副本，只跟着看的副本不在名单内）。
 - **worker**：负责真正的 HTTP 投递、重试、熔断隔离、崩溃恢复，以及向未确认地址发送上线握手请求（confirmer 线程）。
 - **reconciler**：独立的对账进程，周期性把超过约定时间仍未收到回执的副本标记为 `timed_out`（可查，不算认）。
 - **PostgreSQL**：作为任务队列和事实来源，用行锁和每地址单调序号保证同一个接收地址严格 FIFO。
@@ -78,6 +78,24 @@
 - **没人订的类型还是照收**：当真和影子订户都没有时，事件仍是 `unrouted`、一份不投、也不会写成已发出；影子订户不计入"没人订"。
 
 开关方式：登记时 `"observe_only": true/false`；之后用 `PATCH /v1/destinations/{id}` 带 `{"observe_only": false}` 改（不动 URL、不重新握手）；同一 URL 再次 `POST` 登记时，传了 `observe_only` 就整体改标，不传保持现状。地址详情的 `observe_only` 字段随时可查。
+
+### 1.2 按事件类型设"认完门槛"（ack threshold）
+
+每种事件类型可以单独定一个**认完门槛**：当真收到的成功回执**认够这个份数**，这一笔就算认完，不必等剩下的地址。
+
+- `PUT /v1/event-types/{event_type}/ack-threshold`，body 为 `{"ack_threshold": 2}`（必须 ≥1）；`GET .../ack-threshold` 查单个类型；`GET /v1/event-types/ack-thresholds` 列全部；`DELETE .../ack-threshold` 或 PUT 传 `{"ack_threshold": null}` 取消门槛。
+- **只数当真副本**：认够门槛只看**非 `observe_only`** 的副本对上成功回执的份数；跟着看的影子副本认不认都**不能拿来凑数**。
+- **入库那一刻快照**：门槛（以及"没有门槛就要求所有当真副本"这个默认规则）在事件入库扇出时算成该事件自己的 `required_ack_count`：
+  - 定了门槛：取 `min(门槛, 当时已确认的当真订户数)`——门槛比当真订户多不会让事件永远认不完；
+  - 没定门槛：等于当时扇出的当真副本份数（老事件无快照，同样按"现存每一份当真副本都认"处理）；
+  - 之后再改/删门槛只影响**新事件**，已经收下的事件按自己的快照走。
+- **认够之后是终态**：`reconcile_status` 一旦变成 `acknowledged`（`acknowledged_quorum = true`），剩下没认的当真副本再超时、回失败回执、耗尽重倒进死信，都**不会**把整笔改回 `pending` / `partially_acknowledged`。判断只看"已认份数"，这个数只会增加、不会减少。
+- **整笔重丢未认副本时**（`POST /v1/events/{event_id}/requeue-unreconciled`）：
+  - **已经认够**：不再拉名单，直接返回 `requeued_count = 0`、`already_acknowledged = true`；没认的副本仍按各自生命周期走（可以单独按副本/按地址重投），只是整笔接口不再替它们重丢；
+  - **还没认够**：只把**当真**副本里已终态未对上的（`timed_out` / `receipt_failed`）按原地址/原顺序重投，影子副本照旧不在名单内，仍在传输/等回执的也不会被提前重打。
+- **没定门槛的类型**：维持原规则——订了该类型的**每一份当真副本**都对上成功回执才算认完。
+- **没人订的类型**：照样收下、持久化，状态仍是 `unrouted`（只有影子订户时也不是 `unrouted`，但整笔永远停在 `pending`），不会因为存在门槛配置就被当成已发出或已认完；对这种事件调整笔重投返回空名单且 `already_acknowledged = false`。
+- 事件响应 / trace 的 `event` 里带：`ack_threshold`（该类型**当前**配置，可能为 `null`）、`required_ack_count`（这笔自己的快照门槛，`unrouted`/只有影子订户时为 0）、`acknowledged_quorum`（是否已经认够）。`acknowledged_count` / `unacknowledged_count` 仍只统计当真副本，影子计数继续单列在 `shadow_*`。
 
 ### 2. 同一接收地址严格按进入顺序投递
 
@@ -173,9 +191,9 @@ HTTP 投递拿到 2xx 只说明“打出去了”，不代表对方处理完了�
 一条事件扇出给多个地址时，每个地址的副本独立对账；事件响应和轨迹里的 `reconcile_status` 再汇总整笔状态：
 
 - `pending`：还没有任何一份**当真**副本对上成功回执（包括仍在传输、等待回执、已超时、收到失败回执，或有当真副本在死信处等待人工处理；只跟着看的副本无论对上与否都不计入这里的判断）；
-- `partially_acknowledged`：至少一份当真副本已经对上，但不是所有当真地址都对上；轨迹中可逐个查看谁是 `acknowledged`、谁还在 `awaiting`、谁是 `timed_out` / `receipt_failed`（每份副本带 `observe_only`，跟着看的那些单列 `shadow_*` 计数）；
-- `acknowledged`：事件扇出的**每一份当真副本**都在时限内收到成功回执，这时整笔才算认完。只跟着看的副本认与不认都不改变这个结果：它没认不会把整笔拖回未认，它认了也不能替整笔认完。
-- `acknowledged_count / unacknowledged_count` 分别给出已认和未认的**当真**份数；影子副本的对应数字在 `shadow_acknowledged_count / shadow_unacknowledged_count`（以及 `shadow_delivery_count` 等）里；`delivery_count = 0` 的无人订阅事件仍是明确的 `unrouted`，不会被汇总成已认；`delivery_count = 0` 但有影子副本的事件不是 `unrouted`（确实投给了影子订户），但整笔也永远不会变成 `acknowledged`。
+- `partially_acknowledged`：至少一份当真副本已经对上，但还没认够这笔自己的 `required_ack_count`；轨迹中可逐个查看谁是 `acknowledged`、谁还在 `awaiting`、谁是 `timed_out` / `receipt_failed`（每份副本带 `observe_only`，跟着看的那些单列 `shadow_*` 计数）；
+- `acknowledged`：当真副本的成功回执**认够了门槛**。没有为该类型定门槛时，要求事件扇出的**每一份当真副本**都在时限内收到成功回执；定了门槛（见 1.2 节）时，只要求 `required_ack_count` 份（入库时按"门槛与当真订户数取小"快照）对上即可，没认的其余副本不必再等。**认够是终态**：之后其余当真副本的超时、失败回执、进死信都不能把整笔改回未认。只跟着看的副本认与不认都不改变这个结果：它没认不会把整笔拖回未认，它认了也不能替整笔凑数。
+- `acknowledged_count / unacknowledged_count` 分别给出已认和未认的**当真**份数；`required_ack_count` 是这笔自己的认完门槛快照，`acknowledged_quorum` 表示当前是否已经认够；影子副本的对应数字在 `shadow_acknowledged_count / shadow_unacknowledged_count`（以及 `shadow_delivery_count` 等）里；`delivery_count = 0` 的无人订阅事件仍是明确的 `unrouted`，不会被汇总成已认；`delivery_count = 0` 但有影子副本的事件不是 `unrouted`（确实投给了影子订户），但整笔也永远不会变成 `acknowledged`。
 
 `status` 仍只表示传输层状态（`pending` / `delivered` / `unrouted`），不能把“全部收到 2xx”当成整笔已认；整笔是否认完只看 `reconcile_status`。
 
@@ -189,7 +207,7 @@ HTTP 投递拿到 2xx 只说明“打出去了”，不代表对方处理完了�
 
 **重投不是无限的**：每份副本最多被重投 `MAX_REQUEUE_CYCLES`（默认 3）轮。重投后依旧超时（reconciler 标记 `timed_out` 时）或在最后一轮收到失败回执（`receipt_failed`），该副本直接进死信处（原因分别是 `receipt_timeout_exhausted` / `receipt_failure_exhausted`），不再自动重打；之后只能人工从死信处捞回（见第 4 节）。
 
-事件级重投只选择未认的**当真**副本：已经 `acknowledged` 的副本不会再打（**已认的也永远不会被塞进死信**），仍在传输或仍处于本轮等待回执窗口的副本也不会被提前重打；**只跟着看（`observe_only`）的副本即使超时/失败也不在事件级重投名单内**——要重丢影子副本，请用按副本或按地址的重投接口，按它自己的预算走。**重投还过确认闸门**：地址当前必须是 `confirmed`，且副本的确认代号与地址当前代号一致——地址还没对上确认、或该副本是换位置前的老副本时不能重投（老副本不会被打到新位置）。重投**保留原来的 `destination_seq`**，每份副本回到自己原地址队列中原来的位置，按原顺序接着排；各地址仍互不等待。同时 Worker 的领取逻辑保证：只要某地址还有副本在投（`in_flight`），重投回来的副本就不会被领取——不会插到还在投的副本前面。重投成功后该副本重新进入 `awaiting`，等待新一轮回执。
+事件级重投只选择未认的**当真**副本：已经 `acknowledged` 的副本不会再打（**已认的也永远不会被塞进死信**），仍在传输或仍处于本轮等待回执窗口的副本也不会被提前重打；**只跟着看（`observe_only`）的副本即使超时/失败也不在事件级重投名单内**——要重丢影子副本，请用按副本或按地址的重投接口，按它自己的预算走。**整笔已经认够门槛（`acknowledged_quorum = true`，无门槛类型即所有当真副本都认）后，这个接口不再拉名单**：直接返回 `requeued_count = 0`、`already_acknowledged = true`，还没认的那些副本是否超时/失败/进死信都不影响整笔，需要重丢只能逐副本或按地址操作。**重投还过确认闸门**：地址当前必须是 `confirmed`，且副本的确认代号与地址当前代号一致——地址还没对上确认、或该副本是换位置前的老副本时不能重投（老副本不会被打到新位置）。重投**保留原来的 `destination_seq`**，每份副本回到自己原地址队列中原来的位置，按原顺序接着排；各地址仍互不等待。同时 Worker 的领取逻辑保证：只要某地址还有副本在投（`in_flight`），重投回来的副本就不会被领取——不会插到还在投的副本前面。重投成功后该副本重新进入 `awaiting`，等待新一轮回执。
 
 #### 对账查询
 
@@ -289,13 +307,27 @@ curl -s http://localhost:8000/v1/destinations \
   -d '{"url":"https://example.com/webhook","event_types":["paid","refunded"]}'
 ```
 
-只想跟着看、不当真（照样收副本、按自己的节奏外发/重试/隔离/死信/对账，但不影响整笔算不算认完、不进整笔重投名单）：
+# 只想跟着看、不当真（照样收副本、按自己的节奏外发/重试/隔离/死信/对账，但不影响整笔算不算认完、不进整笔重投名单）：
 
 ```bash
 curl -s http://localhost:8000/v1/destinations \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://example.com/audit-mirror","event_types":["paid"],"observe_only":true}'
 # 之后想当真：PATCH /v1/destinations/<id>  body {"observe_only": false}（不重新握手，只影响新事件）
+```
+
+给某类事件定"认完门槛"（当真地址认够这么多份，整笔就算认完，不用等剩下的；只跟着看的地址不能凑数）：
+
+```bash
+# paid 类型：2 个当真地址对上成功回执就算整笔认完
+curl -s -X PUT http://localhost:8000/v1/event-types/paid/ack-threshold \
+  -H 'Content-Type: application/json' \
+  -d '{"ack_threshold": 2}'
+
+curl -s http://localhost:8000/v1/event-types/paid/ack-threshold     # 查单个类型
+curl -s http://localhost:8000/v1/event-types/ack-thresholds         # 列全部
+curl -s -X DELETE http://localhost:8000/v1/event-types/paid/ack-threshold  # 取消门槛（恢复"全部当真副本都认"）
+# PUT 传 {"ack_threshold": null} 同样是取消；ack_threshold 必须 >= 1，否则 422
 ```
 
 返回示例（新地址**还没对上确认**，不会收到任何事件；字段以 `confirmation_` 开头）：
@@ -401,7 +433,8 @@ body（同样要配合签名头发送）: {
 - `event_type` / `dedupe_key` / `payload`：事件本体
 - `not_before`：约定的最早外发时间（未定时为 `null`）；`cancelled_at`：取消时间（未取消为 `null`）
 - `status`：`unrouted`（没有任何地址订该类型）、`pending`（至少一份活跃副本未投完）、`delivered`（全部活跃副本已收到传输层 2xx，但不一定已对上回执）、`cancelled`（未打出前已取消，剩余副本永不再投）、`superseded`（所有副本都因地址换位置而被取代，没有一份打出去，也不补投）、`dead_lettered`（所有活跃副本都已进死信处、且没有还在排队或投递中的副本；其中任一份被人工复活即回到 `pending`）
-- `reconcile_status`：`pending`（还没有副本认）、`partially_acknowledged`（只认了一部分）、`acknowledged`（所有订阅地址的副本都认了）
+- `reconcile_status`：`pending`（还没有副本认）、`partially_acknowledged`（只认够一部分、尚未达到这笔的认完门槛）、`acknowledged`（当真副本认够了这笔的 `required_ack_count`——无门槛类型即所有订阅地址的副本都认了）
+- `ack_threshold`：该事件类型**当前**配置的认完门槛（没定为 `null`）；`required_ack_count`：这笔在入库时快照下来的需要认的当真份数（定了门槛取门槛与当真订户数的较小值，没定等于扇出的当真份数）；`acknowledged_quorum`：是否已经认够（一旦为 true 不会再变回去）
 - `delivery_count` / `delivered_count`：**当真**扇出副本总数 / 已投妥数
 - `shadow_delivery_count` / `shadow_delivered_count`：只跟着看（`observe_only`）的副本总数 / 已投妥数；另有 `shadow_acknowledged_count` / `shadow_unacknowledged_count` / `shadow_pending_count` / `shadow_dead_lettered_count`。影子副本的任何结果都不改变下面的整笔状态
 - `acknowledged_count` / `unacknowledged_count`：已对上成功回执的**当真**份数 / 还没对上的**当真**份数
@@ -598,7 +631,8 @@ python3 scripts/mock_receiver.py --port 9000 \
 
 - `event_sources`：登记的外部事件来源、状态（`disabled_at` 为空即启用）、当前签名密钥与最近换钥时间。密钥只在登记/换钥的响应里明文出现一次。
 - `ingestion_attempts`：入口准入日志，每次事件推送一行（含全部被拒的），带处置结果（`accepted` / `unrouted` / `pending_confirmation` / `duplicate` / `source_unknown` / `source_disabled` / `bad_signature` / `stale_timestamp` / `future_timestamp` / `invalid_timestamp` / `invalid_body`）、发送时间、拒因；被拒记录没有 `event_id`，不会在任何轨迹里显示成已收/已发。`pending_confirmation` 的事件有 `event_id`（确实收下了），但当时没有生成任何副本。
-- `events`：事件本体（来源 `source_id`、类型、去重键、负载、最早外发时间 `not_before`、取消时间 `cancelled_at`），一条事件一行，与地址无关。
+- `events`：事件本体（来源 `source_id`、类型、去重键、负载、最早外发时间 `not_before`、取消时间 `cancelled_at`，以及入库时快照的认完门槛 `required_ack_count`：无门槛类型等于扇出的当真份数，定了门槛取门槛与当真订户数的较小值，只有影子订户/无人订阅时为 0；老事件该列为 NULL，按"现存每一份当真副本都认"处理），一条事件一行，与地址无关。
+- `event_type_ack_thresholds`：按事件类型配置的认完门槛（每个类型至多一行，`ack_threshold >= 1`）。改/删只影响之后入库的事件；事件自己的要求以 `events.required_ack_count` 的快照为准。
 - `destination_subscriptions`：地址订阅的事件类型集合。
 - `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled` / `superseded` / `dead_lettered`）、下次尝试时间、最早外发时间 `not_before`、租约信息、对账状态（`reconcile_state`、对账时限、回执结果、重投次数）、**确认代号 `confirmation_generation`**、**只跟着看快照 `observe_only`（扇出时从地址复制；为 true 的副本照常外发/重试/隔离/死信/对账，但其回执结果从不改变整笔事件的 `reconcile_status`/传输状态，也不进事件级重投名单）** 和**死信信息（连续传输失败次数 `consecutive_failures`、死信原因 `dead_letter_reason`、进入时间 `dead_lettered_at`；原因取值为传输失败耗尽 `delivery_attempts_exhausted`、回执超时耗尽 `receipt_timeout_exhausted`、失败回执耗尽 `receipt_failure_exhausted`）**（换位置后老代号排队副本置 `superseded`，领取闸门也会挡住老代号副本）；Worker 只消费这张表且只领取 `pending`/`in_flight`，死信副本永不自动外发、也不挡后续副本。
 - `delivery_attempts`：每次 HTTP 投递尝试的审计轨迹（关联事件与副本）。

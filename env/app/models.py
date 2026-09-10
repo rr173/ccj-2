@@ -88,6 +88,23 @@ SCHEMA_STATEMENTS = [
         END IF;
     END $$
     """,
+    # Per-event-type acknowledgement threshold ("认完门槛"): at most one row
+    # per event type. A non-null threshold means an event of this type is
+    # whole-event acknowledged once that many FOR-REAL copies carry a matching
+    # success receipt; observe-only ("shadow") copies never count. No row (or a
+    # null threshold) keeps the default rule: every fanned-out for-real copy
+    # must be acknowledged. The effective required number is capped at the
+    # number of for-real confirmed subscribers present at ingest time and is
+    # snapshotted onto the event row, so later configuration/subscription
+    # changes never rewrite the standing of an already-accepted event.
+    """
+    CREATE TABLE IF NOT EXISTS event_type_ack_thresholds (
+        event_type TEXT PRIMARY KEY,
+        ack_threshold INTEGER NOT NULL CHECK (ack_threshold >= 1),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
     # One row per submitted event. Fan-out to subscribed destinations happens
     # at ingest time; an event with no subscribers simply has no deliveries.
     """
@@ -98,7 +115,14 @@ SCHEMA_STATEMENTS = [
         payload JSONB NOT NULL,
         not_before TIMESTAMPTZ,
         cancelled_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        -- Number of for-real copies whose success receipts are required to
+        -- mark the whole event acknowledged. Snapshot taken at fan-out time:
+        -- all for-real confirmed subscribers by default, or the configured
+        -- type threshold capped at that subscriber count. Null on legacy rows
+        -- (treated as "every live for-real copy must acknowledge").
+        required_ack_count INTEGER,
+        CHECK (required_ack_count IS NULL OR required_ack_count >= 0)
     )
     """,
     # One row per (event, subscribed destination). This is the per-destination
@@ -537,6 +561,17 @@ SCHEMA_STATEMENTS = [
     CREATE INDEX IF NOT EXISTS deliveries_event_observe_idx
         ON deliveries (event_id)
         WHERE observe_only = FALSE
+    """,
+    # Idempotent upgrades for per-event-type acknowledgement thresholds
+    # ("认完门槛"). The type table is created above for fresh databases; the
+    # events column snapshots how many for-real success receipts are required
+    # to mark each ingested event acknowledged (null = every live for-real
+    # copy). Legacy events keep the old all-for-real rule.
+    "ALTER TABLE events ADD COLUMN IF NOT EXISTS required_ack_count INTEGER",
+    "ALTER TABLE events DROP CONSTRAINT IF EXISTS events_required_ack_count_check",
+    """
+    ALTER TABLE events ADD CONSTRAINT events_required_ack_count_check
+        CHECK (required_ack_count IS NULL OR required_ack_count >= 0)
     """,
 ]
 
