@@ -81,7 +81,8 @@ CLAIM_SQL = text(
                        e.next_attempt_at,
                        COALESCE(e.not_before, '-infinity'::timestamptz)
                    ) AS delivery_due_at,
-                   e.confirmation_generation AS delivery_generation
+                   e.confirmation_generation AS delivery_generation,
+                   e.consecutive_failures
             FROM deliveries e
             WHERE e.destination_id = d.id
               AND e.status IN ('pending', 'in_flight')
@@ -165,6 +166,7 @@ CLAIM_SQL = text(
         e.destination_seq,
         e.attempts,
         e.claim_token,
+        e.consecutive_failures,
         e.confirmation_generation,
         d.url AS destination_url,
         e.recovered_destination
@@ -207,6 +209,7 @@ EVENT_SUCCESS_SQL = text(
         last_error = NULL,
         updated_at = now(),
         delivered_at = now(),
+        consecutive_failures = 0,
         reconcile_state = 'awaiting',
         reconcile_deadline = now() + make_interval(secs => :receipt_timeout_seconds),
         reconciled_at = NULL,
@@ -230,12 +233,32 @@ FAILURE_SQL = text(
     """
     WITH failed_event AS (
         UPDATE deliveries
-        SET status = 'pending',
+        -- A copy whose own consecutive-failure streak reaches the limit is
+        -- parked in the dead-letter area: it never goes back on the queue and
+        -- the worker never claims 'dead_lettered' rows, so later copies of
+        -- this destination immediately become the head and keep draining.
+        SET status = CASE WHEN :dead_letter THEN 'dead_lettered' ELSE 'pending' END,
+            consecutive_failures = consecutive_failures + 1,
             claim_token = NULL,
             claimed_at = NULL,
             lease_until = NULL,
-            last_error = :error,
+            last_error = CASE
+                WHEN :dead_letter THEN CONCAT(
+                    'dead-lettered after ',
+                    consecutive_failures + 1,
+                    ' consecutive delivery failures; last error: ',
+                    COALESCE(:error, '(none)')
+                )
+                ELSE :error
+            END,
             next_attempt_at = :next_attempt_at,
+            dead_letter_reason = CASE
+                WHEN :dead_letter THEN 'delivery_attempts_exhausted'
+                ELSE dead_letter_reason
+            END,
+            dead_lettered_at = CASE
+                WHEN :dead_letter THEN now() ELSE dead_lettered_at
+            END,
             updated_at = now()
         WHERE id = :delivery_id
           AND status = 'in_flight'
@@ -502,11 +525,17 @@ def record_result(
 
     next_attempt_at = utc_now() + backoff_delay(claim["attempts"])
     should_isolate = False
+    should_dead_letter = False
     recoverable_at = None
     if not result["success"]:
         should_isolate = claim["attempts"] >= settings.failure_threshold
         if should_isolate:
             recoverable_at = utc_now() + timedelta(seconds=settings.quarantine_seconds)
+        # A manual revive resets the streak, so this counts failures since
+        # the last 2xx (or revive) for this specific copy only.
+        should_dead_letter = (
+            claim["consecutive_failures"] + 1 >= settings.max_delivery_attempts
+        )
 
     # A destination that changed location while this HTTP call was in flight
     # is no longer the generation this copy belongs to. A 2xx still counts as
@@ -567,6 +596,7 @@ def record_result(
                 "next_attempt_at": next_attempt_at,
                 "failure_threshold": settings.failure_threshold,
                 "recoverable_at": recoverable_at,
+                "dead_letter": should_dead_letter,
             },
         )
         if updated.rowcount != 1:
@@ -578,7 +608,17 @@ def record_result(
     )
 
     db.commit()
-    if should_isolate and not stale_generation:
+    if should_dead_letter and not stale_generation:
+        logger.error(
+            "delivery_id=%s moved to dead letter after %s consecutive failures "
+            "(destination_id=%s, event_id=%s, error=%s)",
+            claim["delivery_id"],
+            claim["consecutive_failures"] + 1,
+            claim["destination_id"],
+            claim["event_id"],
+            result["error"],
+        )
+    elif should_isolate and not stale_generation:
         logger.warning(
             "destination_id=%s isolated after delivery_id=%s failed %s times",
             claim["destination_id"],

@@ -123,6 +123,20 @@ SCHEMA_STATEMENTS = [
         receipt_result TEXT,
         receipt_id UUID,
         requeue_count INTEGER NOT NULL DEFAULT 0,
+        -- Consecutive transport failures for this copy; reset to 0 by a 2xx
+        -- or by a manual revive from the dead-letter area. attempts (the
+        -- total try count used in the audit trail) keeps growing.
+        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+        -- Dead-letter area. A copy becomes terminally 'dead_lettered' when its
+        -- own consecutive transport failures reach the limit
+        -- (dead_letter_reason 'delivery_attempts_exhausted') or when it has
+        -- been requeued the configured number of times and still does not get
+        -- a matching receipt ('receipt_timeout_exhausted' /
+        -- 'receipt_failure_exhausted'). Dead copies are never claimed again,
+        -- never block later copies of the same destination, and only leave the
+        -- area via an explicit manual revive.
+        dead_letter_reason TEXT,
+        dead_lettered_at TIMESTAMPTZ,
         -- Generation of the destination's activation handshake this copy was
         -- fanned out under. A URL change re-arms confirmation and bumps the
         -- destination generation; older copies then fail the claim gate and
@@ -133,11 +147,26 @@ SCHEMA_STATEMENTS = [
         UNIQUE (destination_id, dedupe_key),
         -- superseded: the destination changed location before this copy was
         -- sent; it never goes out and is not retried or backfilled.
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded')),
+        -- dead_lettered: giving up on this one copy after repeated transport
+        -- failures or unreconciled requeue cycles; it is parked, never sent
+        -- again automatically, and no longer blocks later copies of this
+        -- destination.
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered')),
         CHECK (attempts >= 0),
         CHECK (destination_seq >= 0),
         CHECK (reconcile_state IN ('none', 'awaiting', 'acknowledged', 'receipt_failed', 'timed_out')),
-        CHECK (requeue_count >= 0)
+        CHECK (requeue_count >= 0),
+        CHECK (consecutive_failures >= 0),
+        CHECK (
+            (status = 'dead_lettered') = (dead_letter_reason IS NOT NULL)
+        ),
+        CHECK (
+            dead_letter_reason IS NULL OR dead_letter_reason IN (
+                'delivery_attempts_exhausted',
+                'receipt_timeout_exhausted',
+                'receipt_failure_exhausted'
+            )
+        )
     )
     """,
     # One row per callback receipt sent by a receiver. The disposition records
@@ -436,6 +465,50 @@ SCHEMA_STATEMENTS = [
             'stale_timestamp', 'future_timestamp', 'invalid_timestamp',
             'invalid_body'
         ))
+    """,
+    # Idempotent upgrades for the dead-letter area. A copy that keeps failing
+    # transport past its own attempt budget, or whose receipt keeps not
+    # matching after the allowed requeue cycles, becomes terminally
+    # 'dead_lettered': it is kept for inspection (which copy, which address,
+    # why, when), is never claimed by the worker again, and — because the
+    # worker only takes the smallest pending/in_flight seq — no longer blocks
+    # later copies of the same destination.
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS dead_letter_reason TEXT",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS dead_lettered_at TIMESTAMPTZ",
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_status_check",
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered'))
+    """,
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_consecutive_failures_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_consecutive_failures_check
+        CHECK (consecutive_failures >= 0)
+    """,
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_dead_letter_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_dead_letter_check
+        CHECK (
+            (status = 'dead_lettered') = (dead_letter_reason IS NOT NULL)
+        )
+    """,
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_dead_letter_reason_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_dead_letter_reason_check
+        CHECK (
+            dead_letter_reason IS NULL OR dead_letter_reason IN (
+                'delivery_attempts_exhausted',
+                'receipt_timeout_exhausted',
+                'receipt_failure_exhausted'
+            )
+        )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS deliveries_dead_letter_idx
+        ON deliveries (dead_lettered_at DESC, id DESC)
+        WHERE status = 'dead_lettered'
     """,
 ]
 

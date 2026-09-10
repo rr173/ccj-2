@@ -56,6 +56,24 @@ MARK_TIMED_OUT_SQL = text(
     """
 )
 
+# A failure receipt after the copy's requeue budget is exhausted: the receiver
+# keeps saying it cannot process this copy, so it is parked in the dead-letter
+# area instead of cycling forever. The failure receipt still counts as the
+# reconciliation outcome (receipt_failed), so the copy is never mistaken for
+# acknowledged.
+PARK_FAILED_RECEIPT_SQL = text(
+    """
+    UPDATE deliveries
+    SET status = 'dead_lettered',
+        dead_letter_reason = 'receipt_failure_exhausted',
+        dead_lettered_at = now(),
+        updated_at = now()
+    WHERE id = CAST(:delivery_id AS UUID)
+      AND status = 'delivered'
+      AND requeue_count >= :max_requeue_cycles
+    """
+)
+
 INSERT_RECEIPT_SQL = text(
     """
     INSERT INTO receipts (id, destination_id, dedupe_key, result, delivery_id, disposition)

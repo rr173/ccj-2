@@ -24,6 +24,16 @@ class Settings(BaseSettings):
     failure_threshold: int = 5
     quarantine_seconds: int = 900
     max_response_body_bytes: int = 2048
+    # A copy that fails this many times *consecutively* (a 2xx resets the
+    # streak, and a manual revive starts a fresh one) stops being retried and
+    # is parked in the dead-letter area as 'dead_lettered'. It never goes out
+    # again by itself and no longer blocks later copies of the same address.
+    max_delivery_attempts: int = 10
+    # How many times an unreconciled copy (timed out / failure receipt) may be
+    # sent back out via requeue before "the receipt never matches" is treated
+    # as terminal: the next timeout/failure receipt parks it in the dead-letter
+    # area. A manual revive resets the cycle budget.
+    max_requeue_cycles: int = 3
 
     # Receipt reconciliation settings
     receipt_timeout_seconds: float = 300.0
