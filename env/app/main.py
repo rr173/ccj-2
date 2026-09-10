@@ -1,14 +1,13 @@
 import json
-import time
 from contextlib import asynccontextmanager
-from uuid import UUID, uuid4
+from typing import Any
+from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
 
-from app.config import settings
 from app.db import engine, get_db
 from app.models import init_db
 from app.receipts import ingest_receipt
@@ -17,6 +16,7 @@ from app.schemas import (
     DeliveryOut,
     DestinationIn,
     DestinationOut,
+    EventBulkRequeueOut,
     EventIn,
     EventOut,
     EventTraceOut,
@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Event Ingest Service",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -81,10 +81,24 @@ def event_status(delivery_count: int, delivered_count: int) -> str:
     return "pending"
 
 
-def event_response(event: RowMapping) -> dict:
+def event_reconcile_status(delivery_count: int, acknowledged_count: int) -> str:
+    if delivery_count > 0 and acknowledged_count >= delivery_count:
+        return "acknowledged"
+    if acknowledged_count > 0:
+        return "partially_acknowledged"
+    return "pending"
+
+
+def event_response(event: RowMapping | dict[str, Any]) -> dict:
     result = dict(event)
     result["status"] = event_status(
         result["delivery_count"], result["delivered_count"]
+    )
+    result["reconcile_status"] = event_reconcile_status(
+        result["delivery_count"], result["acknowledged_count"]
+    )
+    result["unacknowledged_count"] = (
+        result["delivery_count"] - result["acknowledged_count"]
     )
     return result
 
@@ -248,8 +262,7 @@ def create_event(body: EventIn, db: Session = Depends(get_db)):
     result["delivery_count"] = len(subscribers)
     result["delivered_count"] = 0
     result["acknowledged_count"] = 0
-    result["status"] = event_status(len(subscribers), 0)
-    return result
+    return event_response(result)
 
 
 @app.get("/v1/events/{event_id}/trace", response_model=EventTraceOut)
@@ -309,6 +322,62 @@ def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
         "deliveries": deliveries,
         "attempts": attempts,
         "receipts": receipts,
+    }
+
+
+@app.post(
+    "/v1/events/{event_id}/requeue-unreconciled",
+    response_model=EventBulkRequeueOut,
+)
+def requeue_event_unreconciled(event_id: UUID, db: Session = Depends(get_db)):
+    event_exists = db.execute(
+        text("SELECT 1 FROM events WHERE id = CAST(:event_id AS UUID)"),
+        {"event_id": str(event_id)},
+    ).first()
+    if event_exists is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="event not found")
+
+    # Only terminal receipt failures/timeouts are re-sent. Copies that are
+    # acknowledged stay untouched; copies still waiting for a receipt or still
+    # in transport are also left alone, so this endpoint never duplicates work.
+    requeued = db.execute(
+        text(
+            f"""
+            WITH target_deliveries AS (
+                SELECT id
+                FROM deliveries
+                WHERE event_id = CAST(:event_id AS UUID)
+                  AND {REQUEUEABLE_WHERE}
+                ORDER BY destination_id, destination_seq
+                FOR UPDATE
+            ), requeued_deliveries AS (
+                UPDATE deliveries d
+                SET {REQUEUE_SET_SQL}
+                FROM target_deliveries t
+                WHERE d.id = t.id
+                RETURNING d.id, d.destination_id, d.destination_seq
+            )
+            SELECT id, destination_id, destination_seq
+            FROM requeued_deliveries
+            ORDER BY destination_id, destination_seq
+            """
+        ),
+        {"event_id": str(event_id)},
+    ).mappings().all()
+    db.commit()
+    return {
+        "event_id": event_id,
+        "requeued_count": len(requeued),
+        "deliveries": [
+            {
+                "delivery_id": row["id"],
+                "destination_id": row["destination_id"],
+                "destination_seq": row["destination_seq"],
+                "requeued": True,
+            }
+            for row in requeued
+        ],
     }
 
 

@@ -71,14 +71,23 @@ class EventOut(BaseModel):
     event_type: str
     dedupe_key: str
     payload: dict[str, Any]
+    # Transport state:
     # unrouted: no destination subscribed to this type at ingest time;
     # pending: at least one delivery is still undelivered;
-    # delivered: every delivery created for this event succeeded.
+    # delivered: every delivery created for this event got a transport 2xx.
     status: str
+    # Whole-event receipt state. Only success receipts on every fanned-out copy
+    # make the whole event acknowledged:
+    # pending: no copy has a receipt outcome yet;
+    # partially_acknowledged: at least one copy is acknowledged and another is not;
+    # acknowledged: every fanned-out copy is acknowledged.
+    reconcile_status: str = "pending"
     delivery_count: int
     delivered_count: int
-    # How many fanned-out copies have been acknowledged by a matching receipt.
+    # How many fanned-out copies have been acknowledged by a matching success receipt.
     acknowledged_count: int = 0
+    # Copies still awaiting, transport-failed/pending, receipt-failed or timed out.
+    unacknowledged_count: int = 0
     created_at: datetime
     duplicate: bool = False
 
@@ -166,6 +175,12 @@ class RequeueOut(BaseModel):
 class BulkRequeueOut(BaseModel):
     destination_id: UUID
     requeued_count: int
+
+
+class EventBulkRequeueOut(BaseModel):
+    event_id: UUID
+    requeued_count: int
+    deliveries: list[RequeueOut]
 
 
 class EventTraceOut(BaseModel):

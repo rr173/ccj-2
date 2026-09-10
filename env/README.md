@@ -2,7 +2,7 @@
 
 这是一个接收事件、按事件类型分发给订阅地址，把事件按顺序推送到外部 Webhook，并对推送结果做**回执对账**的系统：
 
-- **ingest-api**：登记接收地址（含订阅的事件类型）、接收事件、**接入回执**、查询事件投递轨迹与对账情况、人工恢复隔离地址、把超时未对上的副本重投。
+- **ingest-api**：登记接收地址（含订阅的事件类型）、接收事件、**接入回执**、查询事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（支持只重投某一笔事件中尚未认的那些副本）。
 - **worker**：负责真正的 HTTP 投递、重试、熔断隔离、崩溃恢复。
 - **reconciler**：独立的对账进程，周期性把超过约定时间仍未收到回执的副本标记为 `timed_out`（可查，不算认）。
 - **PostgreSQL**：作为任务队列和事实来源，用行锁和每地址单调序号保证同一个接收地址严格 FIFO。
@@ -72,21 +72,33 @@ HTTP 投递拿到 2xx 只说明“打出去了”，不代表对方处理完了�
 - 回执接入（ingest-api 的接口）和对账扫描（reconciler 进程）都不在外发 worker 进程里，可以各自独立扩缩。
 - 回执结果（包括失败回执）不影响地址的失败计数与隔离状态——隔离只看传输层投递结果。
 
+#### 整笔事件的对账状态
+
+一条事件扇出给多个地址时，每个地址的副本独立对账；事件响应和轨迹里的 `reconcile_status` 再汇总整笔状态：
+
+- `pending`：还没有任何一份副本对上成功回执（包括仍在传输、等待回执、已超时或收到失败回执）；
+- `partially_acknowledged`：至少一份副本已经对上，但不是所有订阅地址都对上；轨迹中可逐个查看谁是 `acknowledged`、谁还在 `awaiting`、谁是 `timed_out` / `receipt_failed`；
+- `acknowledged`：事件扇出的**每一份**副本都在时限内收到成功回执，这时整笔才算认完。
+- `acknowledged_count / unacknowledged_count` 分别给出已认和未认份数；`delivery_count = 0` 的无人订阅事件仍是明确的 `unrouted`，不会被汇总成已认。
+
+`status` 仍只表示传输层状态（`pending` / `delivered` / `unrouted`），不能把“全部收到 2xx”当成整笔已认；整笔是否认完只看 `reconcile_status`。
+
 #### 超时/失败副本的重投
 
 `timed_out` 或 `receipt_failed` 的副本可以丢回原地址重投：
 
 - `POST /v1/deliveries/{delivery_id}/requeue`：重投单个副本；
+- `POST /v1/events/{event_id}/requeue-unreconciled`：只把这一笔事件中已经终态未对上的副本（`timed_out` / `receipt_failed`）按原地址批量重投；
 - `POST /v1/destinations/{destination_id}/requeue-unreconciled`：把该地址所有未对上的副本一次性重投。
 
-重投**保留原来的 `destination_seq`**，副本回到原地址队列中它原来的位置，按原顺序接着排；同时 Worker 的领取逻辑保证：只要该地址还有副本在投（`in_flight`），重投回来的副本就不会被领取——不会插到还在投的副本前面。重投成功后该副本重新进入 `awaiting`，等待新一轮回执。
+事件级重投只选择未认副本：已经 `acknowledged` 的副本不会再打，仍在传输或仍处于本轮等待回执窗口的副本也不会被提前重打。重投**保留原来的 `destination_seq`**，每份副本回到自己原地址队列中原来的位置，按原顺序接着排；各地址仍互不等待。同时 Worker 的领取逻辑保证：只要某地址还有副本在投（`in_flight`），重投回来的副本就不会被领取——不会插到还在投的副本前面。重投成功后该副本重新进入 `awaiting`，等待新一轮回执。
 
 #### 对账查询
 
 - `GET /v1/reconciliations/summary`：各对账状态的副本数量；
 - `GET /v1/reconciliations/deliveries?reconcile_state=timed_out&destination_id=...`：列出指定状态（默认 `timed_out`）的副本明细；
 - `GET /v1/receipts?disposition=late&destination_id=...`：回执日志，可按处置结果（`applied`/`duplicate`/`late`/`orphan`/`premature`）过滤；
-- `GET /v1/events/{event_id}/trace`：每条副本附带 `reconcile_state`、对账时限、回执结果，以及该事件命中的全部回执记录。
+- `GET /v1/events/{event_id}/trace`：展示整笔 `reconcile_status`、已认/未认数量；每条副本附带 `reconcile_state`、对账时限、回执结果，以及该事件命中的全部回执记录，可直接查出哪些地址已认、哪些还没认。
 
 ## 快速启动
 
@@ -160,8 +172,10 @@ curl -s http://localhost:8000/v1/events \
 
 - `id`：事件 ID
 - `event_type` / `dedupe_key` / `payload`：事件本体
-- `status`：`unrouted`（没有地址订该类型）、`pending`（至少一份副本未投完）、`delivered`（全部副本已投妥）
+- `status`：`unrouted`（没有地址订该类型）、`pending`（至少一份副本未投完）、`delivered`（全部副本已收到传输层 2xx，但不一定已对上回执）
+- `reconcile_status`：`pending`（还没有副本认）、`partially_acknowledged`（只认了一部分）、`acknowledged`（所有订阅地址的副本都认了）
 - `delivery_count` / `delivered_count`：扇出副本总数 / 已投妥数
+- `acknowledged_count` / `unacknowledged_count`：已对上成功回执的份数 / 还没对上的份数
 - `duplicate`：是否命中去重并返回已有事件
 
 ### 查询某条事件的投递过程
@@ -170,7 +184,7 @@ curl -s http://localhost:8000/v1/events \
 curl -s http://localhost:8000/v1/events/<event_id>/trace
 ```
 
-返回事件当前状态、每个地址的副本（`deliveries`：状态、序号、已尝试次数、下次尝试时间、最近错误、对账状态 `reconcile_state`、对账时限 `reconcile_deadline`、回执结果 `receipt_result`）、全部投递尝试（`attempts`：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息；若某次调用是在租约丢失后返回的，会带 `lost_lease: true`）和该事件命中的回执（`receipts`）。没人订的事件在这里能看到 `status: "unrouted"` 且 `deliveries` 为空——是明确的“没送出去”，不是成功。
+返回事件当前传输状态和整笔对账状态（`reconcile_status`，以及已认/未认数量）、每个地址的副本（`deliveries`：状态、序号、已尝试次数、下次尝试时间、最近错误、对账状态 `reconcile_state`、对账时限 `reconcile_deadline`、回执结果 `receipt_result`）、全部投递尝试（`attempts`：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息；若某次调用是在租约丢失后返回的，会带 `lost_lease: true`）和该事件命中的回执（`receipts`）。部分地址已认时，整笔是 `partially_acknowledged`，不会写成已认完；逐个查看副本即可知道谁认了、谁还没认。没人订的事件在这里能看到 `status: "unrouted"` 且 `deliveries` 为空——是明确的“没送出去”，不是成功。
 
 ### 回执接入（接收方回调）
 
@@ -210,6 +224,10 @@ curl -s 'http://localhost:8000/v1/receipts?disposition=late'
 
 # 重投单个超时副本（保留原 destination_seq，回到原地址队列原位置）
 curl -s -X POST http://localhost:8000/v1/deliveries/<delivery_id>/requeue
+
+# 只把这一笔事件里已超时或收到失败回执、还没认的副本按原地址/原顺序重投；
+# 已 acknowledged 的副本不会重打
+curl -s -X POST http://localhost:8000/v1/events/<event_id>/requeue-unreconciled
 
 # 把某地址所有没对上的副本一次性重投
 curl -s -X POST http://localhost:8000/v1/destinations/<destination_id>/requeue-unreconciled
