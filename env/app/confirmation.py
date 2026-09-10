@@ -52,7 +52,7 @@ DESTINATION_CONFIRM_COLUMNS = (
     "id, url, status, failure_count, recoverable_at, created_at, "
     "confirmation_state, challenge_token, challenge_expires_at, confirmed_at, "
     "confirmation_generation, confirmation_round, confirmation_attempt_count, "
-    "next_probe_at"
+    "next_probe_at, observe_only"
 )
 
 

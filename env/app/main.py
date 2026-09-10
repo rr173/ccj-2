@@ -108,36 +108,59 @@ def destination_response(db: Session, destination: RowMapping) -> dict:
 
 def event_status(
     cancelled_at,
-    delivery_count: int,
+    live_count: int,
     delivered_count: int,
     superseded_count: int,
     pending_count: int = 0,
     dead_lettered_count: int = 0,
+    shadow_live_count: int = 0,
+    shadow_pending_count: int = 0,
+    shadow_delivered_count: int = 0,
+    shadow_dead_lettered_count: int = 0,
+    shadow_superseded_count: int = 0,
 ) -> str:
     if cancelled_at is not None:
         return "cancelled"
-    if delivery_count == 0:
-        # No live copies: either nothing subscribed at all, or every copy was
-        # abandoned because its destination moved before it could be sent.
-        # Either way nothing is still going out.
-        if superseded_count > 0:
-            return "superseded"
-        return "unrouted"
+    if live_count == 0:
+        # No for-real live copies: nothing subscribed/confirmed for-real, or
+        # every for-real copy was abandoned because its destination moved.
+        # Shadow-only subscribers must never make an event look fully routed,
+        # so they do not count toward acknowledgement; but the transport
+        # status still says what actually happened to the shadow copies —
+        # delivered/pending/dead-lettered — instead of "unrouted".
+        if shadow_live_count == 0:
+            if superseded_count > 0 or shadow_superseded_count > 0:
+                return "superseded"
+            return "unrouted"
+        if shadow_pending_count > 0:
+            return "pending"
+        if shadow_dead_lettered_count > 0 and shadow_delivered_count == 0:
+            return "dead_lettered"
+        if shadow_delivered_count >= shadow_live_count:
+            return "delivered"
+        return "pending"
+    # For-real copies decide the transport state. A shadow copy being parked
+    # (dead-letter) or still pending can never hold the whole event back here,
+    # and a shadow's 2xx can never make the event look delivered either.
     if pending_count > 0:
         return "pending"
     if dead_lettered_count > 0:
-        # Every live copy stopped: at least one is parked in the dead-letter
-        # area and nothing is queued or in flight. It is not "delivered" — the
-        # parked copies never completed — and it only leaves this state when a
-        # copy is manually revived (which puts it back to pending).
+        # Every for-real live copy stopped: at least one is parked in the
+        # dead-letter area and nothing for-real is queued or in flight. It is
+        # not "delivered" — the parked copies never completed — and it only
+        # leaves this state when a copy is manually revived (which puts it
+        # back to pending).
         return "dead_lettered"
-    if delivered_count >= delivery_count:
+    if delivered_count >= live_count:
         return "delivered"
     return "pending"
 
 
-def event_reconcile_status(delivery_count: int, acknowledged_count: int) -> str:
-    if delivery_count > 0 and acknowledged_count >= delivery_count:
+def event_reconcile_status(live_count: int, acknowledged_count: int) -> str:
+    # Only for-real copies decide whether the whole event is acknowledged: a
+    # shadow's success receipt can never complete it, and a shadow's timeout
+    # or failure receipt can never drag an otherwise-acknowledged event back.
+    if live_count > 0 and acknowledged_count >= live_count:
         return "acknowledged"
     if acknowledged_count > 0:
         return "partially_acknowledged"
@@ -149,42 +172,84 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
     superseded_count = result.get("superseded_count", 0) or 0
     dead_lettered_count = result.get("dead_lettered_count", 0) or 0
     pending_count = result.get("pending_count", 0) or 0
-    # delivery_count counts live copies only — superseded copies never went
-    # out and must not be described as still pending or as delivered.
-    result["delivery_count"] = result["delivery_count"] - superseded_count
+    shadow_superseded_count = result.get("shadow_superseded_count", 0) or 0
+    shadow_dead_lettered_count = result.get("shadow_dead_lettered_count", 0) or 0
+    shadow_pending_count = result.get("shadow_pending_count", 0) or 0
+    # delivery_count counts live for-real copies only — superseded copies
+    # never went out and must not be described as still pending or delivered.
+    live_count = result["delivery_count"] - superseded_count
+    result["delivery_count"] = live_count
     result["superseded_count"] = superseded_count
     result["dead_lettered_count"] = dead_lettered_count
+    result["pending_count"] = pending_count
+    shadow_live_count = (
+        result.get("shadow_delivery_count", 0) or 0
+    ) - shadow_superseded_count
+    result["shadow_delivery_count"] = shadow_live_count
+    result["shadow_superseded_count"] = shadow_superseded_count
+    result["shadow_dead_lettered_count"] = shadow_dead_lettered_count
+    result["shadow_pending_count"] = shadow_pending_count
     result["status"] = event_status(
         result.get("cancelled_at"),
-        result["delivery_count"],
+        live_count,
         result["delivered_count"],
         superseded_count,
         pending_count,
         dead_lettered_count,
+        shadow_live_count,
+        shadow_pending_count,
+        result.get("shadow_delivered_count", 0) or 0,
+        shadow_dead_lettered_count,
+        shadow_superseded_count,
     )
     result["reconcile_status"] = event_reconcile_status(
-        result["delivery_count"], result["acknowledged_count"]
+        live_count, result["acknowledged_count"]
     )
-    result["unacknowledged_count"] = (
-        result["delivery_count"] - result["acknowledged_count"]
-    )
+    result["unacknowledged_count"] = live_count - result["acknowledged_count"]
+    shadow_acknowledged = result.get("shadow_acknowledged_count", 0) or 0
+    result["shadow_acknowledged_count"] = shadow_acknowledged
+    result["shadow_unacknowledged_count"] = shadow_live_count - shadow_acknowledged
     return result
 
 
 EVENT_WITH_COUNTS_SQL = """
     SELECT e.id, e.source_id, e.event_type, e.dedupe_key, e.payload, e.created_at,
            e.not_before, e.cancelled_at,
-           COUNT(d.id)::int AS delivery_count,
-           COUNT(d.id) FILTER (WHERE d.status = 'delivered')::int AS delivered_count,
+           -- For-real copies decide the whole event's transport/reconcile
+           -- standing; observe-only ("shadow") copies are counted separately
+           -- and can never change it.
+           COUNT(d.id) FILTER (WHERE NOT d.observe_only)::int AS delivery_count,
            COUNT(d.id) FILTER (
-               WHERE d.status IN ('pending', 'in_flight')
+               WHERE NOT d.observe_only AND d.status = 'delivered'
+           )::int AS delivered_count,
+           COUNT(d.id) FILTER (
+               WHERE NOT d.observe_only AND d.status IN ('pending', 'in_flight')
            )::int AS pending_count,
-           COUNT(d.id) FILTER (WHERE d.reconcile_state = 'acknowledged')::int
-               AS acknowledged_count,
-           COUNT(d.id) FILTER (WHERE d.status = 'superseded')::int
-               AS superseded_count,
-           COUNT(d.id) FILTER (WHERE d.status = 'dead_lettered')::int
-               AS dead_lettered_count
+           COUNT(d.id) FILTER (
+               WHERE NOT d.observe_only AND d.reconcile_state = 'acknowledged'
+           )::int AS acknowledged_count,
+           COUNT(d.id) FILTER (
+               WHERE NOT d.observe_only AND d.status = 'superseded'
+           )::int AS superseded_count,
+           COUNT(d.id) FILTER (
+               WHERE NOT d.observe_only AND d.status = 'dead_lettered'
+           )::int AS dead_lettered_count,
+           COUNT(d.id) FILTER (WHERE d.observe_only)::int AS shadow_delivery_count,
+           COUNT(d.id) FILTER (
+               WHERE d.observe_only AND d.status = 'delivered'
+           )::int AS shadow_delivered_count,
+           COUNT(d.id) FILTER (
+               WHERE d.observe_only AND d.status IN ('pending', 'in_flight')
+           )::int AS shadow_pending_count,
+           COUNT(d.id) FILTER (
+               WHERE d.observe_only AND d.reconcile_state = 'acknowledged'
+           )::int AS shadow_acknowledged_count,
+           COUNT(d.id) FILTER (
+               WHERE d.observe_only AND d.status = 'superseded'
+           )::int AS shadow_superseded_count,
+           COUNT(d.id) FILTER (
+               WHERE d.observe_only AND d.status = 'dead_lettered'
+           )::int AS shadow_dead_lettered_count
     FROM events e
     LEFT JOIN deliveries d ON d.event_id = e.id
     WHERE {where}
@@ -209,12 +274,12 @@ def register_destination(body: DestinationIn, db: Session = Depends(get_db)):
             destination = db.execute(
                 text(
                     f"""
-                    INSERT INTO destinations (url)
-                    VALUES (:url)
+                    INSERT INTO destinations (url, observe_only)
+                    VALUES (:url, COALESCE(:observe_only, FALSE))
                     RETURNING {DESTINATION_CONFIRM_COLUMNS}
                     """
                 ),
-                {"url": url},
+                {"url": url, "observe_only": body.observe_only},
             ).mappings().one()
         except IntegrityError:
             # Concurrent registration of the same URL: fall back to the
@@ -272,6 +337,24 @@ def register_destination(body: DestinationIn, db: Session = Depends(get_db)):
                 ],
             )
 
+    if not is_new and body.observe_only is not None:
+        # Re-registration can retoggle the shadow flag. Only newly fanned-out
+        # copies pick the new value; existing copies keep their snapshot.
+        destination = db.execute(
+            text(
+                f"""
+                UPDATE destinations
+                SET observe_only = :observe_only
+                WHERE id = :destination_id
+                RETURNING {DESTINATION_CONFIRM_COLUMNS}
+                """
+            ),
+            {
+                "observe_only": body.observe_only,
+                "destination_id": destination["id"],
+            },
+        ).mappings().one()
+
     # A brand-new destination starts unconfirmed: arm its first challenge
     # round before any event can fan out to it.
     if is_new:
@@ -292,11 +375,16 @@ def update_destination(
 ):
     # Re-locating (new url) re-arms the handshake under a new generation:
     # queued copies aimed at the old location become superseded, copies already
-    # out or in flight are left alone. Subscription-only edits never re-arm.
-    if body.url is None and body.event_types is None:
+    # out or in flight are left alone. Subscription/observe-only edits never
+    # re-arm.
+    if (
+        body.url is None
+        and body.event_types is None
+        and body.observe_only is None
+    ):
         raise HTTPException(
             status_code=422,
-            detail="provide a url and/or event_types to update",
+            detail="provide a url, event_types and/or observe_only to update",
         )
 
     destination = db.execute(
@@ -363,6 +451,24 @@ def update_destination(
                     for event_type in body.event_types
                 ],
             )
+
+    if body.observe_only is not None and body.observe_only != destination["observe_only"]:
+        # Toggling shadow mode only affects copies fanned out afterwards;
+        # already-created copies keep the flag they were born with.
+        destination = db.execute(
+            text(
+                f"""
+                UPDATE destinations
+                SET observe_only = :observe_only
+                WHERE id = CAST(:destination_id AS UUID)
+                RETURNING {DESTINATION_CONFIRM_COLUMNS}
+                """
+            ),
+            {
+                "observe_only": body.observe_only,
+                "destination_id": str(destination_id),
+            },
+        ).mappings().one()
 
     if relocated:
         destination = arm_round(db, str(destination_id), bump_generation=True)
@@ -799,7 +905,7 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     subscribers = db.execute(
         text(
             """
-            SELECT s.destination_id
+            SELECT s.destination_id, d.observe_only
             FROM destination_subscriptions s
             JOIN destinations d ON d.id = s.destination_id
             WHERE s.event_type = :event_type
@@ -835,10 +941,12 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
                 )
                 INSERT INTO deliveries
                     (event_id, destination_id, event_type, dedupe_key, payload,
-                     destination_seq, not_before, confirmation_generation)
+                     destination_seq, not_before, confirmation_generation,
+                     observe_only)
                 SELECT :event_id, id, :event_type, :dedupe_key,
                        CAST(:payload AS JSONB), next_event_seq,
-                       CAST(:not_before AS TIMESTAMPTZ), confirmation_generation
+                       CAST(:not_before AS TIMESTAMPTZ), confirmation_generation,
+                       :observe_only
                 FROM bumped
                 """
             ),
@@ -849,6 +957,7 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
                 "dedupe_key": body.dedupe_key,
                 "payload": payload,
                 "not_before": body.not_before,
+                "observe_only": row[1],
             },
         )
 
@@ -872,13 +981,21 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
         signed_at=signed_at,
     )
     db.commit()
+    real_subscribers = [row for row in subscribers if not row[1]]
+    shadow_subscribers = [row for row in subscribers if row[1]]
     result = dict(event)
-    result["delivery_count"] = len(subscribers)
+    result["delivery_count"] = len(real_subscribers)
     result["delivered_count"] = 0
-    result["pending_count"] = len(subscribers)
+    result["pending_count"] = len(real_subscribers)
     result["acknowledged_count"] = 0
     result["superseded_count"] = 0
     result["dead_lettered_count"] = 0
+    result["shadow_delivery_count"] = len(shadow_subscribers)
+    result["shadow_delivered_count"] = 0
+    result["shadow_pending_count"] = len(shadow_subscribers)
+    result["shadow_acknowledged_count"] = 0
+    result["shadow_superseded_count"] = 0
+    result["shadow_dead_lettered_count"] = 0
     return event_response(result), 201
 
 
@@ -901,7 +1018,8 @@ def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
                    d.delivered_at, d.reconcile_state, d.reconcile_deadline,
                    d.reconciled_at, d.receipt_result, d.requeue_count,
                    d.consecutive_failures, d.dead_letter_reason,
-                   d.dead_lettered_at, d.confirmation_generation
+                   d.dead_lettered_at, d.confirmation_generation,
+                   d.observe_only
             FROM deliveries d
             JOIN destinations dest ON dest.id = d.destination_id
             WHERE d.event_id = CAST(:event_id AS UUID)
@@ -1114,7 +1232,7 @@ def requeue_event_unreconciled(event_id: UUID, db: Session = Depends(get_db)):
                 SELECT id
                 FROM deliveries
                 WHERE event_id = CAST(:event_id AS UUID)
-                  AND {REQUEUEABLE_WHERE}
+                  AND {EVENT_REQUEUEABLE_WHERE}
                 ORDER BY destination_id, destination_seq
                 FOR UPDATE
             ), requeued_deliveries AS (
@@ -1304,6 +1422,13 @@ REQUEUEABLE_WHERE = """
     )
 """
 
+# Event-level "re-send the unacknowledged copies" only ever means for-real
+# copies: an observe-only ("shadow") subscriber's timeout or failure must not
+# land on the list of copies re-thrown for the whole event. A shadow copy can
+# still be requeued explicitly via the per-delivery or per-destination
+# endpoints — its lifecycle is its own.
+EVENT_REQUEUEABLE_WHERE = REQUEUEABLE_WHERE + "    AND NOT observe_only\n"
+
 REQUEUE_SET_SQL = """
     status = 'pending',
     reconcile_state = 'none',
@@ -1443,7 +1568,8 @@ def list_reconciliation_deliveries(
                    d.delivered_at, d.reconcile_state, d.reconcile_deadline,
                    d.reconciled_at, d.receipt_result, d.requeue_count,
                    d.consecutive_failures, d.dead_letter_reason,
-                   d.dead_lettered_at, d.confirmation_generation
+                   d.dead_lettered_at, d.confirmation_generation,
+                   d.observe_only
             FROM deliveries d
             JOIN destinations dest ON dest.id = d.destination_id
             WHERE d.reconcile_state = :reconcile_state
@@ -1626,7 +1752,8 @@ def list_dead_letters(
                    d.delivered_at, d.reconcile_state, d.reconcile_deadline,
                    d.reconciled_at, d.receipt_result, d.requeue_count,
                    d.consecutive_failures, d.dead_letter_reason,
-                   d.dead_lettered_at, d.confirmation_generation
+                   d.dead_lettered_at, d.confirmation_generation,
+                   d.observe_only
             FROM deliveries d
             JOIN destinations dest ON dest.id = d.destination_id
             WHERE d.status = 'dead_lettered'

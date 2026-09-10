@@ -2,7 +2,7 @@
 
 这是一个接收事件、按事件类型分发给订阅地址，把事件按顺序推送到外部 Webhook，并对推送结果做**回执对账**的系统：
 
-- **ingest-api**：登记**事件来源**（发放只属于它的签名密钥、可停用/可换钥）、登记接收地址（含订阅的事件类型；**地址得先完成一次上线握手确认才会收到投递**，换接收位置要重新确认）、**验签 + 发送时间校验后**接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**接入回执与确认应答**、查询**入口准入记录（含每一条被拒事件，以及"收了但还没确认、一份没发"的事件）**、事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（支持只重投某一笔事件中尚未认的那些副本）。
+- **ingest-api**：登记**事件来源**（发放只属于它的签名密钥、可停用/可换钥）、登记接收地址（含订阅的事件类型；可把任一地址标成**只跟着看 `observe_only`**——照样收副本、按它自己的生命周期外发/重试/隔离/死信，但它的回执认不认、超时或进死信都不影响整笔算不算认完；**地址得先完成一次上线握手确认才会收到投递**，换接收位置要重新确认）、**验签 + 发送时间校验后**接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**接入回执与确认应答**、查询**入口准入记录（含每一条被拒事件，以及"收了但还没确认、一份没发"的事件）**、事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（支持只重投某一笔事件中尚未认的那些**当真**副本，只跟着看的副本不在名单内）。
 - **worker**：负责真正的 HTTP 投递、重试、熔断隔离、崩溃恢复，以及向未确认地址发送上线握手请求（confirmer 线程）。
 - **reconciler**：独立的对账进程，周期性把超过约定时间仍未收到回执的副本标记为 `timed_out`（可查，不算认）。
 - **PostgreSQL**：作为任务队列和事实来源，用行锁和每地址单调序号保证同一个接收地址严格 FIFO。
@@ -63,6 +63,21 @@
   - **已经打出去的不用收回来**：换位置时正在投（`in_flight`）或已投妥的副本保持原样；正在投的那次若拿到 2xx 就算交给了旧位置（回执对账照常），若失败则直接置 `superseded`，不会重试、也不会计入新位置的失败/隔离计数。
 - **没人订的类型对上了也要照收**：即使存在已确认地址，只要没有任何地址订阅该事件类型，事件照常接收、持久化，状态为 `unrouted`——不会因为地址确认过了就把它当成已发出。之后补订只对新事件生效。
 - 同一地址的重复登记是幂等的（同一 URL 再次 `POST` 不会重新握手）；重复提交同一 `dedupe_key` 的事件返回原事件并带 `duplicate: true`，不会重复扇出。
+
+### 1.1 只跟着看的地址（observe_only / "影子订阅"）
+
+登记或改地址时可以带 `"observe_only": true`，把一个接收地址标成**只跟着看、不当真**（默认 `false`，即当真）。它和当真地址**一样走完整流程**，唯独不进整笔事件的"认不认账"：
+
+- **订了的类型照样给它各排一份**：扇出时它也拿到自己的独立副本（`deliveries` 里带 `observe_only = true` 的快照标记），之后外发、指数退避重试、连续失败隔离、耗尽进死信处、回执对账（认了 / 失败回执 / 超时 / 迟到回执）、换位置时代号失效与 `superseded`，**全部按它自己的副本独立进行**，与当真地址没有任何区别。这个标记在扇出那一刻快照到副本上，之后再改开关只影响新副本，老副本保持出生时的样子。
+- **它认不认、超时还是进死信，都改不了整笔算不算认完**：整笔的 `reconcile_status` 只由**当真副本**决定。影子副本回成功回执，只把它自己那份记成 `acknowledged`，整笔仍是 `pending` / `partially_acknowledged`；已经被当真副本认成 `acknowledged` 的整笔，也不会被影子副本的失败回执、超时或进死信带偏。传输层 `status` 同理：影子副本的 2xx 不能把整笔写成 `delivered`，它进死信也不会把整笔写成 `dead_lettered`。
+- **整笔重丢未认副本时不算它**：`POST /v1/events/{event_id}/requeue-unreconciled` 的名单只含当真副本；影子副本即使超时/失败也不会被这条整笔接口重丢。影子副本**自己**仍然可以单独重投——`POST /v1/deliveries/{delivery_id}/requeue` 和按地址的 `POST /v1/destinations/{id}/requeue-unreconciled` 照常作用于它，预算和死信规则按它自己那份算。
+- **把它停掉（隔离）或丢进死信，挡不住订了同一类型的当真地址**：隔离/死信本来就是按地址、按副本独立的；影子地址失败计数、隔离恢复、死信后越过它继续排后面的副本，全部只影响它自己。
+- **查某一笔时分得清谁是当真、谁是跟着看**：事件响应与 trace 的 `event` 里，当真副本计数是 `delivery_count` / `delivered_count` / `acknowledged_count` / `unacknowledged_count` / `dead_lettered_count`；影子副本单列 `shadow_delivery_count` / `shadow_delivered_count` / `shadow_acknowledged_count` / `shadow_unacknowledged_count` / `shadow_pending_count` / `shadow_dead_lettered_count` 等。每份副本（trace 的 `deliveries`、对账明细、死信明细）都带 `observe_only` 布尔字段。**影子副本认了绝不写成整笔已认完**——当真份数为 0、只有影子副本的整笔，`reconcile_status` 永远停在 `pending`。
+- **只有影子订的类型**：事件照收、照常投给这些影子地址（传输层可到 `delivered`），但整笔 `reconcile_status` 不会变 `acknowledged`；它也**不会**被当成 `unrouted`——准入记录仍是 `accepted`，因为确实有已确认订户收到了。
+- **没标成跟着看的地址维持现状**：不带 `observe_only` 的地址就是当真地址，所有计数、整笔状态、整笔重投行为与以前完全一致。
+- **没人订的类型还是照收**：当真和影子订户都没有时，事件仍是 `unrouted`、一份不投、也不会写成已发出；影子订户不计入"没人订"。
+
+开关方式：登记时 `"observe_only": true/false`；之后用 `PATCH /v1/destinations/{id}` 带 `{"observe_only": false}` 改（不动 URL、不重新握手）；同一 URL 再次 `POST` 登记时，传了 `observe_only` 就整体改标，不传保持现状。地址详情的 `observe_only` 字段随时可查。
 
 ### 2. 同一接收地址严格按进入顺序投递
 
@@ -157,10 +172,10 @@ HTTP 投递拿到 2xx 只说明“打出去了”，不代表对方处理完了�
 
 一条事件扇出给多个地址时，每个地址的副本独立对账；事件响应和轨迹里的 `reconcile_status` 再汇总整笔状态：
 
-- `pending`：还没有任何一份副本对上成功回执（包括仍在传输、等待回执、已超时、收到失败回执，或有副本在死信处等待人工处理）；
-- `partially_acknowledged`：至少一份副本已经对上，但不是所有订阅地址都对上；轨迹中可逐个查看谁是 `acknowledged`、谁还在 `awaiting`、谁是 `timed_out` / `receipt_failed`；
-- `acknowledged`：事件扇出的**每一份**副本都在时限内收到成功回执，这时整笔才算认完。
-- `acknowledged_count / unacknowledged_count` 分别给出已认和未认份数；`delivery_count = 0` 的无人订阅事件仍是明确的 `unrouted`，不会被汇总成已认。
+- `pending`：还没有任何一份**当真**副本对上成功回执（包括仍在传输、等待回执、已超时、收到失败回执，或有当真副本在死信处等待人工处理；只跟着看的副本无论对上与否都不计入这里的判断）；
+- `partially_acknowledged`：至少一份当真副本已经对上，但不是所有当真地址都对上；轨迹中可逐个查看谁是 `acknowledged`、谁还在 `awaiting`、谁是 `timed_out` / `receipt_failed`（每份副本带 `observe_only`，跟着看的那些单列 `shadow_*` 计数）；
+- `acknowledged`：事件扇出的**每一份当真副本**都在时限内收到成功回执，这时整笔才算认完。只跟着看的副本认与不认都不改变这个结果：它没认不会把整笔拖回未认，它认了也不能替整笔认完。
+- `acknowledged_count / unacknowledged_count` 分别给出已认和未认的**当真**份数；影子副本的对应数字在 `shadow_acknowledged_count / shadow_unacknowledged_count`（以及 `shadow_delivery_count` 等）里；`delivery_count = 0` 的无人订阅事件仍是明确的 `unrouted`，不会被汇总成已认；`delivery_count = 0` 但有影子副本的事件不是 `unrouted`（确实投给了影子订户），但整笔也永远不会变成 `acknowledged`。
 
 `status` 仍只表示传输层状态（`pending` / `delivered` / `unrouted`），不能把“全部收到 2xx”当成整笔已认；整笔是否认完只看 `reconcile_status`。
 
@@ -174,7 +189,7 @@ HTTP 投递拿到 2xx 只说明“打出去了”，不代表对方处理完了�
 
 **重投不是无限的**：每份副本最多被重投 `MAX_REQUEUE_CYCLES`（默认 3）轮。重投后依旧超时（reconciler 标记 `timed_out` 时）或在最后一轮收到失败回执（`receipt_failed`），该副本直接进死信处（原因分别是 `receipt_timeout_exhausted` / `receipt_failure_exhausted`），不再自动重打；之后只能人工从死信处捞回（见第 4 节）。
 
-事件级重投只选择未认副本：已经 `acknowledged` 的副本不会再打（**已认的也永远不会被塞进死信**），仍在传输或仍处于本轮等待回执窗口的副本也不会被提前重打。**重投还过确认闸门**：地址当前必须是 `confirmed`，且副本的确认代号与地址当前代号一致——地址还没对上确认、或该副本是换位置前的老副本时不能重投（老副本不会被打到新位置）。重投**保留原来的 `destination_seq`**，每份副本回到自己原地址队列中原来的位置，按原顺序接着排；各地址仍互不等待。同时 Worker 的领取逻辑保证：只要某地址还有副本在投（`in_flight`），重投回来的副本就不会被领取——不会插到还在投的副本前面。重投成功后该副本重新进入 `awaiting`，等待新一轮回执。
+事件级重投只选择未认的**当真**副本：已经 `acknowledged` 的副本不会再打（**已认的也永远不会被塞进死信**），仍在传输或仍处于本轮等待回执窗口的副本也不会被提前重打；**只跟着看（`observe_only`）的副本即使超时/失败也不在事件级重投名单内**——要重丢影子副本，请用按副本或按地址的重投接口，按它自己的预算走。**重投还过确认闸门**：地址当前必须是 `confirmed`，且副本的确认代号与地址当前代号一致——地址还没对上确认、或该副本是换位置前的老副本时不能重投（老副本不会被打到新位置）。重投**保留原来的 `destination_seq`**，每份副本回到自己原地址队列中原来的位置，按原顺序接着排；各地址仍互不等待。同时 Worker 的领取逻辑保证：只要某地址还有副本在投（`in_flight`），重投回来的副本就不会被领取——不会插到还在投的副本前面。重投成功后该副本重新进入 `awaiting`，等待新一轮回执。
 
 #### 对账查询
 
@@ -274,6 +289,15 @@ curl -s http://localhost:8000/v1/destinations \
   -d '{"url":"https://example.com/webhook","event_types":["paid","refunded"]}'
 ```
 
+只想跟着看、不当真（照样收副本、按自己的节奏外发/重试/隔离/死信/对账，但不影响整笔算不算认完、不进整笔重投名单）：
+
+```bash
+curl -s http://localhost:8000/v1/destinations \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/audit-mirror","event_types":["paid"],"observe_only":true}'
+# 之后想当真：PATCH /v1/destinations/<id>  body {"observe_only": false}（不重新握手，只影响新事件）
+```
+
 返回示例（新地址**还没对上确认**，不会收到任何事件；字段以 `confirmation_` 开头）：
 
 ```json
@@ -290,7 +314,8 @@ curl -s http://localhost:8000/v1/destinations \
   "confirmed_at": null,
   "confirmation_generation": 1,
   "confirmation_round": 1,
-  "next_probe_at": "2026-09-09T00:00:00Z"
+  "next_probe_at": "2026-09-09T00:00:00Z",
+  "observe_only": false
 }
 ```
 
@@ -377,8 +402,9 @@ body（同样要配合签名头发送）: {
 - `not_before`：约定的最早外发时间（未定时为 `null`）；`cancelled_at`：取消时间（未取消为 `null`）
 - `status`：`unrouted`（没有任何地址订该类型）、`pending`（至少一份活跃副本未投完）、`delivered`（全部活跃副本已收到传输层 2xx，但不一定已对上回执）、`cancelled`（未打出前已取消，剩余副本永不再投）、`superseded`（所有副本都因地址换位置而被取代，没有一份打出去，也不补投）、`dead_lettered`（所有活跃副本都已进死信处、且没有还在排队或投递中的副本；其中任一份被人工复活即回到 `pending`）
 - `reconcile_status`：`pending`（还没有副本认）、`partially_acknowledged`（只认了一部分）、`acknowledged`（所有订阅地址的副本都认了）
-- `delivery_count` / `delivered_count`：扇出副本总数 / 已投妥数
-- `acknowledged_count` / `unacknowledged_count`：已对上成功回执的份数 / 还没对上的份数
+- `delivery_count` / `delivered_count`：**当真**扇出副本总数 / 已投妥数
+- `shadow_delivery_count` / `shadow_delivered_count`：只跟着看（`observe_only`）的副本总数 / 已投妥数；另有 `shadow_acknowledged_count` / `shadow_unacknowledged_count` / `shadow_pending_count` / `shadow_dead_lettered_count`。影子副本的任何结果都不改变下面的整笔状态
+- `acknowledged_count` / `unacknowledged_count`：已对上成功回执的**当真**份数 / 还没对上的**当真**份数
 - `duplicate`：是否命中去重并返回已有事件
 
 ### 取消与改期（仅在任何副本打出之前可用）
@@ -401,7 +427,7 @@ curl -s -X POST http://localhost:8000/v1/events/<event_id>/reschedule \
 curl -s http://localhost:8000/v1/events/<event_id>/trace
 ```
 
-返回事件当前传输状态和整笔对账状态（`reconcile_status`，以及已认/未认数量）、每个地址的副本（`deliveries`：状态、序号、已尝试次数、下次尝试时间、最近错误、对账状态 `reconcile_state`、对账时限 `reconcile_deadline`、回执结果 `receipt_result`、连续失败次数与死信原因/进入时间）、全部投递尝试（`attempts`：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息；若某次调用是在租约丢失后返回的，会带 `lost_lease: true`）和该事件命中的回执（`receipts`）。部分地址已认时，整笔是 `partially_acknowledged`，不会写成已认完；逐个查看副本即可知道谁认了、谁还没认。没人订的事件在这里能看到 `status: "unrouted"` 且 `deliveries` 为空——是明确的“没送出去”，不是成功。所有活动副本都进了死信处、且没有还在排队/投递中的副本时，事件整体 `status` 为 `dead_lettered`。
+返回事件当前传输状态和整笔对账状态（`reconcile_status`，以及已认/未认数量）、每个地址的副本（`deliveries`：状态、序号、已尝试次数、下次尝试时间、最近错误、对账状态 `reconcile_state`、对账时限 `reconcile_deadline`、回执结果 `receipt_result`、连续失败次数与死信原因/进入时间，以及 `observe_only` 是否只跟着看）、全部投递尝试（`attempts`：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息；若某次调用是在租约丢失后返回的，会带 `lost_lease: true`）和该事件命中的回执（`receipts`）。部分地址已认时，整笔是 `partially_acknowledged`，不会写成已认完；逐个查看副本即可知道谁认了、谁还没认——其中 `observe_only: true` 的副本只是跟着看：它认了不会让整笔变 `acknowledged`，它没认/超时/进死信也不会把已经认完的整笔拖回去（影子计数单列在 `shadow_*` 字段）。没人订的事件在这里能看到 `status: "unrouted"` 且 `deliveries` 为空——是明确的“没送出去”，不是成功。所有活动副本都进了死信处、且没有还在排队/投递中的副本时，事件整体 `status` 为 `dead_lettered`。
 
 ### 回执接入（接收方回调）
 
@@ -574,11 +600,11 @@ python3 scripts/mock_receiver.py --port 9000 \
 - `ingestion_attempts`：入口准入日志，每次事件推送一行（含全部被拒的），带处置结果（`accepted` / `unrouted` / `pending_confirmation` / `duplicate` / `source_unknown` / `source_disabled` / `bad_signature` / `stale_timestamp` / `future_timestamp` / `invalid_timestamp` / `invalid_body`）、发送时间、拒因；被拒记录没有 `event_id`，不会在任何轨迹里显示成已收/已发。`pending_confirmation` 的事件有 `event_id`（确实收下了），但当时没有生成任何副本。
 - `events`：事件本体（来源 `source_id`、类型、去重键、负载、最早外发时间 `not_before`、取消时间 `cancelled_at`），一条事件一行，与地址无关。
 - `destination_subscriptions`：地址订阅的事件类型集合。
-- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled` / `superseded` / `dead_lettered`）、下次尝试时间、最早外发时间 `not_before`、租约信息、对账状态（`reconcile_state`、对账时限、回执结果、重投次数）、**确认代号 `confirmation_generation`** 和**死信信息（连续传输失败次数 `consecutive_failures`、死信原因 `dead_letter_reason`、进入时间 `dead_lettered_at`；原因取值为传输失败耗尽 `delivery_attempts_exhausted`、回执超时耗尽 `receipt_timeout_exhausted`、失败回执耗尽 `receipt_failure_exhausted`）**（换位置后老代号排队副本置 `superseded`，领取闸门也会挡住老代号副本）；Worker 只消费这张表且只领取 `pending`/`in_flight`，死信副本永不自动外发、也不挡后续副本。
+- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled` / `superseded` / `dead_lettered`）、下次尝试时间、最早外发时间 `not_before`、租约信息、对账状态（`reconcile_state`、对账时限、回执结果、重投次数）、**确认代号 `confirmation_generation`**、**只跟着看快照 `observe_only`（扇出时从地址复制；为 true 的副本照常外发/重试/隔离/死信/对账，但其回执结果从不改变整笔事件的 `reconcile_status`/传输状态，也不进事件级重投名单）** 和**死信信息（连续传输失败次数 `consecutive_failures`、死信原因 `dead_letter_reason`、进入时间 `dead_lettered_at`；原因取值为传输失败耗尽 `delivery_attempts_exhausted`、回执超时耗尽 `receipt_timeout_exhausted`、失败回执耗尽 `receipt_failure_exhausted`）**（换位置后老代号排队副本置 `superseded`，领取闸门也会挡住老代号副本）；Worker 只消费这张表且只领取 `pending`/`in_flight`，死信副本永不自动外发、也不挡后续副本。
 - `delivery_attempts`：每次 HTTP 投递尝试的审计轨迹（关联事件与副本）。
 - `confirmation_attempts`：上线握手轨迹，一行对应一次确认探测（`challenge`）、应答（`echo`，含回错的 `invalid`）或轮次过期（`expired`），带轮次号、HTTP 状态码、响应片段或错误信息。
 - `receipts`：接收方回执日志，一条回执一行，含处置结果（`applied`/`duplicate`/`late`/`orphan`/`premature`）与匹配到的副本；重复、迟到、查无副本的回执都留在这里可查。
-- `destinations`：接收地址、状态、连续失败次数、隔离可恢复时间、该地址下一个序号，以及上线确认状态（`confirmation_state`、当前 challenge 与时限、确认时间、确认代号/轮次号、下次探测时间）。
+- `destinations`：接收地址、状态、连续失败次数、隔离可恢复时间、该地址下一个序号、是否只跟着看（`observe_only`），以及上线确认状态（`confirmation_state`、当前 challenge 与时限、确认时间、确认代号/轮次号、下次探测时间）。
 
 ## 从一对一模型升级
 

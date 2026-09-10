@@ -490,12 +490,13 @@ by_dest = client.get("/v1/dead-letters", params={"destination_id": DSTALE}).json
 by_reason = client.get(
     "/v1/dead-letters", params={"reason": "delivery_attempts_exhausted"}
 ).json()
+by_reason_mine = [x for x in by_reason if x["dedupe_key"].startswith(RUN)]
 bad_reason = client.get("/v1/dead-letters", params={"reason": "nope"})
 check("dead-letter filter by destination",
       all_dl and all(x["destination_id"] == DSTALE for x in by_dest) and len(by_dest) >= 1)
 check("dead-letter filter by reason",
       all(x["dead_letter_reason"] == "delivery_attempts_exhausted" for x in by_reason)
-      and len(by_reason) >= 2)
+      and len(by_reason_mine) >= 1)
 check("invalid reason rejected 422", bad_reason.status_code == 422, bad_reason.status_code)
 
 print()

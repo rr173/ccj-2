@@ -31,6 +31,13 @@ SCHEMA_STATEMENTS = [
         confirmation_round BIGINT NOT NULL DEFAULT 1,
         confirmation_attempt_count INTEGER NOT NULL DEFAULT 0,
         next_probe_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        -- Observe-only ("shadow") destinations still get their own copy of
+        -- every subscribed event, with their own delivery/retries/dead-letter
+        -- lifecycle, but their receipts never count toward the whole event's
+        -- acknowledgement and event-level requeue never selects their copies.
+        -- The flag is snapshotted onto each delivery at fan-out time, so a
+        -- later toggle never rewrites the standing of already-created copies.
+        observe_only BOOLEAN NOT NULL DEFAULT FALSE,
         CHECK (status IN ('active', 'isolated')),
         CHECK (failure_count >= 0),
         CHECK (next_event_seq >= 0),
@@ -143,6 +150,12 @@ SCHEMA_STATEMENTS = [
         -- queued ones are moved to the terminal 'superseded' state so nothing
         -- more is sent to the old location and nothing old is backfilled.
         confirmation_generation BIGINT NOT NULL DEFAULT 1,
+        -- Snapshot of destinations.observe_only taken at fan-out. Observe-only
+        -- copies go out and reconcile entirely on their own, but neither their
+        -- receipts (nor their timeouts/dead-letters) ever change the whole
+        -- event's acknowledgement standing, are targeted by event-level
+        -- requeue, or are counted among the event's for-real copies.
+        observe_only BOOLEAN NOT NULL DEFAULT FALSE,
         UNIQUE (destination_id, destination_seq),
         UNIQUE (destination_id, dedupe_key),
         -- superseded: the destination changed location before this copy was
@@ -511,6 +524,19 @@ SCHEMA_STATEMENTS = [
     CREATE INDEX IF NOT EXISTS deliveries_dead_letter_idx
         ON deliveries (dead_lettered_at DESC, id DESC)
         WHERE status = 'dead_lettered'
+    """,
+    # Idempotent upgrades for the observe-only ("shadow") subscriber mode.
+    # A shadow destination still receives its own copy of every subscribed
+    # event and runs its own delivery/retry/quarantine/dead-letter lifecycle,
+    # but its copies never count toward the whole event's acknowledgement, are
+    # skipped by event-level unreconciled requeue and are reported separately.
+    # Existing destinations/copies predate the feature and default to for-real.
+    "ALTER TABLE destinations ADD COLUMN IF NOT EXISTS observe_only BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS observe_only BOOLEAN NOT NULL DEFAULT FALSE",
+    """
+    CREATE INDEX IF NOT EXISTS deliveries_event_observe_idx
+        ON deliveries (event_id)
+        WHERE observe_only = FALSE
     """,
 ]
 

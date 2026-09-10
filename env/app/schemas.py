@@ -33,6 +33,12 @@ class DestinationIn(BaseModel):
     # None means "keep the current subscriptions" when re-registering an
     # existing URL; a list (even empty) replaces the whole set.
     event_types: list[str] | None = None
+    # Observe-only ("shadow"): the destination still gets a copy of every
+    # subscribed event with its own delivery/retry/dead-letter lifecycle, but
+    # its receipts never count toward the whole event's acknowledgement and
+    # event-level requeue never selects its copies. None on re-registration
+    # keeps the current flag; a brand-new destination defaults to for-real.
+    observe_only: bool | None = None
 
     @field_validator("event_types")
     @classmethod
@@ -61,6 +67,10 @@ class DestinationPatchIn(BaseModel):
     # As on registration: None leaves subscriptions untouched, a list
     # (including the empty list) replaces the whole set.
     event_types: list[str] | None = None
+    # None leaves the observe-only flag untouched; true/false retoggles it.
+    # Toggling only changes copies fanned out afterwards — existing copies
+    # keep the flag snapshot taken when they were created.
+    observe_only: bool | None = None
 
     @field_validator("event_types")
     @classmethod
@@ -100,6 +110,9 @@ class DestinationOut(BaseModel):
     confirmation_generation: int = 1
     confirmation_round: int = 1
     next_probe_at: datetime | None = None
+    # True: a shadow that receives copies but whose receipts never decide the
+    # whole event's acknowledgement. False (default): a for-real subscriber.
+    observe_only: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -161,6 +174,18 @@ class EventOut(BaseModel):
     acknowledged_count: int = 0
     # Copies still awaiting, transport-failed/pending, receipt-failed or timed out.
     unacknowledged_count: int = 0
+    # Observe-only ("shadow") copies are reported separately: they still go
+    # out and reconcile on their own, but their receipts/timeouts never change
+    # reconcile_status or the for-real counts above, and event-level requeue
+    # never selects them.
+    shadow_delivery_count: int = 0
+    shadow_delivered_count: int = 0
+    shadow_acknowledged_count: int = 0
+    shadow_unacknowledged_count: int = 0
+    # Extra per-state shadow counters, kept separate from the for-real ones.
+    shadow_pending_count: int = 0
+    shadow_superseded_count: int = 0
+    shadow_dead_lettered_count: int = 0
     # Scheduled send gate copied onto every fanned-out copy; null = send as
     # soon as the per-destination queue reaches it.
     not_before: datetime | None = None
@@ -225,6 +250,10 @@ class DeliveryOut(BaseModel):
     # A URL change bumps the destination generation; older copies then fail
     # the claim gate and queued ones become superseded.
     confirmation_generation: int = 1
+    # True: this copy belongs to an observe-only ("shadow") subscriber. It is
+    # delivered and reconciled on its own, but its receipt outcome never
+    # changes the whole event's reconcile_status or its for-real counts.
+    observe_only: bool = False
 
     model_config = {"from_attributes": True}
 
