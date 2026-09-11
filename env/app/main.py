@@ -38,6 +38,7 @@ from app.schemas import (
     ConfirmationAttemptOut,
     ConfirmationIn,
     ConfirmationOut,
+    CorrectionIn,
     DeadLetterReviveOut,
     DeadLetterSummaryOut,
     DeliveryOut,
@@ -74,7 +75,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Event Ingest Service",
-    version="2.7.0",
+    version="2.8.0",
     lifespan=lifespan,
 )
 
@@ -123,6 +124,8 @@ def event_status(
     shadow_delivered_count: int = 0,
     shadow_dead_lettered_count: int = 0,
     shadow_superseded_count: int = 0,
+    failed_count: int = 0,
+    shadow_failed_count: int = 0,
 ) -> str:
     if cancelled_at is not None:
         return "cancelled"
@@ -141,6 +144,8 @@ def event_status(
             return "pending"
         if shadow_dead_lettered_count > 0 and shadow_delivered_count == 0:
             return "dead_lettered"
+        if shadow_failed_count > 0 and shadow_delivered_count == 0:
+            return "failed"
         if shadow_delivered_count >= shadow_live_count:
             return "delivered"
         return "pending"
@@ -156,6 +161,11 @@ def event_status(
         # leaves this state when a copy is manually revived (which puts it
         # back to pending).
         return "dead_lettered"
+    if failed_count > 0:
+        # Every for-real live copy stopped and at least one is a correction
+        # copy whose send attempt failed terminally. Only correction events
+        # can reach this state: ordinary copies retry or dead-letter instead.
+        return "failed"
     if delivered_count >= live_count:
         return "delivered"
     return "pending"
@@ -192,9 +202,11 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
     superseded_count = result.get("superseded_count", 0) or 0
     dead_lettered_count = result.get("dead_lettered_count", 0) or 0
     pending_count = result.get("pending_count", 0) or 0
+    failed_count = result.get("failed_count", 0) or 0
     shadow_superseded_count = result.get("shadow_superseded_count", 0) or 0
     shadow_dead_lettered_count = result.get("shadow_dead_lettered_count", 0) or 0
     shadow_pending_count = result.get("shadow_pending_count", 0) or 0
+    shadow_failed_count = result.get("shadow_failed_count", 0) or 0
     # delivery_count counts live for-real copies only — superseded copies
     # never went out and must not be described as still pending or delivered.
     live_count = result["delivery_count"] - superseded_count
@@ -202,6 +214,7 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
     result["superseded_count"] = superseded_count
     result["dead_lettered_count"] = dead_lettered_count
     result["pending_count"] = pending_count
+    result["failed_count"] = failed_count
     shadow_live_count = (
         result.get("shadow_delivery_count", 0) or 0
     ) - shadow_superseded_count
@@ -209,6 +222,7 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
     result["shadow_superseded_count"] = shadow_superseded_count
     result["shadow_dead_lettered_count"] = shadow_dead_lettered_count
     result["shadow_pending_count"] = shadow_pending_count
+    result["shadow_failed_count"] = shadow_failed_count
     result["status"] = event_status(
         result.get("cancelled_at"),
         live_count,
@@ -221,6 +235,8 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
         result.get("shadow_delivered_count", 0) or 0,
         shadow_dead_lettered_count,
         shadow_superseded_count,
+        failed_count,
+        shadow_failed_count,
     )
     required_ack_count = result.get("required_ack_count")
     # No configured threshold (legacy rows) means "every live for-real copy".
@@ -257,6 +273,7 @@ EVENT_WITH_COUNTS_SQL = """
     SELECT e.id, e.source_id, e.event_type, e.dedupe_key, e.payload, e.created_at,
            e.not_before, e.cancelled_at,
            e.required_ack_count,
+           e.corrects_event_id,
            t.ack_threshold AS configured_ack_threshold,
            -- For-real copies decide the whole event's transport/reconcile
            -- standing; observe-only ("shadow") copies are counted separately
@@ -277,6 +294,9 @@ EVENT_WITH_COUNTS_SQL = """
            COUNT(d.id) FILTER (
                WHERE NOT d.observe_only AND d.status = 'dead_lettered'
            )::int AS dead_lettered_count,
+           COUNT(d.id) FILTER (
+               WHERE NOT d.observe_only AND d.status = 'failed'
+           )::int AS failed_count,
            COUNT(d.id) FILTER (WHERE d.observe_only)::int AS shadow_delivery_count,
            COUNT(d.id) FILTER (
                WHERE d.observe_only AND d.status = 'delivered'
@@ -292,7 +312,10 @@ EVENT_WITH_COUNTS_SQL = """
            )::int AS shadow_superseded_count,
            COUNT(d.id) FILTER (
                WHERE d.observe_only AND d.status = 'dead_lettered'
-           )::int AS shadow_dead_lettered_count
+           )::int AS shadow_dead_lettered_count,
+           COUNT(d.id) FILTER (
+               WHERE d.observe_only AND d.status = 'failed'
+           )::int AS shadow_failed_count
     FROM events e
     LEFT JOIN deliveries d ON d.event_id = e.id
     LEFT JOIN event_type_ack_thresholds t ON t.event_type = e.event_type
@@ -912,7 +935,8 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
                     CAST(:required_ack_count AS INTEGER))
             ON CONFLICT (dedupe_key) DO NOTHING
             RETURNING id, source_id, event_type, dedupe_key, payload, not_before,
-                      cancelled_at, created_at, required_ack_count
+                      cancelled_at, created_at, required_ack_count,
+                      corrects_event_id
             """
         ),
         {
@@ -1084,12 +1108,14 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     result["acknowledged_count"] = 0
     result["superseded_count"] = 0
     result["dead_lettered_count"] = 0
+    result["failed_count"] = 0
     result["shadow_delivery_count"] = len(shadow_subscribers)
     result["shadow_delivered_count"] = 0
     result["shadow_pending_count"] = len(shadow_subscribers)
     result["shadow_acknowledged_count"] = 0
     result["shadow_superseded_count"] = 0
     result["shadow_dead_lettered_count"] = 0
+    result["shadow_failed_count"] = 0
     return event_response(result), 201
 
 
@@ -1154,7 +1180,276 @@ def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
         "deliveries": deliveries,
         "attempts": attempts,
         "receipts": receipts,
+        "corrections": list_corrections_of(db, event_id),
     }
+
+
+# --- Corrections ("补一笔更正") ------------------------------------------------
+#
+# A correction is an additional entry submitted against an already-accepted
+# event. The original event's copies that already went out are never recalled
+# or rewritten; the correction is a new event row (linked by
+# corrects_event_id) whose copies are fanned out only to the destinations the
+# original was *really delivered* to (copies carrying delivered_at). Each
+# correction copy joins the tail of its destination's queue with a fresh
+# destination_seq, so it waits behind everything already queued and can never
+# cut ahead of a copy currently in flight. Its reconciliation starts only
+# when it is really sent (the usual delivered-at deadline), never from the
+# correction's submit time. A correction copy that fails its send attempt
+# ends in the terminal 'failed' state: accounted on its own, never charged to
+# the destination's consecutive-failure tally (no isolation), and no longer
+# blocking later copies of that destination.
+
+CORRECTIONS_OF_EVENT_SQL = EVENT_WITH_COUNTS_SQL.format(
+    where="e.corrects_event_id = CAST(:event_id AS UUID)"
+) + " ORDER BY e.created_at ASC, e.id ASC"
+
+
+def list_corrections_of(db: Session, event_id: UUID) -> list[dict]:
+    rows = db.execute(
+        text(CORRECTIONS_OF_EVENT_SQL), {"event_id": str(event_id)}
+    ).mappings().all()
+    return [event_response(row) for row in rows]
+
+
+@app.post(
+    "/v1/events/{event_id}/corrections",
+    response_model=EventOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_correction(
+    event_id: UUID,
+    body: CorrectionIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    event = db.execute(
+        text(
+            """
+            SELECT id, source_id, event_type
+            FROM events
+            WHERE id = CAST(:event_id AS UUID)
+            FOR UPDATE
+            """
+        ),
+        {"event_id": str(event_id)},
+    ).mappings().first()
+    if event is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="event not found")
+
+    # The correction goes exactly to the addresses the original really
+    # reached: a copy that completed transport at least once carries
+    # delivered_at. Copies still queued, cancelled, superseded or never
+    # created (unrouted / pending-confirmation) are not corrected. The
+    # destination rows are locked in id order (same discipline as ingest
+    # fan-out) so concurrent corrections stay deadlock-free.
+    delivered = db.execute(
+        text(
+            """
+            SELECT d.destination_id, d.observe_only
+            FROM deliveries d
+            JOIN destinations dest ON dest.id = d.destination_id
+            WHERE d.event_id = CAST(:event_id AS UUID)
+              AND d.delivered_at IS NOT NULL
+            ORDER BY d.destination_id
+            FOR UPDATE OF dest
+            """
+        ),
+        {"event_id": str(event_id)},
+    ).mappings().all()
+
+    if not delivered:
+        # Nothing ever went out for this event: there is no delivered copy to
+        # correct. Refuse loudly and create nothing — the event keeps reading
+        # as "never sent", and the same correction dedupe_key stays usable
+        # once something really goes out.
+        total = db.execute(
+            text(
+                """
+                SELECT COUNT(*)::int AS count
+                FROM deliveries
+                WHERE event_id = CAST(:event_id AS UUID)
+                """
+            ),
+            {"event_id": str(event_id)},
+        ).mappings().one()["count"]
+        db.rollback()
+        if total == 0:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "event was never routed to any destination (unrouted or "
+                    "subscribers not yet confirmed); there is no delivered "
+                    "copy to correct"
+                ),
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "no copy of this event has been sent out yet; there is no "
+                "delivered copy to correct"
+            ),
+        )
+
+    payload = json.dumps(body.payload)
+    correction = db.execute(
+        text(
+            """
+            INSERT INTO events (source_id, event_type, dedupe_key, payload,
+                                required_ack_count, corrects_event_id)
+            VALUES (CAST(:source_id AS UUID), :event_type, :dedupe_key,
+                    CAST(:payload AS JSONB), 0,
+                    CAST(:corrects_event_id AS UUID))
+            ON CONFLICT (dedupe_key) DO NOTHING
+            RETURNING id, source_id, event_type, dedupe_key, payload, not_before,
+                      cancelled_at, created_at, required_ack_count,
+                      corrects_event_id
+            """
+        ),
+        {
+            "source_id": str(event["source_id"]) if event["source_id"] else None,
+            "event_type": event["event_type"],
+            "dedupe_key": body.dedupe_key,
+            "payload": payload,
+            "corrects_event_id": str(event_id),
+        },
+    ).mappings().first()
+
+    if correction is None:
+        # The dedupe key already exists. The same correction sent again is
+        # applied exactly once: return the original correction marked as a
+        # duplicate. A key belonging to a different event or correction is a
+        # conflict, not a duplicate.
+        existing = db.execute(
+            text(
+                """
+                SELECT id, corrects_event_id
+                FROM events
+                WHERE dedupe_key = :dedupe_key
+                """
+            ),
+            {"dedupe_key": body.dedupe_key},
+        ).mappings().first()
+        if existing is None:  # pragma: no cover - cannot happen after a conflict
+            db.rollback()
+            raise HTTPException(status_code=500, detail="correction insert conflict lost")
+        if str(existing["corrects_event_id"]) != str(event_id):
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="dedupe_key is already used by another event or correction",
+            )
+        duplicate = db.execute(
+            text(EVENT_WITH_COUNTS_SQL.format(where="e.id = CAST(:correction_id AS UUID)")),
+            {"correction_id": str(existing["id"])},
+        ).mappings().first()
+        db.commit()
+        result = event_response(duplicate)
+        result["duplicate"] = True
+        response.status_code = 200
+        return result
+
+    # Fan the correction out to exactly the delivered set: one additional copy
+    # per destination at the tail of that destination's queue (a fresh
+    # destination_seq). The observe_only snapshot comes from the original
+    # copy it corrects — a shadow address's correction copy stays a shadow
+    # and can never count as for-real. Copies aimed at a currently
+    # unconfirmed destination simply wait at the usual claim gate.
+    real_copies = [row for row in delivered if not row["observe_only"]]
+    shadow_copies = [row for row in delivered if row["observe_only"]]
+    for row in delivered:
+        db.execute(
+            text(
+                """
+                WITH bumped AS (
+                    UPDATE destinations
+                    SET next_event_seq = next_event_seq + 1
+                    WHERE id = :destination_id
+                    RETURNING id, next_event_seq, confirmation_generation
+                )
+                INSERT INTO deliveries
+                    (event_id, destination_id, event_type, dedupe_key, payload,
+                     destination_seq, confirmation_generation, observe_only)
+                SELECT :event_id, id, :event_type, :dedupe_key,
+                       CAST(:payload AS JSONB), next_event_seq,
+                       confirmation_generation, :observe_only
+                FROM bumped
+                """
+            ),
+            {
+                "event_id": correction["id"],
+                "destination_id": row["destination_id"],
+                "event_type": event["event_type"],
+                "dedupe_key": body.dedupe_key,
+                "payload": payload,
+                "observe_only": row["observe_only"],
+            },
+        )
+
+    # Snapshot the correction's own acknowledgement requirement with the same
+    # rule as ingest: the type's configured threshold capped at the for-real
+    # copies of this correction, otherwise every for-real copy. Shadow
+    # correction copies never count toward it.
+    ack_threshold = db.execute(
+        text(
+            """
+            SELECT ack_threshold
+            FROM event_type_ack_thresholds
+            WHERE event_type = :event_type
+            """
+        ),
+        {"event_type": event["event_type"]},
+    ).mappings().first()
+    ack_threshold = ack_threshold["ack_threshold"] if ack_threshold else None
+    required_ack_count = (
+        min(ack_threshold, len(real_copies))
+        if ack_threshold is not None
+        else len(real_copies)
+    )
+    db.execute(
+        text(
+            """
+            UPDATE events
+            SET required_ack_count = :required_ack_count
+            WHERE id = CAST(:event_id AS UUID)
+            """
+        ),
+        {"event_id": correction["id"], "required_ack_count": required_ack_count},
+    )
+    db.commit()
+    result = dict(correction)
+    result["required_ack_count"] = required_ack_count
+    result["configured_ack_threshold"] = ack_threshold
+    result["delivery_count"] = len(real_copies)
+    result["delivered_count"] = 0
+    result["pending_count"] = len(real_copies)
+    result["acknowledged_count"] = 0
+    result["superseded_count"] = 0
+    result["dead_lettered_count"] = 0
+    result["failed_count"] = 0
+    result["shadow_delivery_count"] = len(shadow_copies)
+    result["shadow_delivered_count"] = 0
+    result["shadow_pending_count"] = len(shadow_copies)
+    result["shadow_acknowledged_count"] = 0
+    result["shadow_superseded_count"] = 0
+    result["shadow_dead_lettered_count"] = 0
+    result["shadow_failed_count"] = 0
+    return event_response(result)
+
+
+@app.get("/v1/events/{event_id}/corrections", response_model=list[EventOut])
+def list_corrections(event_id: UUID, db: Session = Depends(get_db)):
+    event = db.execute(
+        text("SELECT 1 FROM events WHERE id = CAST(:event_id AS UUID)"),
+        {"event_id": str(event_id)},
+    ).first()
+    if event is None:
+        raise HTTPException(status_code=404, detail="event not found")
+    # Events that never went out anywhere simply have no corrections here —
+    # and can never acquire one (POST above refuses them), so nothing is ever
+    # reported as corrected or sent for them.
+    return list_corrections_of(db, event_id)
 
 
 # --- Cancellation and rescheduling ------------------------------------------

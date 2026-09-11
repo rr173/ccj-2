@@ -2,7 +2,7 @@
 
 这是一个接收事件、按事件类型分发给订阅地址，把事件按顺序推送到外部 Webhook，并对推送结果做**回执对账**的系统：
 
-- **ingest-api**：登记**事件来源**（发放只属于它的签名密钥、可停用/可换钥）、登记接收地址（含订阅的事件类型；可把任一地址标成**只跟着看 `observe_only`**——照样收副本、按它自己的生命周期外发/重试/隔离/死信，但它的回执认不认、超时或进死信都不影响整笔算不算认完；**地址得先完成一次上线握手确认才会收到投递**，换接收位置要重新确认；可给任一地址标一段**现在不收**的时间——窗口内副本在原队列位置等、不算失败、对账不倒计时，订了同一类型的其他地址照打）、**按事件类型设定认完门槛**（当真副本认够份数整笔即认完且终态不可逆，影子副本不凑数；没定门槛的类型仍要求所有当真副本都认）、**验签 + 发送时间校验后**接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**接入回执与确认应答**、查询**入口准入记录（含每一条被拒事件，以及"收了但还没确认、一份没发"的事件）**、事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（整笔重投在认够门槛后不再拉名单；没认够时只重投某一笔事件中尚未认的那些**当真**副本，只跟着看的副本不在名单内）。
+- **ingest-api**：登记**事件来源**（发放只属于它的签名密钥、可停用/可换钥）、登记接收地址（含订阅的事件类型；可把任一地址标成**只跟着看 `observe_only`**——照样收副本、按它自己的生命周期外发/重试/隔离/死信，但它的回执认不认、超时或进死信都不影响整笔算不算认完；**地址得先完成一次上线握手确认才会收到投递**，换接收位置要重新确认；可给任一地址标一段**现在不收**的时间——窗口内副本在原队列位置等、不算失败、对账不倒计时，订了同一类型的其他地址照打）、**按事件类型设定认完门槛**（当真副本认够份数整笔即认完且终态不可逆，影子副本不凑数；没定门槛的类型仍要求所有当真副本都认）、**验签 + 发送时间校验后**接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**给已收下的事件补一笔更正**（另补一笔新事件，只补给当初真正打到过的地址，排在各地址队尾，对账从真正打出才算，更正失败只算它自己的）、**接入回执与确认应答**、查询**入口准入记录（含每一条被拒事件，以及"收了但还没确认、一份没发"的事件）**、事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（整笔重投在认够门槛后不再拉名单；没认够时只重投某一笔事件中尚未认的那些**当真**副本，只跟着看的副本不在名单内）。
 - **worker**：负责真正的 HTTP 投递、重试、熔断隔离、崩溃恢复，以及向未确认地址发送上线握手请求（confirmer 线程）。
 - **reconciler**：独立的对账进程，周期性把超过约定时间仍未收到回执的副本标记为 `timed_out`（可查，不算认）。
 - **PostgreSQL**：作为任务队列和事实来源，用行锁和每地址单调序号保证同一个接收地址严格 FIFO。
@@ -107,6 +107,21 @@
 - **停收期间不算失败**：窗口内一次都不会真正打，没有任何尝试可记，`failure_count` 不变、**不会被当成连续失败去隔离**；窗口结束后第一次真打如果真失败，才按正常规则计数。
 - **只影响这一个地址**：订了同一类型的其他地址照打不误；暂停期间新扇出的副本照常进它的队列，排到窗口结束。
 - 窗口只管事件投递：上线确认探测（confirmer）不受窗口影响，未确认的地址可以在停收期间完成握手，窗口一结束就能收事件。
+
+### 1.4 给已收下的事件补一笔更正（correction）
+
+每一笔已经收下的事件，之后都可以再补一笔更正：`POST /v1/events/{event_id}/corrections`，body 为 `{"dedupe_key": "...", "payload": {...}}`。更正是**另补的一笔**，不是把原来那份收回来改：
+
+- **原来打出去的那份不动**：更正本身是一笔新事件（响应与查询里带 `corrects_event_id` 指向原来那笔），有自己的去重键、自己的副本、自己的对账生命周期；原来那笔事件的副本、回执状态、整笔 `reconcile_status` 一概不被改写。
+- **只补给当初真正打到过的地址**：扇出名单 = 提交更正那一刻，原来那笔里已经真正投妥（`delivered_at` 有值）的副本所在的地址。还在排队、已取消、被取代（`superseded`）或根本没扇出过的地址一律不补——哪怕它之后投妥了，也不回头补这一笔。一个地址都没打出去过时，更正直接被拒（见下）。
+- **排在原队伍后面等**：每份更正副本拿该地址新的队尾序号（`destination_seq`），排在已排队的所有副本后面；领取闸门照旧——只要该地址还有副本在投（`in_flight`），更正副本就不会被领取，不会插到人家正在投的前面。
+- **对账从真正打出去之后才开始算**：更正副本投妥那一刻才进入 `awaiting` 并写入 `reconcile_deadline`（投妥时间 + `RECEIPT_TIMEOUT_SECONDS`）；提交更正的时间、排队等待的时间都不计入倒计时。接收方按更正自己的 `dedupe_key` 回执（回 `(destination_id, 更正的 dedupe_key)` 即可）。
+- **更正失败按它自己算**：更正副本外发失败（非 2xx / 连接失败 / 超时）后**不原地重试**，直接置终态 `failed`——不计入该地址的连续失败计数、**不会触发隔离**、也不会挡在队列里让后面还在排的副本等它（它已不在队头）。失败可在更正自己的轨迹里查到（副本状态 `failed`、投递尝试里留着那次失败）。原来那笔已经认了的副本不受任何影响。想再补一次，用新的 `dedupe_key` 重新提交一笔更正即可。
+- **只跟着看的地址有自己那份就跟自己的**：影子地址当初那份如果真打出去了，更正也照样给它补一份，并继承原来那份的 `observe_only` 快照——它自己的更正副本自己外发、自己对账，但**不能拿来给更正这笔的认完门槛凑数**（更正事件的 `required_ack_count` 只数当真副本，快照规则与入库扇出相同：类型门槛与当真份数取小）。
+- **没人订或根本没收下的不能更正**：原来那笔是 `unrouted`（没人订或都没确认，一份副本都没有）、有副本但一份都没打出去、或已取消的，`POST` 更正返回 `409`，什么都不创建；事件 id 不存在（包括入口就被拒、从未成为事件的）返回 `404`。`GET /v1/events/{event_id}/corrections` 随时能查：没有更正就是空列表，绝不会写成已经发出去。
+- **同一笔更正重复送来只认一次**：更正的 `dedupe_key` 全局唯一（与事件同一个命名空间）。重复提交同一笔更正返回 `200` 和原更正并带 `duplicate: true`，不新建、不二次扇出；`dedupe_key` 已被别的事件/更正占用时返回 `409`。被拒（409）的更正不占用键——等内容真的打出去了，可以拿同一个键再提交。
+
+更正本身是一笔普通事件：可以用 `/v1/events/{更正id}/trace` 查它自己的投递轨迹与整笔对账状态；它的副本照常过确认闸门、停收窗口、回执对账、超时/失败回执重投与死信规则（只有传输层失败不同——见上，直接 `failed` 不原地重试）。原来那笔的轨迹（`GET /v1/events/{event_id}/trace`）里新增 `corrections` 段，列出它名下的全部更正；投递给接收方的更正请求会带头 `X-Corrects-Event-Id` 和 body 字段 `corrects_event_id`，接收方可以据此把它和原来那笔关联起来。
 
 ### 2. 同一接收地址严格按进入顺序投递
 
@@ -468,13 +483,30 @@ curl -s -X POST http://localhost:8000/v1/events/<event_id>/reschedule \
 
 只要已有一份副本投妥或正在投，这两个接口都返回 `409`——已经打出去的不能取消、也不能改时间；已取消的事件再改期同样返回 `409`。
 
+### 给已收下的事件补一笔更正
+
+```bash
+# 另补一笔：只补给当初真正投妥过的地址，排在各地址队尾；原来那份不动
+curl -s -X POST http://localhost:8000/v1/events/<event_id>/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"dedupe_key":"order-1001-paid-fix-1","payload":{"order_id":"1001","amount":12}}'
+
+# 查这笔事件名下的全部更正（没有就是空列表，不会写成已经发出去）
+curl -s http://localhost:8000/v1/events/<event_id>/corrections
+
+# 更正本身是一笔事件（响应里 corrects_event_id 指向原来那笔），有自己的轨迹：
+curl -s http://localhost:8000/v1/events/<correction_event_id>/trace
+```
+
+重复提交同一笔更正（同一个 `dedupe_key`）返回 `200` 和原更正并带 `duplicate: true`，只认一次；`dedupe_key` 被别的事件/更正占用返回 `409`。原来那笔没人订、一份都没打出去、已取消的返回 `409`（什么都不创建，也不占用这个键）；事件不存在返回 `404`。更正副本外发失败后不重试，置终态 `failed`，只算它自己——不隔离地址、不挡后面的副本、不改原来那笔已认的状态。
+
 ### 查询某条事件的投递过程
 
 ```bash
 curl -s http://localhost:8000/v1/events/<event_id>/trace
 ```
 
-返回事件当前传输状态和整笔对账状态（`reconcile_status`，以及已认/未认数量）、每个地址的副本（`deliveries`：状态、序号、已尝试次数、下次尝试时间、最近错误、对账状态 `reconcile_state`、对账时限 `reconcile_deadline`、回执结果 `receipt_result`、连续失败次数与死信原因/进入时间，以及 `observe_only` 是否只跟着看）、全部投递尝试（`attempts`：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息；若某次调用是在租约丢失后返回的，会带 `lost_lease: true`）和该事件命中的回执（`receipts`）。部分地址已认时，整笔是 `partially_acknowledged`，不会写成已认完；逐个查看副本即可知道谁认了、谁还没认——其中 `observe_only: true` 的副本只是跟着看：它认了不会让整笔变 `acknowledged`，它没认/超时/进死信也不会把已经认完的整笔拖回去（影子计数单列在 `shadow_*` 字段）。没人订的事件在这里能看到 `status: "unrouted"` 且 `deliveries` 为空——是明确的“没送出去”，不是成功。所有活动副本都进了死信处、且没有还在排队/投递中的副本时，事件整体 `status` 为 `dead_lettered`。
+返回事件当前传输状态和整笔对账状态（`reconcile_status`，以及已认/未认数量）、每个地址的副本（`deliveries`：状态、序号、已尝试次数、下次尝试时间、最近错误、对账状态 `reconcile_state`、对账时限 `reconcile_deadline`、回执结果 `receipt_result`、连续失败次数与死信原因/进入时间，以及 `observe_only` 是否只跟着看）、全部投递尝试（`attempts`：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息；若某次调用是在租约丢失后返回的，会带 `lost_lease: true`）和该事件命中的回执（`receipts`）。部分地址已认时，整笔是 `partially_acknowledged`，不会写成已认完；逐个查看副本即可知道谁认了、谁还没认——其中 `observe_only: true` 的副本只是跟着看：它认了不会让整笔变 `acknowledged`，它没认/超时/进死信也不会把已经认完的整笔拖回去（影子计数单列在 `shadow_*` 字段）。没人订的事件在这里能看到 `status: "unrouted"` 且 `deliveries` 为空——是明确的“没送出去”，不是成功。所有活动副本都进了死信处、且没有还在排队/投递中的副本时，事件整体 `status` 为 `dead_lettered`。轨迹里另有 `corrections` 段，列出这笔事件名下的全部更正（每笔更正都是一个带 `corrects_event_id` 的普通事件响应，可再用它自己的 `/trace` 追查）；没有更正时为空列表——没人订或没打出去过的事件永远查不到更正，不会写成已经发出去。
 
 ### 回执接入（接收方回调）
 
@@ -592,6 +624,8 @@ X-Delivery-Id: 9c2f0a4e-7b1d-4e55-9a3c-2f8d6c1a0b22
 
 接收方只有返回 2xx 才算**传输成功**。请在接收方用 `Idempotency-Key` 做幂等表或唯一约束。
 
+如果这是一笔**更正**（对某笔已收下事件另补的一笔），请求会额外带头 `X-Corrects-Event-Id: <原来那笔事件的 id>`，body 里同样带 `corrects_event_id` 字段；`Idempotency-Key` / `dedupe_key` 用的是更正自己的去重键。接收方可以据此把更正和原来那笔关联起来做业务修正；普通事件不带这个头和字段。
+
 传输成功不等于对方认了：接收方处理完业务后，还需要在约定时限（`RECEIPT_TIMEOUT_SECONDS`，默认 300 秒）内回调回执接口：
 
 ```http
@@ -664,10 +698,10 @@ python3 scripts/mock_receiver.py --port 9000 \
 
 - `event_sources`：登记的外部事件来源、状态（`disabled_at` 为空即启用）、当前签名密钥与最近换钥时间。密钥只在登记/换钥的响应里明文出现一次。
 - `ingestion_attempts`：入口准入日志，每次事件推送一行（含全部被拒的），带处置结果（`accepted` / `unrouted` / `pending_confirmation` / `duplicate` / `source_unknown` / `source_disabled` / `bad_signature` / `stale_timestamp` / `future_timestamp` / `invalid_timestamp` / `invalid_body`）、发送时间、拒因；被拒记录没有 `event_id`，不会在任何轨迹里显示成已收/已发。`pending_confirmation` 的事件有 `event_id`（确实收下了），但当时没有生成任何副本。
-- `events`：事件本体（来源 `source_id`、类型、去重键、负载、最早外发时间 `not_before`、取消时间 `cancelled_at`，以及入库时快照的认完门槛 `required_ack_count`：无门槛类型等于扇出的当真份数，定了门槛取门槛与当真订户数的较小值，只有影子订户/无人订阅时为 0；老事件该列为 NULL，按"现存每一份当真副本都认"处理），一条事件一行，与地址无关。
+- `events`：事件本体（来源 `source_id`、类型、去重键、负载、最早外发时间 `not_before`、取消时间 `cancelled_at`，以及入库时快照的认完门槛 `required_ack_count`：无门槛类型等于扇出的当真份数，定了门槛取门槛与当真订户数的较小值，只有影子订户/无人订阅时为 0；老事件该列为 NULL，按"现存每一份当真副本都认"处理），一条事件一行，与地址无关。**更正也是一行事件**：`corrects_event_id` 指向被更正的那笔（普通事件该列为 NULL），它有自己的去重键和副本，原来那笔的行不会被改写。
 - `event_type_ack_thresholds`：按事件类型配置的认完门槛（每个类型至多一行，`ack_threshold >= 1`）。改/删只影响之后入库的事件；事件自己的要求以 `events.required_ack_count` 的快照为准。
 - `destination_subscriptions`：地址订阅的事件类型集合。
-- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled` / `superseded` / `dead_lettered`）、下次尝试时间、最早外发时间 `not_before`、租约信息、对账状态（`reconcile_state`、对账时限、回执结果、重投次数）、**确认代号 `confirmation_generation`**、**只跟着看快照 `observe_only`（扇出时从地址复制；为 true 的副本照常外发/重试/隔离/死信/对账，但其回执结果从不改变整笔事件的 `reconcile_status`/传输状态，也不进事件级重投名单）** 和**死信信息（连续传输失败次数 `consecutive_failures`、死信原因 `dead_letter_reason`、进入时间 `dead_lettered_at`；原因取值为传输失败耗尽 `delivery_attempts_exhausted`、回执超时耗尽 `receipt_timeout_exhausted`、失败回执耗尽 `receipt_failure_exhausted`）**（换位置后老代号排队副本置 `superseded`，领取闸门也会挡住老代号副本）；Worker 只消费这张表且只领取 `pending`/`in_flight`，死信副本永不自动外发、也不挡后续副本。
+- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled` / `superseded` / `dead_lettered` / `failed`——`failed` 只出现在更正副本上：外发失败一次即终态，不原地重试、不计地址连续失败、不挡后续副本）、下次尝试时间、最早外发时间 `not_before`、租约信息、对账状态（`reconcile_state`、对账时限、回执结果、重投次数）、**确认代号 `confirmation_generation`**、**只跟着看快照 `observe_only`（扇出时从地址复制；为 true 的副本照常外发/重试/隔离/死信/对账，但其回执结果从不改变整笔事件的 `reconcile_status`/传输状态，也不进事件级重投名单）** 和**死信信息（连续传输失败次数 `consecutive_failures`、死信原因 `dead_letter_reason`、进入时间 `dead_lettered_at`；原因取值为传输失败耗尽 `delivery_attempts_exhausted`、回执超时耗尽 `receipt_timeout_exhausted`、失败回执耗尽 `receipt_failure_exhausted`）**（换位置后老代号排队副本置 `superseded`，领取闸门也会挡住老代号副本）；Worker 只消费这张表且只领取 `pending`/`in_flight`，死信副本永不自动外发、也不挡后续副本。
 - `delivery_attempts`：每次 HTTP 投递尝试的审计轨迹（关联事件与副本）。
 - `confirmation_attempts`：上线握手轨迹，一行对应一次确认探测（`challenge`）、应答（`echo`，含回错的 `invalid`）或轮次过期（`expired`），带轮次号、HTTP 状态码、响应片段或错误信息。
 - `receipts`：接收方回执日志，一条回执一行，含处置结果（`applied`/`duplicate`/`late`/`orphan`/`premature`）与匹配到的副本；重复、迟到、查无副本的回执都留在这里可查。

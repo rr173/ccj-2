@@ -180,9 +180,12 @@ CLAIM_SQL = text(
         e.consecutive_failures,
         e.confirmation_generation,
         d.url AS destination_url,
-        e.recovered_destination
+        e.recovered_destination,
+        ev.corrects_event_id,
+        (ev.corrects_event_id IS NOT NULL) AS is_correction
     FROM claimed_event e
     JOIN candidate_destination d ON d.id = e.destination_id
+    LEFT JOIN events ev ON ev.id = e.event_id
     """
 )
 
@@ -319,6 +322,28 @@ SUPERSEDE_FAILED_SQL = text(
     """
 )
 
+# A correction copy that fails its send attempt ends right here in the
+# terminal 'failed' state. The failure is accounted entirely on the copy
+# itself: the original event's copies are different rows and are never
+# touched, the destination's consecutive-failure tally is deliberately NOT
+# incremented (a correction failure can never isolate the address), and the
+# copy leaves the queue head so later copies of the same destination keep
+# draining instead of waiting behind correction retries.
+CORRECTION_FAILURE_SQL = text(
+    """
+    UPDATE deliveries
+    SET status = 'failed',
+        claim_token = NULL,
+        claimed_at = NULL,
+        lease_until = NULL,
+        last_error = :error,
+        updated_at = now()
+    WHERE id = :delivery_id
+      AND status = 'in_flight'
+      AND claim_token = :claim_token
+    """
+)
+
 ATTEMPT_SQL = text(
     """
     INSERT INTO delivery_attempts (
@@ -442,6 +467,7 @@ def deliver(
     dedupe_key: str,
     payload: dict[str, Any],
     destination_seq: int,
+    corrects_event_id: str | None = None,
 ) -> dict[str, Any]:
     body = {
         "event_id": event_id,
@@ -460,6 +486,11 @@ def deliver(
     }
     if event_type is not None:
         headers["X-Event-Type"] = event_type
+    if corrects_event_id is not None:
+        # A correction is an additional send, not a recall: the receiver can
+        # tell it apart and link it to the original event it corrects.
+        body["corrects_event_id"] = corrects_event_id
+        headers["X-Corrects-Event-Id"] = corrects_event_id
     started = utc_now()
     try:
         response = client.post(url, json=body, headers=headers)
@@ -545,7 +576,12 @@ def record_result(
     should_isolate = False
     should_dead_letter = False
     recoverable_at = None
-    if not result["success"]:
+    # A correction copy keeps its own failure accounting: its failure is never
+    # charged to the destination's consecutive-failure tally (no isolation),
+    # never dead-letters through the transport budget and never retries in
+    # place — it ends terminally 'failed' further below.
+    is_correction = bool(claim["is_correction"])
+    if not result["success"] and not is_correction:
         should_isolate = claim["attempts"] >= settings.failure_threshold
         if should_isolate:
             recoverable_at = utc_now() + timedelta(seconds=settings.quarantine_seconds)
@@ -604,6 +640,17 @@ def record_result(
             "superseded failed in-flight delivery_id=%s after destination location change",
             claim["delivery_id"],
         )
+    elif is_correction:
+        updated = db.execute(
+            CORRECTION_FAILURE_SQL,
+            {
+                "delivery_id": claim["delivery_id"],
+                "claim_token": claim["claim_token"],
+                "error": result["error"],
+            },
+        )
+        if updated.rowcount != 1:
+            raise StaleClaimError(f"delivery {claim['delivery_id']} is no longer owned by this worker")
     else:
         updated = db.execute(
             FAILURE_SQL,
@@ -626,7 +673,16 @@ def record_result(
     )
 
     db.commit()
-    if should_dead_letter and not stale_generation:
+    if is_correction and not result["success"] and not stale_generation:
+        logger.warning(
+            "correction delivery_id=%s failed terminally (destination_id=%s, "
+            "event_id=%s, error=%s); destination failure tally untouched",
+            claim["delivery_id"],
+            claim["destination_id"],
+            claim["event_id"],
+            result["error"],
+        )
+    elif should_dead_letter and not stale_generation:
         logger.error(
             "delivery_id=%s moved to dead letter after %s consecutive failures "
             "(destination_id=%s, event_id=%s, error=%s)",
@@ -693,6 +749,11 @@ def process_once() -> bool:
             dedupe_key=claim["dedupe_key"],
             payload=claim["payload"],
             destination_seq=claim["destination_seq"],
+            corrects_event_id=(
+                str(claim["corrects_event_id"])
+                if claim["corrects_event_id"]
+                else None
+            ),
         )
         heartbeat.stop()
 

@@ -176,6 +176,21 @@ class EventRescheduleIn(BaseModel):
         return _normalize_optional_datetime(value)
 
 
+class CorrectionIn(BaseModel):
+    # A correction ("补一笔") submitted against an already-accepted event. It
+    # is an additional entry of its own — the original event's copies that
+    # already went out are never recalled or rewritten. The correction is
+    # fanned out only to the destinations the original was really delivered
+    # to; destinations that never got the original do not get the correction.
+    #
+    # dedupe_key is the correction's own idempotency key (globally unique,
+    # shared with the event key namespace): re-sending the same correction is
+    # applied exactly once and returns the original correction as a
+    # duplicate. payload is the corrected business payload.
+    dedupe_key: str = Field(..., min_length=1, max_length=256)
+    payload: dict[str, Any]
+
+
 class EventOut(BaseModel):
     id: UUID
     # Registered external source that pushed this event in (null only for
@@ -189,8 +204,16 @@ class EventOut(BaseModel):
     # pending: at least one delivery is still undelivered;
     # delivered: every delivery created for this event got a transport 2xx;
     # cancelled: the event was cancelled before anything was sent; its
-    # remaining copies will never go out.
+    # remaining copies will never go out;
+    # failed: every live copy stopped and at least one is a correction copy
+    # whose send attempt failed terminally (only correction events can reach
+    # this state — ordinary copies retry or dead-letter instead).
     status: str
+    # Set only on correction events: the original event this one corrects.
+    # A correction is an additional entry fanned out to the destinations the
+    # original was really delivered to; the original event and its copies are
+    # never rewritten. Null on ordinary events.
+    corrects_event_id: UUID | None = None
     # Whole-event receipt state. Decided by for-real copies only:
     # pending: no for-real copy has a success receipt yet;
     # partially_acknowledged: at least one for-real copy is acknowledged but
@@ -245,6 +268,12 @@ class EventOut(BaseModel):
     # receipts kept not matching after redelivery). They never go out on their
     # own and are not acked; a manual revive puts them back in queue.
     dead_lettered_count: int = 0
+    # Correction copies whose send attempt failed terminally (corrections are
+    # not retried in place and never count toward the address's failure
+    # tally). Always zero on ordinary events — their copies never take this
+    # state.
+    failed_count: int = 0
+    shadow_failed_count: int = 0
 
 
 class DeliveryOut(BaseModel):
@@ -265,7 +294,11 @@ class DeliveryOut(BaseModel):
     # — terminal, it never went out and is not retried or backfilled;
     # dead_lettered: repeated transport failures (or repeatedly unmatched
     # receipts after redelivery) gave up on this one copy — terminal until a
-    # manual revive puts it back at its original queue position.
+    # manual revive puts it back at its original queue position;
+    # failed: a correction copy whose send attempt failed — terminal for that
+    # copy; corrections are not retried in place, the failure is not charged
+    # to the address's consecutive-failure tally (no isolation) and the copy
+    # no longer blocks later copies of its destination.
     status: str
     attempts: int
     next_attempt_at: datetime
@@ -399,6 +432,12 @@ class EventTraceOut(BaseModel):
     deliveries: list[DeliveryOut]
     attempts: list[DeliveryAttemptOut]
     receipts: list[ReceiptOut] = []
+    # Corrections submitted against this event. Each is its own event with
+    # its own copies and reconciliation (trace it via its own
+    # /v1/events/{id}/trace); the original event above is never rewritten by
+    # them. Empty when nothing was ever corrected — in particular for events
+    # that never went out anywhere.
+    corrections: list[EventOut] = []
 
 
 class RecoveryOut(BaseModel):

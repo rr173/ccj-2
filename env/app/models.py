@@ -203,7 +203,11 @@ SCHEMA_STATEMENTS = [
         -- failures or unreconciled requeue cycles; it is parked, never sent
         -- again automatically, and no longer blocks later copies of this
         -- destination.
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered')),
+        -- failed: a correction copy whose send attempt failed. Terminal for
+        -- that copy only: corrections are not retried in place, the failure
+        -- is never charged to the destination's consecutive-failure tally
+        -- (no isolation), and the copy no longer blocks later copies.
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed')),
         CHECK (attempts >= 0),
         CHECK (destination_seq >= 0),
         CHECK (reconcile_state IN ('none', 'awaiting', 'acknowledged', 'receipt_failed', 'timed_out')),
@@ -427,7 +431,7 @@ SCHEMA_STATEMENTS = [
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered'))
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed'))
     """,
     # Idempotent upgrades for databases created before inbound source auth.
     # Every newly accepted event belongs to the registered source that pushed
@@ -507,7 +511,7 @@ SCHEMA_STATEMENTS = [
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered'))
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed'))
     """,
     # Widen the ingestion disposition check to include pending_confirmation.
     "ALTER TABLE ingestion_attempts DROP CONSTRAINT IF EXISTS ingestion_attempts_disposition_check",
@@ -534,7 +538,7 @@ SCHEMA_STATEMENTS = [
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered'))
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed'))
     """,
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_consecutive_failures_check",
     """
@@ -603,6 +607,40 @@ SCHEMA_STATEMENTS = [
             (paused_until IS NULL OR paused_from IS NOT NULL)
             AND (paused_until IS NULL OR paused_until > paused_from)
         )
+    """,
+    # Idempotent upgrades for event corrections ("补一笔更正"). A correction is
+    # itself an event row whose corrects_event_id points at the original
+    # event; its copies are additional deliveries fanned out only to the
+    # destinations the original event was really delivered to. The original
+    # event's own rows are never rewritten by a correction.
+    "ALTER TABLE events ADD COLUMN IF NOT EXISTS corrects_event_id UUID",
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.table_constraints
+            WHERE constraint_name = 'events_corrects_event_id_fkey'
+        ) THEN
+            ALTER TABLE events
+                ADD CONSTRAINT events_corrects_event_id_fkey
+                FOREIGN KEY (corrects_event_id) REFERENCES events(id);
+        END IF;
+    END $$
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS events_corrects_event_idx
+        ON events (corrects_event_id)
+        WHERE corrects_event_id IS NOT NULL
+    """,
+    # A correction copy that fails its send attempt ends in the terminal
+    # 'failed' state (see the deliveries table comment above). Widen the
+    # status check everywhere it is re-asserted so re-running init_db on a
+    # database that already has failed rows validates.
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_status_check",
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed'))
     """,
 ]
 
