@@ -143,14 +143,19 @@ def fan_out_gated_event(
     consent_timeout_seconds: int,
     observe_only: bool | None = None,
     destinations: list | None = None,
+    filter_specs: dict[str, Any] | None = None,
 ) -> dict[str, int]:
     """Create the preview/body pair for every confirmed subscriber (or the
-    explicit ``destinations`` list used by corrections).
+    explicit ``destinations`` list used by ingest/corrections) whose own
+    subscription condition held.
 
     Each destination's FIFO gets two consecutive sequence numbers; the pair
     is created inside the same per-destination row bump so a concurrent
-    fan-out cannot interleave another event between preview and body. Returns
-    the number of for-real / shadow pairs created.
+    fan-out cannot interleave another event between preview and body. The
+    subscription condition is snapshotted onto both copies (``filter_specs``
+    maps destination id -> JSON text; a withheld destination is simply not in
+    the passed ``destinations`` list). Returns the number of for-real /
+    shadow pairs created.
     """
     if destinations is None:
         destination_rows = db.execute(
@@ -171,11 +176,16 @@ def fan_out_gated_event(
         destination_rows = [
             (row[0], row[1]) for row in destinations
         ]
+    filter_specs = filter_specs or {}
 
     real_pairs = 0
     shadow_pairs = 0
     prev_key = preview_key(dedupe_key)
     for destination_id, is_shadow in destination_rows:
+        filter_spec = filter_specs.get(str(destination_id))
+        filter_param = (
+            json.dumps(filter_spec) if filter_spec is not None else None
+        )
         # One destination lock + two seq bumps in a single UPDATE ... RETURNING
         # chain would be ideal; two locked updates keep the code aligned with
         # the existing fan-out discipline (lock destination in id order, bump
@@ -204,12 +214,12 @@ def fan_out_gated_event(
                 INSERT INTO deliveries
                     (event_id, destination_id, event_type, dedupe_key, payload,
                      destination_seq, not_before, confirmation_generation,
-                     observe_only, phase, release_state,
+                     observe_only, filter_spec, phase, release_state,
                      consent_timeout_seconds, body_delivery_id)
                 SELECT :event_id, id, :event_type, :preview_key,
                        CAST(:preview_payload AS JSONB), next_event_seq,
                        CAST(:not_before AS TIMESTAMPTZ), confirmation_generation,
-                       :observe_only, 'preview', NULL,
+                       :observe_only, CAST(:filter_spec AS JSONB), 'preview', NULL,
                        :consent_timeout_seconds,
                        CAST(:placeholder AS UUID)
                 FROM bumped
@@ -224,6 +234,7 @@ def fan_out_gated_event(
                 "preview_payload": preview_payload or json.dumps({}),
                 "not_before": not_before,
                 "observe_only": is_shadow,
+                "filter_spec": filter_param,
                 "consent_timeout_seconds": consent_timeout_seconds,
                 "placeholder": "00000000-0000-0000-0000-000000000000",
             },
@@ -245,12 +256,12 @@ def fan_out_gated_event(
                 INSERT INTO deliveries
                     (event_id, destination_id, event_type, dedupe_key, payload,
                      destination_seq, not_before, confirmation_generation,
-                     observe_only, phase, release_state,
+                     observe_only, filter_spec, phase, release_state,
                      consent_timeout_seconds, preview_delivery_id)
                 SELECT :event_id, id, :event_type, :dedupe_key,
                        CAST(:payload AS JSONB), next_event_seq,
                        CAST(:not_before AS TIMESTAMPTZ), confirmation_generation,
-                       :observe_only, 'body', 'held',
+                       :observe_only, CAST(:filter_spec AS JSONB), 'body', 'held',
                        :consent_timeout_seconds, CAST(:preview_id AS UUID)
                 FROM bumped
                 RETURNING id
@@ -264,6 +275,7 @@ def fan_out_gated_event(
                 "payload": payload,
                 "not_before": not_before,
                 "observe_only": is_shadow,
+                "filter_spec": filter_param,
                 "consent_timeout_seconds": consent_timeout_seconds,
                 "preview_id": preview_id,
             },

@@ -19,6 +19,7 @@ from app.db import engine, get_db
 from app.ingest_auth import (
     ACCEPTED,
     DUPLICATE,
+    FILTERED,
     INVALID_BODY,
     PENDING_CONFIRMATION,
     SOURCE_DISABLED,
@@ -33,6 +34,11 @@ from app.models import init_db
 from app import release as release_gate
 from app.config import settings
 from app.receipts import ingest_receipt
+from app.subfilters import (
+    FilterSpecError,
+    evaluate as evaluate_filter,
+    validate_filter_spec,
+)
 from app.schemas import (
     AckThresholdIn,
     AckThresholdOut,
@@ -72,6 +78,7 @@ from app.schemas import (
     SourceIn,
     SourceOut,
     SourceRotatedOut,
+    SubscriptionFilterEvaluationOut,
 )
 from app.schemas import MAX_EVENT_TYPE_LENGTH
 
@@ -84,7 +91,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Event Ingest Service",
-    version="2.9.0",
+    version="2.10.0",
     lifespan=lifespan,
 )
 
@@ -115,9 +122,164 @@ def fetch_event_types(db: Session, destination_id: UUID) -> list[str]:
     return [row[0] for row in rows]
 
 
+def fetch_filters(
+    db: Session, destination_id: UUID
+) -> dict[str, dict[str, Any]]:
+    """Current subscription conditions keyed by event type; types with no
+    condition are omitted (they receive every event of the type)."""
+    rows = db.execute(
+        text(
+            """
+            SELECT event_type, filter_spec
+            FROM destination_subscriptions
+            WHERE destination_id = CAST(:destination_id AS UUID)
+              AND filter_spec IS NOT NULL
+            ORDER BY event_type
+            """
+        ),
+        {"destination_id": destination_id},
+    ).all()
+    return {row[0]: row[1] for row in rows}
+
+
+def validate_filters(
+    filters: dict[str | Any, Any] | None,
+) -> dict[str, dict[str, Any] | None]:
+    """Validate every condition in an inbound filters map.
+
+    Returns the map with each non-null condition canonicalized. Raises
+    HTTPException(422) on any malformed condition.
+    """
+    if filters is None:
+        return {}
+    canonical: dict[str, dict[str, Any] | None] = {}
+    for event_type, spec in filters.items():
+        normalized_type = event_type.strip()
+        if (
+            not normalized_type
+            or len(normalized_type) > MAX_EVENT_TYPE_LENGTH
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "filters keys must be non-empty event types of at most "
+                    f"{MAX_EVENT_TYPE_LENGTH} characters"
+                ),
+            )
+        if spec is None:
+            canonical[normalized_type] = None
+            continue
+        try:
+            canonical[normalized_type] = validate_filter_spec(spec)
+        except FilterSpecError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"invalid filter for event type {normalized_type!r}: {exc}",
+            )
+    return canonical
+
+
+def assert_filter_keys_subscribed(
+    filters: dict[str, dict[str, Any] | None], subscribed_types: set[str]
+) -> None:
+    """A condition can only live on an actual subscription. Writing a
+    condition for a type the address does not subscribe to is a client error
+    (it would otherwise be silently inert)."""
+    unknown = sorted(set(filters) - subscribed_types)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "filters may only name subscribed event types; unknown for "
+                f"this destination: {unknown}"
+            ),
+        )
+
+
+def replace_subscriptions(
+    db: Session,
+    destination_id: Any,
+    event_types: list[str],
+    filters: dict[str, dict[str, Any] | None],
+) -> None:
+    """Wholesale replacement of a destination's subscription set (POST with
+    event_types). Types not in the list lose both subscription and condition;
+    a type listed in filters gets that condition, the rest stay unconditional.
+    """
+    db.execute(
+        text(
+            """
+            DELETE FROM destination_subscriptions
+            WHERE destination_id = CAST(:destination_id AS UUID)
+            """
+        ),
+        {"destination_id": str(destination_id)},
+    )
+    if not event_types:
+        return
+    db.execute(
+        text(
+            """
+            INSERT INTO destination_subscriptions
+                (destination_id, event_type, filter_spec)
+            VALUES (
+                CAST(:destination_id AS UUID), :event_type,
+                CAST(:filter_spec AS JSONB)
+            )
+            ON CONFLICT DO NOTHING
+            """
+        ),
+        [
+            {
+                "destination_id": str(destination_id),
+                "event_type": event_type,
+                "filter_spec": (
+                    json.dumps(filters[event_type])
+                    if filters.get(event_type) is not None
+                    else None
+                ),
+            }
+            for event_type in event_types
+        ],
+    )
+
+
+def patch_subscription_filters(
+    db: Session,
+    destination_id: Any,
+    filters: dict[str, dict[str, Any] | None],
+) -> None:
+    """Patch conditions of already-subscribed types (PATCH). A null value
+    clears that type's condition; other types keep theirs. The caller has
+    already verified every key is subscribed."""
+    if not filters:
+        return
+    db.execute(
+        text(
+            """
+            UPDATE destination_subscriptions
+            SET filter_spec = CAST(:filter_spec AS JSONB)
+            WHERE destination_id = CAST(:destination_id AS UUID)
+              AND event_type = :event_type
+            """
+        ),
+        [
+            {
+                "destination_id": str(destination_id),
+                "event_type": event_type,
+                "filter_spec": (
+                    json.dumps(spec) if spec is not None else None
+                ),
+            }
+            for event_type, spec in filters.items()
+        ],
+    )
+
+
 def destination_response(db: Session, destination: RowMapping) -> dict:
     result = dict(destination)
     result["event_types"] = fetch_event_types(db, destination["id"])
+    result["filters"] = fetch_filters(db, destination["id"])
     return result
 
 
@@ -137,6 +299,8 @@ def event_status(
     shadow_failed_count: int = 0,
     release_closed_count: int = 0,
     shadow_release_closed_count: int = 0,
+    filtered_count: int = 0,
+    shadow_filtered_count: int = 0,
 ) -> str:
     if cancelled_at is not None:
         return "cancelled"
@@ -160,6 +324,12 @@ def event_status(
                 # was ever sent to any for-real address. This is explicit and
                 # never "delivered".
                 return "release_closed"
+            if filtered_count > 0:
+                # Confirmed for-real subscribers exist, but every one of their
+                # own subscription conditions withheld this body: no copy was
+                # created and nothing was sent. Explicitly "filtered", never
+                # "unrouted" (that means nobody subscribes at all).
+                return "filtered"
             return "unrouted"
         if shadow_pending_count > 0:
             return "pending"
@@ -235,6 +405,14 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
     shadow_pending_count = result.get("shadow_pending_count", 0) or 0
     shadow_failed_count = result.get("shadow_failed_count", 0) or 0
     shadow_closed_count = result.get("shadow_bodies_closed_count", 0) or 0
+    # Subscribers whose own condition withheld this body got no delivery row,
+    # so these counts come from subscription_filter_evaluations (joined into
+    # the counts SQL), never from deliveries. They must stay visible and never
+    # collapse into "unrouted".
+    filtered_out_count = result.get("filtered_out_count", 0) or 0
+    shadow_filtered_out_count = result.get("shadow_filtered_out_count", 0) or 0
+    result["filtered_out_count"] = filtered_out_count
+    result["shadow_filtered_out_count"] = shadow_filtered_out_count
     # delivery_count counts live for-real body copies only — superseded copies
     # never went out, and a gated body closed before release (denied / expired
     # / voided) never went out either; neither must be described as still
@@ -278,6 +456,8 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
         shadow_failed_count,
         release_closed_count,
         shadow_closed_count,
+        filtered_out_count,
+        shadow_filtered_out_count,
     )
     required_ack_count = result.get("required_ack_count")
     # No configured threshold (legacy rows) means "every live for-real copy".
@@ -320,7 +500,7 @@ DELIVERY_COLUMNS = (
     "d.delivered_at, d.reconcile_state, d.reconcile_deadline, "
     "d.reconciled_at, d.receipt_result, d.requeue_count, "
     "d.consecutive_failures, d.dead_letter_reason, d.dead_lettered_at, "
-    "d.confirmation_generation, d.observe_only, "
+    "d.confirmation_generation, d.observe_only, d.filter_spec, "
     "d.phase, d.release_state, d.preview_delivery_id, d.body_delivery_id, "
     "d.consent_deadline, d.consent_timeout_seconds, d.released_at, "
     "d.voided_at, d.void_reason"
@@ -431,7 +611,24 @@ EVENT_WITH_COUNTS_SQL = """
            COUNT(d.id) FILTER (
                WHERE d.observe_only AND d.phase = 'preview'
                  AND d.status = 'delivered'
-           )::int AS shadow_previews_delivered_count
+           )::int AS shadow_previews_delivered_count,
+           -- Subscription conditions ("订阅条件"): judgements live in their
+           -- own table (one row per confirmed, condition-carrying subscriber),
+           -- so they are correlated scalar subqueries, not deliveries
+           -- aggregates — joining them here would multiply the counts above.
+           -- A withheld (matched=false) copy never existed; these counts are
+           -- what keeps "this address's own condition did not match" distinct
+           -- from "nobody subscribed" (unrouted).
+           (
+               SELECT COUNT(*)::int
+               FROM subscription_filter_evaluations fe
+               WHERE fe.event_id = e.id AND NOT fe.matched AND NOT fe.observe_only
+           ) AS filtered_out_count,
+           (
+               SELECT COUNT(*)::int
+               FROM subscription_filter_evaluations fe
+               WHERE fe.event_id = e.id AND NOT fe.matched AND fe.observe_only
+           ) AS shadow_filtered_out_count
     FROM events e
     LEFT JOIN deliveries d ON d.event_id = e.id
     LEFT JOIN event_type_ack_thresholds t ON t.event_type = e.event_type
@@ -496,30 +693,27 @@ def register_destination(body: DestinationIn, db: Session = Depends(get_db)):
             {"destination_id": existing["id"]},
         ).mappings().one()
 
-    if body.event_types is not None:
-        db.execute(
-            text(
-                """
-                DELETE FROM destination_subscriptions
-                WHERE destination_id = :destination_id
-                """
+    canonical_filters = validate_filters(body.filters)
+    if canonical_filters and body.event_types is None:
+        # A condition must accompany the subscription set on registration:
+        # without it the address may not subscribe to those types yet (and a
+        # silently dropped condition would later route content unexpectedly).
+        # Existing subscriptions are changed via PATCH.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "filters require event_types on registration: name the "
+                "subscribed types the conditions apply to"
             ),
-            {"destination_id": destination["id"]},
         )
-        if body.event_types:
-            db.execute(
-                text(
-                    """
-                    INSERT INTO destination_subscriptions (destination_id, event_type)
-                    VALUES (:destination_id, :event_type)
-                    ON CONFLICT DO NOTHING
-                    """
-                ),
-                [
-                    {"destination_id": destination["id"], "event_type": event_type}
-                    for event_type in body.event_types
-                ],
-            )
+    if body.event_types is not None:
+        # Whitespace-normalized subscription set; filter keys must name a
+        # type the address actually subscribes to after this edit.
+        subscribed_types = set(body.event_types)
+        assert_filter_keys_subscribed(canonical_filters, subscribed_types)
+        replace_subscriptions(
+            db, destination["id"], body.event_types, canonical_filters
+        )
 
     if not is_new and body.observe_only is not None:
         # Re-registration can retoggle the shadow flag. Only newly fanned-out
@@ -561,14 +755,16 @@ def update_destination(
     # queued copies aimed at the old location become superseded, copies already
     # out or in flight are left alone. Subscription/observe-only edits never
     # re-arm.
+    canonical_filters = validate_filters(body.filters)
     if (
         body.url is None
         and body.event_types is None
         and body.observe_only is None
+        and not canonical_filters
     ):
         raise HTTPException(
             status_code=422,
-            detail="provide a url, event_types and/or observe_only to update",
+            detail="provide a url, event_types, observe_only and/or filters to update",
         )
 
     destination = db.execute(
@@ -612,29 +808,21 @@ def update_destination(
         )
 
     if body.event_types is not None:
-        db.execute(
-            text(
-                """
-                DELETE FROM destination_subscriptions
-                WHERE destination_id = :destination_id
-                """
-            ),
-            {"destination_id": str(destination_id)},
+        replace_subscriptions(
+            db, str(destination_id), body.event_types, canonical_filters
         )
-        if body.event_types:
-            db.execute(
-                text(
-                    """
-                    INSERT INTO destination_subscriptions (destination_id, event_type)
-                    VALUES (:destination_id, :event_type)
-                    ON CONFLICT DO NOTHING
-                    """
-                ),
-                [
-                    {"destination_id": str(destination_id), "event_type": event_type}
-                    for event_type in body.event_types
-                ],
-            )
+        # With a wholesale subscription replacement, every filter key must
+        # name a type the address subscribes to after the replacement; types
+        # dropped from the list lose their condition automatically.
+        assert_filter_keys_subscribed(canonical_filters, set(body.event_types))
+    elif canonical_filters:
+        # Subscription set untouched: every patched condition must name an
+        # existing subscription, and a null value clears that type's
+        # condition. The change only affects later fan-outs — copies already
+        # fanned out keep the condition snapshot they were born with.
+        current_types = set(fetch_event_types(db, destination_id))
+        assert_filter_keys_subscribed(canonical_filters, current_types)
+        patch_subscription_filters(db, destination_id, canonical_filters)
 
     if body.observe_only is not None and body.observe_only != destination["observe_only"]:
         # Toggling shadow mode only affects copies fanned out afterwards;
@@ -1145,7 +1333,7 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     subscribers = db.execute(
         text(
             """
-            SELECT s.destination_id, d.observe_only
+            SELECT s.destination_id, d.observe_only, s.filter_spec
             FROM destination_subscriptions s
             JOIN destinations d ON d.id = s.destination_id
             WHERE s.event_type = :event_type
@@ -1168,16 +1356,62 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
         {"event_type": body.event_type},
     ).mappings().one()["count"]
 
-    real_subscribers = [row for row in subscribers if not row[1]]
-    shadow_subscribers = [row for row in subscribers if row[1]]
+    # Per-address subscription conditions ("订阅条件"). Each confirmed
+    # subscriber carrying a condition gets exactly one evaluation against
+    # THIS exact body: matching subscribers stay in the fan-out list (the
+    # condition is snapshotted onto their copies); non-matching subscribers
+    # are taken out of it and recorded in subscription_filter_evaluations
+    # with matched=false, so no delivery exists for them (nothing is sent and
+    # it is never written as sent) while the trace still says "this address's
+    # own condition did not match" — distinct from 'unrouted' (nobody
+    # subscribes). The judgement is a pure function of (condition snapshot,
+    # body), so re-evaluating the same pair always yields the same answer.
+    # Conditions are evaluated here, once, so a later edit only affects later
+    # events; already-fanned copies are never recalled.
+    routed_subscribers = []
+    filtered_real = 0
+    filtered_shadow = 0
+    for row in subscribers:
+        destination_id, is_shadow, filter_spec = row
+        if filter_spec is None:
+            routed_subscribers.append(row)
+            continue
+        matches = evaluate_filter(filter_spec, body.payload)
+        db.execute(
+            text(
+                """
+                INSERT INTO subscription_filter_evaluations
+                    (event_id, destination_id, event_type, matched,
+                     filter_spec, observe_only)
+                VALUES (
+                    CAST(:event_id AS UUID), CAST(:destination_id AS UUID),
+                    :event_type, :matched, CAST(:filter_spec AS JSONB),
+                    :observe_only
+                )
+                ON CONFLICT (event_id, destination_id) DO NOTHING
+                """
+            ),
+            {
+                "event_id": event["id"],
+                "destination_id": destination_id,
+                "event_type": body.event_type,
+                "matched": matches,
+                "filter_spec": json.dumps(filter_spec),
+                "observe_only": is_shadow,
+            },
+        )
+        if matches:
+            routed_subscribers.append(row)
+        elif is_shadow:
+            filtered_shadow += 1
+        else:
+            filtered_real += 1
 
     if policy is not None:
-        # Gated type: every confirmed subscriber gets a preview first and a
-        # held body behind it. Destinations not subscribed (or not confirmed)
-        # get neither — there is no pair row for them. The body claim gate in
-        # the worker refuses every body until this same address's preview has
-        # landed and the address nods before its deadline, so the body can
-        # never overtake or precede its notice.
+        # Gated type: every confirmed subscriber whose condition held gets a
+        # preview first and a held body behind it. A non-matching subscriber
+        # gets neither (the preview would itself reveal the event): its
+        # withheld judgement is the evaluation row inserted above.
         pair_counts = release_gate.fan_out_gated_event(
             db,
             event_id=str(event["id"]),
@@ -1187,14 +1421,23 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
             preview_payload=preview_payload,
             not_before=body.not_before,
             consent_timeout_seconds=policy["consent_timeout_seconds"],
-            destinations=subscribers,
+            destinations=routed_subscribers,
+            filter_specs={
+                str(row[0]): row[2]
+                for row in routed_subscribers
+                if row[2] is not None
+            },
         )
         real_pair_count = pair_counts["real_pairs"]
         shadow_pair_count = pair_counts["shadow_pairs"]
     else:
-        real_pair_count = len(real_subscribers)
-        shadow_pair_count = len(shadow_subscribers)
-        for row in subscribers:
+        real_pair_count = len(
+            [row for row in routed_subscribers if not row[1]]
+        )
+        shadow_pair_count = len(
+            [row for row in routed_subscribers if row[1]]
+        )
+        for row in routed_subscribers:
             db.execute(
                 text(
                     """
@@ -1208,11 +1451,11 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
                     INSERT INTO deliveries
                         (event_id, destination_id, event_type, dedupe_key, payload,
                          destination_seq, not_before, confirmation_generation,
-                         observe_only)
+                         observe_only, filter_spec)
                     SELECT :event_id, id, :event_type, :dedupe_key,
                            CAST(:payload AS JSONB), next_event_seq,
                            CAST(:not_before AS TIMESTAMPTZ), confirmation_generation,
-                           :observe_only
+                           :observe_only, CAST(:filter_spec AS JSONB)
                     FROM bumped
                     """
                 ),
@@ -1224,6 +1467,7 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
                     "payload": payload,
                     "not_before": body.not_before,
                     "observe_only": row[1],
+                    "filter_spec": json.dumps(row[2]) if row[2] is not None else None,
                 },
             )
 
@@ -1259,8 +1503,17 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     # says which case this is without ever describing the event as sent:
     # - nobody subscribes to this type at all        -> unrouted
     # - subscribers exist but none has confirmed yet -> pending_confirmation
-    if not subscribers:
-        disposition = UNROUTED if total_subscribers == 0 else PENDING_CONFIRMATION
+    # - every confirmed subscriber's own condition
+    #   withheld this exact body                      -> filtered
+    # Each withheld judgement carries its condition snapshot in
+    # subscription_filter_evaluations and stays distinct from "nobody
+    # subscribed"; an unconditional subscriber (or a matching one) is simply
+    # accepted/fanned out.
+    if not routed_subscribers:
+        if not subscribers:
+            disposition = UNROUTED if total_subscribers == 0 else PENDING_CONFIRMATION
+        else:
+            disposition = FILTERED
     else:
         disposition = ACCEPTED
     log_attempt(
@@ -1272,6 +1525,12 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
         dedupe_key=body.dedupe_key,
         event_type=body.event_type,
         signed_at=signed_at,
+        reason=(
+            "every confirmed subscriber's subscription condition withheld "
+            "this body"
+            if disposition == FILTERED
+            else None
+        ),
     )
     db.commit()
     result = dict(event)
@@ -1306,6 +1565,10 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     result["shadow_bodies_released_count"] = 0
     result["shadow_bodies_closed_count"] = 0
     result["shadow_previews_delivered_count"] = 0
+    # Withheld counts come from the evaluation rows just inserted, not from
+    # deliveries.
+    result["filtered_out_count"] = filtered_real
+    result["shadow_filtered_out_count"] = filtered_shadow
     return event_response(result), 201
 
 
@@ -1363,7 +1626,71 @@ def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
         "attempts": attempts,
         "receipts": receipts,
         "corrections": list_corrections_of(db, event_id),
+        "filter_evaluations": list_filter_evaluations_of(db, event_id),
     }
+
+
+def list_filter_evaluations_of(db: Session, event_id: UUID) -> list:
+    # Per-address subscription-condition judgements for this exact body.
+    # matched=false rows are exactly the "this address's own condition did not
+    # match, so it got no copy" outcomes — distinct from an unrouted event
+    # (nobody subscribed) and from a subscriber still waiting on confirmation
+    # (which is never evaluated and never appears here).
+    return db.execute(
+        text(
+            """
+            SELECT id, event_id, destination_id, event_type, matched,
+                   filter_spec, observe_only, created_at
+            FROM subscription_filter_evaluations
+            WHERE event_id = CAST(:event_id AS UUID)
+            ORDER BY created_at ASC, id ASC
+            """
+        ),
+        {"event_id": str(event_id)},
+    ).mappings().all()
+
+
+@app.get(
+    "/v1/filter-evaluations",
+    response_model=list[SubscriptionFilterEvaluationOut],
+)
+def list_filter_evaluations(
+    event_id: UUID | None = None,
+    destination_id: UUID | None = None,
+    matched: bool | None = None,
+    event_type: str | None = None,
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    # Audit trail of subscription-condition judgements. Filter
+    # matched=false&destination_id=... to answer "why did this address not get
+    # this one"; each row carries the exact condition snapshot that was
+    # judged, so the outcome never collapses into "nobody subscribed".
+    return db.execute(
+        text(
+            """
+            SELECT id, event_id, destination_id, event_type, matched,
+                   filter_spec, observe_only, created_at
+            FROM subscription_filter_evaluations
+            WHERE (CAST(:event_id AS UUID) IS NULL
+                   OR event_id = CAST(:event_id AS UUID))
+              AND (CAST(:destination_id AS UUID) IS NULL
+                   OR destination_id = CAST(:destination_id AS UUID))
+              AND (:matched IS NULL OR matched = :matched)
+              AND (CAST(:event_type AS TEXT) IS NULL
+                   OR event_type = CAST(:event_type AS TEXT))
+            ORDER BY created_at DESC, id DESC
+            LIMIT :limit
+            """
+        ),
+        {
+            "event_id": str(event_id) if event_id else None,
+            "destination_id": str(destination_id) if destination_id else None,
+            "matched": matched,
+            "event_type": event_type,
+            "limit": limit,
+        },
+    ).mappings().all()
 
 
 # --- Corrections ("补一笔更正") ------------------------------------------------
@@ -1429,13 +1756,28 @@ def create_correction(
     delivered = db.execute(
         text(
             """
-            SELECT d.destination_id, d.observe_only
-            FROM deliveries d
-            JOIN destinations dest ON dest.id = d.destination_id
-            WHERE d.event_id = CAST(:event_id AS UUID)
-              AND d.delivered_at IS NOT NULL
-            ORDER BY d.destination_id
-            FOR UPDATE OF dest
+            SELECT DISTINCT reached.destination_id, reached.observe_only,
+                   s.filter_spec
+            FROM (
+                -- One row per destination that really received a body of
+                -- THIS original event (gated events also have a preview row:
+                -- only the body counts).
+                SELECT DISTINCT d.destination_id, d.observe_only
+                FROM deliveries d
+                WHERE d.event_id = CAST(:event_id AS UUID)
+                  AND d.delivered_at IS NOT NULL
+                  AND d.phase = 'body'
+            ) reached
+            -- The original event's type is single-valued (events.event_type),
+            -- so this join is 1:1; joining without it would fan out across
+            -- every type the destination subscribes to and could pick up
+            -- another type's condition.
+            JOIN events original ON original.id = CAST(:event_id AS UUID)
+            JOIN destinations dest ON dest.id = reached.destination_id
+            LEFT JOIN destination_subscriptions s
+                   ON s.destination_id = reached.destination_id
+                  AND s.event_type = original.event_type
+            ORDER BY reached.destination_id
             """
         ),
         {"event_id": str(event_id)},
@@ -1471,6 +1813,40 @@ def create_correction(
             detail=(
                 "no copy of this event has been sent out yet; there is no "
                 "delivered copy to correct"
+            ),
+        )
+
+    # A correction carries its own corrected body, so each eligible address's
+    # CURRENT subscription condition is evaluated afresh against that body —
+    # the snapshot on the original copy is not reused. Conditions later
+    # replaced/added therefore apply to the next (correction) send, while
+    # copies already queued for the address keep their own snapshots. The
+    # judgement rows are inserted below, once the correction event exists.
+    def _withheld(row) -> bool:
+        return (
+            row["filter_spec"] is not None
+            and not evaluate_filter(row["filter_spec"], body.payload)
+        )
+
+    routed_delivered = [row for row in delivered if not _withheld(row)]
+    filtered_real = sum(
+        1 for row in delivered if _withheld(row) and not row["observe_only"]
+    )
+    filtered_shadow = sum(
+        1 for row in delivered if _withheld(row) and row["observe_only"]
+    )
+
+    if not routed_delivered:
+        # Every address the original really reached currently withholds the
+        # correction body under its own condition: nothing is created and no
+        # dedupe key is consumed. Distinct from "nothing was ever delivered"
+        # above.
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "every destination the original event was delivered to has a "
+                "subscription condition that withholds this correction body"
             ),
         )
 
@@ -1532,15 +1908,17 @@ def create_correction(
         response.status_code = 200
         return result
 
-    # Fan the correction out to exactly the delivered set: one additional copy
-    # per destination at the tail of that destination's queue (a fresh
-    # destination_seq). The observe_only snapshot comes from the original
-    # copy it corrects — a shadow address's correction copy stays a shadow
-    # and can never count as for-real. Copies aimed at a currently
-    # unconfirmed destination simply wait at the usual claim gate.
-    real_copies = [row for row in delivered if not row["observe_only"]]
-    shadow_copies = [row for row in delivered if row["observe_only"]]
-    for row in delivered:
+    # Fan the correction out to exactly the delivered-and-still-matching set:
+    # one additional copy per destination at the tail of that destination's
+    # queue (a fresh destination_seq). The observe_only snapshot comes from the
+    # original copy it corrects — a shadow address's correction copy stays a
+    # shadow and can never count as for-real. The CURRENT condition is
+    # snapshotted onto the correction copy, and each condition-carrying address
+    # gets one evaluation row recording the judgement. Copies aimed at a
+    # currently unconfirmed destination simply wait at the usual claim gate.
+    real_copies = [row for row in routed_delivered if not row["observe_only"]]
+    shadow_copies = [row for row in routed_delivered if row["observe_only"]]
+    for row in routed_delivered:
         db.execute(
             text(
                 """
@@ -1552,10 +1930,12 @@ def create_correction(
                 )
                 INSERT INTO deliveries
                     (event_id, destination_id, event_type, dedupe_key, payload,
-                     destination_seq, confirmation_generation, observe_only)
+                     destination_seq, confirmation_generation, observe_only,
+                     filter_spec)
                 SELECT :event_id, id, :event_type, :dedupe_key,
                        CAST(:payload AS JSONB), next_event_seq,
-                       confirmation_generation, :observe_only
+                       confirmation_generation, :observe_only,
+                       CAST(:filter_spec AS JSONB)
                 FROM bumped
                 """
             ),
@@ -1565,6 +1945,42 @@ def create_correction(
                 "event_type": event["event_type"],
                 "dedupe_key": body.dedupe_key,
                 "payload": payload,
+                "observe_only": row["observe_only"],
+                "filter_spec": (
+                    json.dumps(row["filter_spec"])
+                    if row["filter_spec"] is not None
+                    else None
+                ),
+            },
+        )
+
+    # Record one evaluation per condition-carrying eligible address,
+    # including the withheld ones (they have no correction copy but the
+    # trace must still say "this address's condition did not match").
+    for row in delivered:
+        if row["filter_spec"] is None:
+            continue
+        matches = not _withheld(row)
+        db.execute(
+            text(
+                """
+                INSERT INTO subscription_filter_evaluations
+                    (event_id, destination_id, event_type, matched,
+                     filter_spec, observe_only)
+                VALUES (
+                    CAST(:event_id AS UUID), CAST(:destination_id AS UUID),
+                    :event_type, :matched, CAST(:filter_spec AS JSONB),
+                    :observe_only
+                )
+                ON CONFLICT (event_id, destination_id) DO NOTHING
+                """
+            ),
+            {
+                "event_id": correction["id"],
+                "destination_id": row["destination_id"],
+                "event_type": event["event_type"],
+                "matched": matches,
+                "filter_spec": json.dumps(row["filter_spec"]),
                 "observe_only": row["observe_only"],
             },
         )
@@ -1617,6 +2033,8 @@ def create_correction(
     result["shadow_superseded_count"] = 0
     result["shadow_dead_lettered_count"] = 0
     result["shadow_failed_count"] = 0
+    result["filtered_out_count"] = filtered_real
+    result["shadow_filtered_out_count"] = filtered_shadow
     return event_response(result)
 
 
@@ -2119,6 +2537,7 @@ INGESTION_DISPOSITIONS = (
     ACCEPTED,
     UNROUTED,
     PENDING_CONFIRMATION,
+    FILTERED,
     DUPLICATE,
     "source_unknown",
     SOURCE_DISABLED,

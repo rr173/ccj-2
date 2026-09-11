@@ -40,6 +40,13 @@ UNROUTED = "unrouted"
 # to complete its activation handshake: no delivery rows were created, so it
 # was not written as "sent" and can never be backfilled after confirmation.
 PENDING_CONFIRMATION = "pending_confirmation"
+# The event was accepted and stored, subscribers exist and are confirmed, but
+# every one of them carries its own subscription condition that withheld this
+# exact body: no delivery rows were created (so it was never written as sent),
+# while the per-address judgements stay visible in
+# subscription_filter_evaluations. Distinct from 'unrouted' (nobody
+# subscribes) and from 'pending_confirmation'.
+FILTERED = "filtered"
 DUPLICATE = "duplicate"
 SOURCE_UNKNOWN = "source_unknown"
 SOURCE_DISABLED = "source_disabled"

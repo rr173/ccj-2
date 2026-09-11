@@ -7,6 +7,13 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 MAX_EVENT_TYPE_LENGTH = 128
 MAX_EVENT_TYPES_PER_DESTINATION = 100
 
+# A subscription condition ("订阅条件") is an arbitrary JSON object whose
+# shape is validated by app.subfilters.validate_filter_spec at write time;
+# Pydantic only enforces "a JSON object keyed by event type, each value an
+# object". NULL / an absent field means "leave conditions unchanged" on an
+# edit; per-key null on PATCH clears just that type's condition.
+SubscriptionFilters = dict[str, dict[str, Any]]
+
 
 def _normalize_optional_datetime(value: datetime | None) -> datetime | None:
     """Naive timestamps are interpreted as UTC."""
@@ -39,6 +46,21 @@ class DestinationIn(BaseModel):
     # event-level requeue never selects its copies. None on re-registration
     # keeps the current flag; a brand-new destination defaults to for-real.
     observe_only: bool | None = None
+    # Optional subscription conditions keyed by event type. On registration
+    # filters only make sense together with event_types (a condition for a
+    # type the address does not subscribe to is refused, 422). A type absent
+    # from the map has no condition and receives every event of that type.
+    filters: SubscriptionFilters | None = None
+
+    @field_validator("filters")
+    @classmethod
+    def filters_must_be_objects(cls, value):
+        if value is None:
+            return None
+        for event_type, spec in value.items():
+            if not isinstance(event_type, str) or not isinstance(spec, dict):
+                raise ValueError("filters must map event types to condition objects")
+        return value
 
     @field_validator("event_types")
     @classmethod
@@ -71,6 +93,13 @@ class DestinationPatchIn(BaseModel):
     # Toggling only changes copies fanned out afterwards — existing copies
     # keep the flag snapshot taken when they were created.
     observe_only: bool | None = None
+    # Replace the condition of each listed subscribed type: a condition
+    # object sets it, null clears that type's condition (the address then
+    # receives every event of that type). Types not named in the map keep
+    # their current condition. None leaves all conditions untouched. Keys
+    # must name types the address subscribes to after this edit (422
+    # otherwise), and edits to conditions only affect later events.
+    filters: dict[str, dict[str, Any] | None] | None = None
 
     @field_validator("event_types")
     @classmethod
@@ -136,6 +165,11 @@ class DestinationOut(BaseModel):
     paused_from: datetime | None = None
     paused_until: datetime | None = None
     paused: bool = False
+    # Current subscription conditions keyed by event type. Only types with a
+    # condition appear here; an absent type means the address receives every
+    # event of that type. Conditions are evaluated at fan-out time, so a
+    # change here only ever affects later events.
+    filters: dict[str, dict[str, Any]] = {}
 
     model_config = {"from_attributes": True}
 
@@ -281,6 +315,13 @@ class EventOut(BaseModel):
     shadow_bodies_waiting_count: int = 0
     shadow_bodies_released_count: int = 0
     shadow_bodies_closed_count: int = 0
+    # Confirmed subscribers whose own subscription condition withheld this
+    # exact body: no delivery was created for them, so they are neither
+    # "unrouted" (nobody subscribed) nor pending confirmation. Kept separate
+    # for for-real and observe-only subscribers; each judgement is also in the
+    # event's filter_evaluations (trace) with its condition snapshot.
+    filtered_out_count: int = 0
+    shadow_filtered_out_count: int = 0
     created_at: datetime
     duplicate: bool = False
     # Fanned-out copies abandoned because their destination changed location
@@ -355,6 +396,11 @@ class DeliveryOut(BaseModel):
     # delivered and reconciled on its own, but its receipt outcome never
     # changes the whole event's reconcile_status or its for-real counts.
     observe_only: bool = False
+    # Snapshot of the subscription condition this copy was fanned out under.
+    # Null means the subscription carried no condition (every body matches);
+    # a non-null condition held for this body — a non-matching body creates no
+    # copy at all (its judgement is in the event's filter_evaluations).
+    filter_spec: dict[str, Any] | None = None
     # Preview-consent gate ("预告 + 点头才给正文"):
     # preview: the notice queued ahead of the body for a gated event (no real
     #          payload, no receipt reconciliation);
@@ -484,6 +530,31 @@ class EventTraceOut(BaseModel):
     # them. Empty when nothing was ever corrected — in particular for events
     # that never went out anywhere.
     corrections: list[EventOut] = []
+    # One row per confirmed subscriber whose subscription carries a
+    # condition, evaluated once against this exact body at fan-out: matched
+    # copies were created, withheld ("条件没对上") ones were not. This is what
+    # distinguishes "this address's own condition did not match" from an event
+    # with no subscribers (unrouted). Subscriptions without a condition and
+    # still-unconfirmed subscribers do not appear here.
+    filter_evaluations: list["SubscriptionFilterEvaluationOut"] = []
+
+
+class SubscriptionFilterEvaluationOut(BaseModel):
+    id: int
+    event_id: UUID
+    destination_id: UUID
+    event_type: str
+    # True: this address's own condition held for this body, a delivery was
+    # created; false: it did not, no delivery was created and nothing was sent
+    # to this address (it must never read as delivered).
+    matched: bool
+    # Exact condition snapshot that was judged, so the decision is auditable
+    # even after the subscription condition is later replaced.
+    filter_spec: dict[str, Any]
+    observe_only: bool = False
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 class RecoveryOut(BaseModel):
@@ -539,6 +610,9 @@ class IngestionAttemptOut(BaseModel):
     # unrouted: stored but no destination subscribes to the type;
     # pending_confirmation: stored, but every subscriber was still unconfirmed
     #   at ingest time — no copies created, nothing sent;
+    # filtered: stored, subscribers exist and are confirmed, but each one's
+    #   own subscription condition withheld the body — no copies created, the
+    #   per-address judgements are in subscription_filter_evaluations;
     # duplicate: same dedupe_key seen again, no new event was created;
     # source_unknown / source_disabled / bad_signature / stale_timestamp /
     # future_timestamp / invalid_timestamp / invalid_body: rejected at entry.

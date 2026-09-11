@@ -2,7 +2,7 @@
 
 这是一个接收事件、按事件类型分发给订阅地址，把事件按顺序推送到外部 Webhook，并对推送结果做**回执对账**的系统：
 
-- **ingest-api**：登记**事件来源**（发放只属于它的签名密钥、可停用/可换钥）、登记接收地址（含订阅的事件类型；可把任一地址标成**只跟着看 `observe_only`**——照样收副本、按它自己的生命周期外发/重试/隔离/死信，但它的回执认不认、超时或进死信都不影响整笔算不算认完；**地址得先完成一次上线握手确认才会收到投递**，换接收位置要重新确认；可给任一地址标一段**现在不收**的时间——窗口内副本在原队列位置等、不算失败、对账不倒计时，订了同一类型的其他地址照打）、**按事件类型设定认完门槛**（当真副本认够份数整笔即认完且终态不可逆，影子副本不凑数；没定门槛的类型仍要求所有当真副本都认）、**验签 + 发送时间校验后**接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**给已收下的事件补一笔更正**（另补一笔新事件，只补给当初真正打到过的地址，排在各地址队尾，对账从真正打出才算，更正失败只算它自己的）、**接入回执与确认应答**、查询**入口准入记录（含每一条被拒事件，以及"收了但还没确认、一份没发"的事件）**、事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（整笔重投在认够门槛后不再拉名单；没认够时只重投某一笔事件中尚未认的那些**当真**副本，只跟着看的副本不在名单内）。
+- **ingest-api**：登记**事件来源**（发放只属于它的签名密钥、可停用/可换钥）、登记接收地址（含订阅的事件类型；可把任一地址标成**只跟着看 `observe_only`**——照样收副本、按它自己的生命周期外发/重试/隔离/死信，但它的回执认不认、超时或进死信都不影响整笔算不算认完；**地址得先完成一次上线握手确认才会收到投递**，换接收位置要重新确认；**每个"地址×事件类型"还可以挂一条只看正文的订阅条件 `filters`——正文对得上才给它、对不上不给且绝不写成已发，条件后来改了只接下一条；可给任一地址标一段**现在不收**的时间——窗口内副本在原队列位置等、不算失败、对账不倒计时，订了同一类型的其他地址照打）、**按事件类型设定认完门槛**（当真副本认够份数整笔即认完且终态不可逆，影子副本不凑数；没定门槛的类型仍要求所有当真副本都认）、**验签 + 发送时间校验后**接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**给已收下的事件补一笔更正**（另补一笔新事件，只补给当初真正打到过的地址，排在各地址队尾，对账从真正打出才算，更正失败只算它自己的）、**接入回执与确认应答**、查询**入口准入记录（含每一条被拒事件，以及"收了但还没确认、一份没发"的事件）**、事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（整笔重投在认够门槛后不再拉名单；没认够时只重投某一笔事件中尚未认的那些**当真**副本，只跟着看的副本不在名单内）。
 - **worker**：负责真正的 HTTP 投递、重试、熔断隔离、崩溃恢复，以及向未确认地址发送上线握手请求（confirmer 线程）。
 - **reconciler**：独立的对账进程，周期性把超过约定时间仍未收到回执的副本标记为 `timed_out`（可查，不算认）。
 - **PostgreSQL**：作为任务队列和事实来源，用行锁和每地址单调序号保证同一个接收地址严格 FIFO。
@@ -35,6 +35,8 @@
 | 报文不是合法 JSON / 不符事件 schema | 422 | `invalid_body` |
 | 同一 `dedupe_key` 再送一次（即便换一个来源送） | 200 | `duplicate`（返回原事件，`duplicate: true`，不新建事件、不二次扇出） |
 
+> `accepted` 之外还有两个"收下了但没往任何地址发"的处置：`unrouted`（压根没人订这个类型）、`pending_confirmation`（有人订但都还没完成上线确认）、`filtered`（有已确认订户，但每一家自己的**订阅条件**都没对上这条正文；逐家判定见 `subscription_filter_evaluations`）。这三者互不混淆，且都不会写成已发出。
+
 - **每一次入口尝试都落 `ingestion_attempts` 表**，包括所有被拒的。用 `GET /v1/ingestion/attempts?rejected_only=true` 或按 `source_id` / `disposition` / `dedupe_key` 过滤即可查到"谁、什么时间、因为什么被拒"。被拒记录的 `event_id` 为空——它从未成为事件，轨迹/对账里绝不会把它写成"已收下/已发出"。
 - 错误响应形如 `{"detail": {"error": "...", "disposition": "bad_signature"}}`，与日志中的处置一一对应。
 
@@ -48,7 +50,7 @@
 
 ### 1. 按事件类型分发（发布/订阅）与上线确认
 
-- 登记地址时用 `event_types` 声明它关心哪些事件类型；不传或传 `null` 表示保持现状（新地址则为不订任何类型），传列表（含空列表）则整体替换订阅集合。
+- 登记地址时用 `event_types` 声明它关心哪些事件类型；不传或传 `null` 表示保持现状（新地址则为不订任何类型），传列表（含空列表）则整体替换订阅集合。每个"地址×类型"还可以挂一条**订阅条件**（`filters`，见 1.6 节）：只有正文对得上条件才给它，对不上不建副本、不发出、判定单独可查（`filtered`），条件改了只接下一条。
 - **接收地址得先完成一次上线确认（握手），对上之后才准往它那里打。** 新登记（或换了接收位置）的地址状态是 `pending`：系统向该地址发一个带一次性 `challenge` 的确认请求，对方得在约定时限（`CONFIRM_TIMEOUT_SECONDS`，默认 300 秒）内把 challenge 原样对上，地址才变成 `confirmed`。对上有两种方式：
   - 在确认请求的 2xx 响应体里回 `{"echo": "<challenge>"}`；
   - 或由接收方回调 `POST /v1/destinations/{id}/confirm`（body `{"challenge": "<challenge>"}`，也可用 `X-Confirmation-Challenge` 头）。
@@ -113,12 +115,12 @@
 每一笔已经收下的事件，之后都可以再补一笔更正：`POST /v1/events/{event_id}/corrections`，body 为 `{"dedupe_key": "...", "payload": {...}}`。更正是**另补的一笔**，不是把原来那份收回来改：
 
 - **原来打出去的那份不动**：更正本身是一笔新事件（响应与查询里带 `corrects_event_id` 指向原来那笔），有自己的去重键、自己的副本、自己的对账生命周期；原来那笔事件的副本、回执状态、整笔 `reconcile_status` 一概不被改写。
-- **只补给当初真正打到过的地址**：扇出名单 = 提交更正那一刻，原来那笔里已经真正投妥（`delivered_at` 有值）的副本所在的地址。还在排队、已取消、被取代（`superseded`）或根本没扇出过的地址一律不补——哪怕它之后投妥了，也不回头补这一笔。一个地址都没打出去过时，更正直接被拒（见下）。
+- **只补给当初真正打到过的地址**：扇出名单 = 提交更正那一刻，原来那笔里已经真正投妥（`delivered_at` 有值）的副本所在的地址。还在排队、已取消、被取代（`superseded`）或根本没扇出过的地址一律不补——哪怕它之后投妥了，也不回头补这一笔。**该地址当前挂了订阅条件的，还要用更正自己的正文按当前条件再判一次**（见 1.6 节）：对不上的地址同样不补，判定挂在更正这笔事件上可查；一个地址都不剩时，更正直接被拒（见下）。
 - **排在原队伍后面等**：每份更正副本拿该地址新的队尾序号（`destination_seq`），排在已排队的所有副本后面；领取闸门照旧——只要该地址还有副本在投（`in_flight`），更正副本就不会被领取，不会插到人家正在投的前面。
 - **对账从真正打出去之后才开始算**：更正副本投妥那一刻才进入 `awaiting` 并写入 `reconcile_deadline`（投妥时间 + `RECEIPT_TIMEOUT_SECONDS`）；提交更正的时间、排队等待的时间都不计入倒计时。接收方按更正自己的 `dedupe_key` 回执（回 `(destination_id, 更正的 dedupe_key)` 即可）。
 - **更正失败按它自己算**：更正副本外发失败（非 2xx / 连接失败 / 超时）后**不原地重试**，直接置终态 `failed`——不计入该地址的连续失败计数、**不会触发隔离**、也不会挡在队列里让后面还在排的副本等它（它已不在队头）。失败可在更正自己的轨迹里查到（副本状态 `failed`、投递尝试里留着那次失败）。原来那笔已经认了的副本不受任何影响。想再补一次，用新的 `dedupe_key` 重新提交一笔更正即可。
 - **只跟着看的地址有自己那份就跟自己的**：影子地址当初那份如果真打出去了，更正也照样给它补一份，并继承原来那份的 `observe_only` 快照——它自己的更正副本自己外发、自己对账，但**不能拿来给更正这笔的认完门槛凑数**（更正事件的 `required_ack_count` 只数当真副本，快照规则与入库扇出相同：类型门槛与当真份数取小）。
-- **没人订或根本没收下的不能更正**：原来那笔是 `unrouted`（没人订或都没确认，一份副本都没有）、有副本但一份都没打出去、或已取消的，`POST` 更正返回 `409`，什么都不创建；事件 id 不存在（包括入口就被拒、从未成为事件的）返回 `404`。`GET /v1/events/{event_id}/corrections` 随时能查：没有更正就是空列表，绝不会写成已经发出去。
+- **没人订或根本没收下的不能更正**：原来那笔是 `unrouted`（没人订或都没确认，一份副本都没有）、有副本但一份都没打出去、或已取消的，`POST` 更正返回 `409`，什么都不创建；**所有当初打得到的地址现在的订阅条件都没对上更正正文时同样 `409`**（什么都不创建，也不占用 `dedupe_key`，之后内容对得上还能用同一个键提交）；事件 id 不存在（包括入口就被拒、从未成为事件的）返回 `404`。`GET /v1/events/{event_id}/corrections` 随时能查：没有更正就是空列表，绝不会写成已经发出去。
 - **同一笔更正重复送来只认一次**：更正的 `dedupe_key` 全局唯一（与事件同一个命名空间）。重复提交同一笔更正返回 `200` 和原更正并带 `duplicate: true`，不新建、不二次扇出；`dedupe_key` 已被别的事件/更正占用时返回 `409`。被拒（409）的更正不占用键——等内容真的打出去了，可以拿同一个键再提交。
 
 更正本身是一笔普通事件：可以用 `/v1/events/{更正id}/trace` 查它自己的投递轨迹与整笔对账状态；它的副本照常过确认闸门、停收窗口、回执对账、超时/失败回执重投与死信规则（只有传输层失败不同——见上，直接 `failed` 不原地重试）。原来那笔的轨迹（`GET /v1/events/{event_id}/trace`）里新增 `corrections` 段，列出它名下的全部更正；投递给接收方的更正请求会带头 `X-Corrects-Event-Id` 和 body 字段 `corrects_event_id`，接收方可以据此把它和原来那笔关联起来。
@@ -151,10 +153,51 @@
 - **点头只算这个地址自己的**：决定按 `(event_id, destination_id)` 定位正文行并锁行，A 点了只放 A 那份，B 的正文照样 held；拿 B 的地址 id 不能给 A 放行。并发/重复点头在该正文行上串行化，且有效决定对 `release_gate_decisions.delivery_id` 有唯一部分索引——**同一份预告同地址点两次只算一次**。
 - **作废还没出门的正文，预告不用动**：`POST /v1/deliveries/{body_delivery_id}/void-body` 把一份仍 held 的正文置终态 `release_voided`（`void_reason=manual`），它那份预告（无论排队还是已投妥）原样保留，其他地址的正文也不受影响；重复调幂等（返回 `voided:false`）。**已经出门（in_flight/delivered）的正文不能作废**（409）——发出去的收不回。
 - **预告本身没发成**：预告连续传输失败进死信（`preview_dead_lettered`）、或地址换位置导致预告被 `superseded` 时，它那份还没出门的 held 正文**自动连带作废**为 `release_voided`（地址压根没收到预告，绝不能收到正文）；预告正在投时地址换了位置，那次失败按换位置处理并连带作废正文。
-- **没订这类的地址**：与普通事件同一套扇出门槛——没订阅、或订阅了但还没完成上线确认的地址，**预告和正文都不会生成**，它的任何决定只记 `orphan`。
+- **没订这类的地址**：与普通事件同一套扇出门槛——没订阅、或订阅了但还没完成上线确认的地址，**预告和正文都不会生成**，它的任何决定只记 `orphan`。**挂了订阅条件但正文没对上的已确认订户同样一对消息都不生成**（预告本身也会暴露事件；判定记 `matched=false`，见 1.6 节），它来点头也是 `orphan`。
 - **对账与门槛**：只有**正文**副本进回执对账、计入 `delivery_count`/认完门槛；预告是 `phase=preview`，单独可见但永不计入。held/作废中的正文也不算"活跃正文"（与 `superseded` 同样处理）：所有当真正文都没点头/被作废的事件传输状态为 `release_closed`，认完要求按现存活跃正文算。影子（observe_only）地址同样收"预告+正文"两份并自己走闸门，但其结果不计入整笔。
 - **可查**：事件响应/`trace` 里每个副本带 `phase`、`release_state`、`consent_deadline`、`preview_delivery_id`/`body_delivery_id`、`released_at`/`voided_at`/`void_reason`；事件级汇总新增 `preview_gated`、`bodies_waiting_count`、`bodies_released_count`、`bodies_denied_count`、`bodies_expired_count`、`bodies_voided_count` 及对应 `shadow_*`。每一次点头/不要都落 `release_gate_decisions` 审计表，可用 `GET /v1/release-gate-decisions`（按 event/destination/disposition 过滤）查到"谁、什么时候、做了什么决定、怎么被处置"。
 - mock 接收方加 `--ingest-url http://... --preview-decision approve|deny|none` 即可在收到预告时自动回调决定（`none` 可用来观察超时作废）。
+
+### 1.6 按地址×类型挂"正文条件"（subscription filters）
+
+每个接收地址除了声明订哪些事件类型，还可以给**某一个类型**单独挂一条条件：只有**事件正文（`payload`）对得上这条条件**，这份正文才给这个地址。条件是纯声明式 JSON，没有脚本、没有时间/随机/IO，同一份正文对着同一条条件看多少次结果都一样。
+
+- **挂条件**：登记地址（`POST /v1/destinations`，要同时带 `event_types`）或 `PATCH /v1/destinations/{id}` 时带 `filters`，键是事件类型，值是条件对象：
+
+  ```bash
+  curl -s http://localhost:8000/v1/destinations -H 'Content-Type: application/json' -d '{
+    "url": "https://example.com/high-value",
+    "event_types": ["paid"],
+    "filters": {"paid": {"path": "amount", "op": "gte", "value": 1000}}
+  }'
+  # 改条件只影响下一条：
+  curl -s -X PATCH http://localhost:8000/v1/destinations/<id> -H 'Content-Type: application/json' \
+    -d '{"filters": {"paid": {"path": "amount", "op": "gte", "value": 5000}}}'
+  # 去掉这个类型的条件（恢复照收）：
+  curl -s -X PATCH http://localhost:8000/v1/destinations/<id> -H 'Content-Type: application/json' \
+    -d '{"filters": {"paid": null}}'
+  ```
+
+  条件只能挂在**这个地址确实订了**的类型上（登记时必须同时出现在 `event_types` 里；PATCH 时该类型必须在现有订阅集合里），否则 422。条件本身不合法（未知 op、路径空、`all/any/not` 组合写错、嵌套超 8 层/超 100 个条件等）也是 422，不会悄悄存下来。`PATCH` 里 `event_types` 列表照旧整体替换订阅集合，被移除的类型条件一起删掉；不带 `event_types` 时 `filters` 是逐类型打补丁（对象替换、`null` 清除）。
+- **条件语法**：
+  - 叶子条件 `{"path": "<点分路径>", "op": "<操作符>", "value": ...}`：路径按点逐层走对象，数字段走数组（`items.0.id`）；路径不存在时除 `exists` 外一律不成立（`ne` 也不成立——"没这个字段"不等于"不等于某个值"）。
+  - 操作符：`eq` / `ne`（深度 JSON 相等，`true` 不等于 `1`，类型不同即不等）、`gt` / `gte` / `lt` / `lte`（两个数字或两个字符串按序比较，布尔不当数字）、`in`（值等于列表中任一成员）、`exists`（路径存在即可，不带 `value`）、`starts_with` / `ends_with` / `contains`（字符串操作，两边都得是字符串）。
+  - 组合：`{"all": [条件, ...]}`（全部成立）、`{"any": [条件, ...]}`（任一成立）、`{"not": 条件}`（取反）；一条条件只能是叶子或某一种组合。
+- **对不上的这份不给、也不写成已发**：入库扇出那一刻，对每个**已确认**且挂了条件的订户，用纯求值器拿**这条事件自己的正文**判一次：
+  - 成立 → 照常拿到它自己的副本，条件原文**快照到副本上**（`deliveries.filter_spec`），外发/重试/隔离/死信/对账与无条件副本完全一样；
+  - 不成立 → **根本不建副本**，不会出网、`delivered_count` 不含它、trace 的 `deliveries` 里没有它；判定落 `subscription_filter_evaluations` 表（`matched=false` + 条件快照 + `observe_only` 标记）。
+- **没写条件的地址，订了就照收**：没有条件（NULL）的订阅与以前完全一致。
+- **条件后来改了只接下一条**：条件只在入库扇出时读当前值；已经排给该地址的副本带着出生时的快照，改/删条件不影响它们，也不会把旧副本收回来。副本上永远能查到它是对哪条条件成立才生成的。
+- **各家条件各算各的**：判定按 `(事件, 地址)` 独立进行，A 的条件成立与否绝不影响 B；同一事件里 A 被挡、B 照发是常态。当真地址和 `observe_only` 影子地址的判定也各自独立、分别计数（`filtered_out_count` / `shadow_filtered_out_count`）。
+- **没订这个类型的，写了条件也不要给**：条件必须依附订阅；退订（从 `event_types` 移除）后该类型的新事件既不生成副本也不产生判定记录。还没完成上线确认的地址在扇出时根本不参与，条件**不会**被求值（保持 `pending_confirmation` 语义，不与"条件没对上"混淆）。
+- **查这一笔要能看出是"这家条件没对上"**：
+  - 事件 trace（`GET /v1/events/{id}/trace`）新增 `filter_evaluations` 段，逐地址列出 `matched`、条件快照、是否影子；每份真实副本也带自己的 `filter_spec`。
+  - 事件响应/汇总新增当真/影子被条件挡住的计数 `filtered_out_count` / `shadow_filtered_out_count`。
+  - 全局可查：`GET /v1/filter-evaluations?event_id=...&destination_id=...&matched=false&event_type=...`。
+  - **与"压根没人订"明确区分**：所有已确认订户的条件都不满足时，事件照收照存，传输状态是 `filtered`，准入记录 disposition 也是 `filtered`；没有任何订户的类型仍是 `unrouted`。两种都没有副本、都不会写成已发，但任何查询都不会把它们混成一种。
+- **预告放行（gated）类型同样适用**：条件不成立时连预告都不生成（预告本身也会暴露"有这么一件事"）；该地址点头/不要接口对它返回 `orphan`。
+- **更正（correction）按更正自己的正文、用当前条件重判**：更正扇出名单原本是"原事件真正投妥过的地址"，现在还要用**更正自己的正文**对每个地址**当前**的条件再判一次；对不上的地址不补，判定同样落 `subscription_filter_evaluations`（挂在更正这笔事件上）。所有候选地址都被挡住时更正返回 409、什么都不创建，也不占用 `dedupe_key`（之后内容对得上还能用同一个键提交）。
+- **确定性**：求值是 `(条件, 正文)` 的纯函数（无时钟、无随机、无网络、不求值表达式）；同一份正文对着同一套条件再看一次，给/不给必然一致。
 
 ### 2. 同一接收地址严格按进入顺序投递
 
@@ -375,6 +418,27 @@ curl -s http://localhost:8000/v1/destinations \
 # 之后想当真：PATCH /v1/destinations/<id>  body {"observe_only": false}（不重新握手，只影响新事件）
 ```
 
+# 挂订阅条件（只有正文对得上才给它；对不上不发、判定可查、不与 unrouted 混淆）：
+
+```bash
+curl -s http://localhost:8000/v1/destinations \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "url":"https://example.com/high-value",
+        "event_types":["paid","refunded"],
+        "filters":{
+          "paid":{"path":"amount","op":"gte","value":1000},
+          "refunded":{"all":[
+            {"path":"amount","op":"gte","value":100},
+            {"path":"reason","op":"in","value":["fraud","duplicate"]}
+          ]}
+        }
+      }'
+# 改条件（只接下一条，已排队的不动）：PATCH /v1/destinations/<id>  body {"filters":{"paid":{"path":"amount","op":"gte","value":5000}}}
+# 去掉条件（这个类型恢复照收）：            PATCH /v1/destinations/<id>  body {"filters":{"paid":null}}
+# 逐家判定可查：GET /v1/events/<id>/trace 的 filter_evaluations，或 GET /v1/filter-evaluations?matched=false
+```
+
 给某类事件定"认完门槛"（当真地址认够这么多份，整笔就算认完，不用等剩下的；只跟着看的地址不能凑数）：
 
 ```bash
@@ -441,7 +505,8 @@ curl -s -X POST http://localhost:8000/v1/deliveries/<body_delivery_id>/void-body
   "observe_only": false,
   "paused_from": null,
   "paused_until": null,
-  "paused": false
+  "paused": false,
+  "filters": {"paid": {"path": "amount", "op": "gte", "value": 1000}}
 }
 ```
 
@@ -526,10 +591,11 @@ body（同样要配合签名头发送）: {
 - `source_id`：把事件送进来的已登记来源（入口准入前的历史事件可能为 `null`）
 - `event_type` / `dedupe_key` / `payload`：事件本体
 - `not_before`：约定的最早外发时间（未定时为 `null`）；`cancelled_at`：取消时间（未取消为 `null`）
-- `status`：`unrouted`（没有任何地址订该类型）、`pending`（至少一份活跃副本未投完）、`delivered`（全部活跃副本已收到传输层 2xx，但不一定已对上回执）、`cancelled`（未打出前已取消，剩余副本永不再投）、`superseded`（所有副本都因地址换位置而被取代，没有一份打出去，也不补投）、`dead_lettered`（所有活跃副本都已进死信处、且没有还在排队或投递中的副本；其中任一份被人工复活即回到 `pending`）
+- `status`：`unrouted`（没有任何地址订该类型）、`pending`（至少一份活跃副本未投完）、`delivered`（全部活跃副本已收到传输层 2xx，但不一定已对上回执）、`cancelled`（未打出前已取消，剩余副本永不再投）、`superseded`（所有副本都因地址换位置而被取代，没有一份打出去，也不补投）、`filtered`（有已确认订户，但每一家自己的订阅条件都没对上这条正文：一份副本都没生成，逐家判定见 trace 的 `filter_evaluations`；它不是 `unrouted`，也不会写成已发）、`dead_lettered`（所有活跃副本都已进死信处、且没有还在排队或投递中的副本；其中任一份被人工复活即回到 `pending`）
 - `reconcile_status`：`pending`（还没有副本认）、`partially_acknowledged`（只认够一部分、尚未达到这笔的认完门槛）、`acknowledged`（当真副本认够了这笔的 `required_ack_count`——无门槛类型即所有订阅地址的副本都认了）
 - `ack_threshold`：该事件类型**当前**配置的认完门槛（没定为 `null`）；`required_ack_count`：这笔在入库时快照下来的需要认的当真份数（定了门槛取门槛与当真订户数的较小值，没定等于扇出的当真份数）；`acknowledged_quorum`：是否已经认够（一旦为 true 不会再变回去）
 - `delivery_count` / `delivered_count`：**当真**扇出副本总数 / 已投妥数
+- `filtered_out_count` / `shadow_filtered_out_count`：已确认订户中，**自家订阅条件没对上这条正文因而没拿到副本**的当真 / 影子地址数（一份副本都没给它们；判定明细见 trace 的 `filter_evaluations`）。这让"这家条件没对上"与 `unrouted`（压根没人订）始终区分得开
 - `shadow_delivery_count` / `shadow_delivered_count`：只跟着看（`observe_only`）的副本总数 / 已投妥数；另有 `shadow_acknowledged_count` / `shadow_unacknowledged_count` / `shadow_pending_count` / `shadow_dead_lettered_count`。影子副本的任何结果都不改变下面的整笔状态
 - `acknowledged_count` / `unacknowledged_count`：已对上成功回执的**当真**份数 / 还没对上的**当真**份数
 - `duplicate`：是否命中去重并返回已有事件
@@ -571,7 +637,7 @@ curl -s http://localhost:8000/v1/events/<correction_event_id>/trace
 curl -s http://localhost:8000/v1/events/<event_id>/trace
 ```
 
-返回事件当前传输状态和整笔对账状态（`reconcile_status`，以及已认/未认数量）、每个地址的副本（`deliveries`：状态、序号、已尝试次数、下次尝试时间、最近错误、对账状态 `reconcile_state`、对账时限 `reconcile_deadline`、回执结果 `receipt_result`、连续失败次数与死信原因/进入时间，以及 `observe_only` 是否只跟着看）、全部投递尝试（`attempts`：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息；若某次调用是在租约丢失后返回的，会带 `lost_lease: true`）和该事件命中的回执（`receipts`）。部分地址已认时，整笔是 `partially_acknowledged`，不会写成已认完；逐个查看副本即可知道谁认了、谁还没认——其中 `observe_only: true` 的副本只是跟着看：它认了不会让整笔变 `acknowledged`，它没认/超时/进死信也不会把已经认完的整笔拖回去（影子计数单列在 `shadow_*` 字段）。没人订的事件在这里能看到 `status: "unrouted"` 且 `deliveries` 为空——是明确的“没送出去”，不是成功。所有活动副本都进了死信处、且没有还在排队/投递中的副本时，事件整体 `status` 为 `dead_lettered`。轨迹里另有 `corrections` 段，列出这笔事件名下的全部更正（每笔更正都是一个带 `corrects_event_id` 的普通事件响应，可再用它自己的 `/trace` 追查）；没有更正时为空列表——没人订或没打出去过的事件永远查不到更正，不会写成已经发出去。
+返回事件当前传输状态和整笔对账状态（`reconcile_status`，以及已认/未认数量）、每个地址的副本（`deliveries`：状态、序号、已尝试次数、下次尝试时间、最近错误、对账状态 `reconcile_state`、对账时限 `reconcile_deadline`、回执结果 `receipt_result`、连续失败次数与死信原因/进入时间，以及 `observe_only` 是否只跟着看、`filter_spec` 这份副本出生时命中的订阅条件快照）、全部投递尝试（`attempts`：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息；若某次调用是在租约丢失后返回的，会带 `lost_lease: true`）和该事件命中的回执（`receipts`）。`filter_evaluations` 段逐地址列出订阅条件判定（`matched`、条件快照、是否影子）：`matched=false` 的行就是"这家自己的条件没对上所以没拿到"，与压根没人订（`unrouted`、`deliveries` 与本段都为空）一眼分得开。部分地址已认时，整笔是 `partially_acknowledged`，不会写成已认完；逐个查看副本即可知道谁认了、谁还没认——其中 `observe_only: true` 的副本只是跟着看：它认了不会让整笔变 `acknowledged`，它没认/超时/进死信也不会把已经认完的整笔拖回去（影子计数单列在 `shadow_*` 字段）。没人订的事件在这里能看到 `status: "unrouted"` 且 `deliveries` 为空——是明确的“没送出去”，不是成功；有订户但条件全没对上的事件则是 `status: "filtered"` 且 `filter_evaluations` 里每家一条 `matched=false`。所有活动副本都进了死信处、且没有还在排队/投递中的副本时，事件整体 `status` 为 `dead_lettered`。轨迹里另有 `corrections` 段，列出这笔事件名下的全部更正（每笔更正都是一个带 `corrects_event_id` 的普通事件响应，可再用它自己的 `/trace` 追查；更正也有自己的 `filter_evaluations`——用更正正文对当前条件重判的结果）；没有更正时为空列表——没人订或没打出去过的事件永远查不到更正，不会写成已经发出去。
 
 ### 回执接入（接收方回调）
 
@@ -763,13 +829,14 @@ python3 scripts/mock_receiver.py --port 9000 \
 ## 数据表概览
 
 - `event_sources`：登记的外部事件来源、状态（`disabled_at` 为空即启用）、当前签名密钥与最近换钥时间。密钥只在登记/换钥的响应里明文出现一次。
-- `ingestion_attempts`：入口准入日志，每次事件推送一行（含全部被拒的），带处置结果（`accepted` / `unrouted` / `pending_confirmation` / `duplicate` / `source_unknown` / `source_disabled` / `bad_signature` / `stale_timestamp` / `future_timestamp` / `invalid_timestamp` / `invalid_body`）、发送时间、拒因；被拒记录没有 `event_id`，不会在任何轨迹里显示成已收/已发。`pending_confirmation` 的事件有 `event_id`（确实收下了），但当时没有生成任何副本。
+- `ingestion_attempts`：入口准入日志，每次事件推送一行（含全部被拒的），带处置结果（`accepted` / `unrouted` / `pending_confirmation` / `filtered` / `duplicate` / `source_unknown` / `source_disabled` / `bad_signature` / `stale_timestamp` / `future_timestamp` / `invalid_timestamp` / `invalid_body`）、发送时间、拒因；被拒记录没有 `event_id`，不会在任何轨迹里显示成已收/已发。`pending_confirmation` 的事件有 `event_id`（确实收下了），但当时没有生成任何副本。
 - `events`：事件本体（来源 `source_id`、类型、去重键、负载、最早外发时间 `not_before`、取消时间 `cancelled_at`，以及入库时快照的认完门槛 `required_ack_count`：无门槛类型等于扇出的当真份数，定了门槛取门槛与当真订户数的较小值，只有影子订户/无人订阅时为 0；老事件该列为 NULL，按"现存每一份当真副本都认"处理；gated 类型另有 `preview_payload`：预告里允许露出的短文本，真正负载仍只在 `payload` 里随正文走），一条事件一行，与地址无关。**更正也是一行事件**：`corrects_event_id` 指向被更正的那笔（普通事件该列为 NULL），它有自己的去重键和副本，原来那笔的行不会被改写。
 - `event_type_ack_thresholds`：按事件类型配置的认完门槛（每个类型至多一行，`ack_threshold >= 1`）。改/删只影响之后入库的事件；事件自己的要求以 `events.required_ack_count` 的快照为准。
 - `event_type_preview_policies`：按事件类型开启的"预告+点头才给正文"策略（每类型至多一行，`consent_timeout_seconds >= 1`）。时限在事件入库时快照到该事件的每份副本（`deliveries.consent_timeout_seconds`）；改/删只影响之后入库的事件。
 - `release_gate_decisions`：预告决定（点头/不要）的审计表，一行对应一次回调，带决定、处置（`released`/`denied`/`duplicate`/`conflict`/`late_ignored`/`preview_not_delivered`/`orphan`）、关联的事件/地址/正文副本和原因。每扇闸门至多一行有效决定（对非空 `delivery_id` 的唯一部分索引），重复点头只产生 `duplicate` 审计行，不二次放行。
-- `destination_subscriptions`：地址订阅的事件类型集合。
-- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled` / `superseded` / `dead_lettered` / `failed`——`failed` 只出现在更正副本上：外发失败一次即终态，不原地重试、不计地址连续失败、不挡后续副本；`release_denied` / `release_expired` / `release_voided` 只出现在 gated 事件的正文副本上：地址回了不要、预告过点没点头、或人工作废/预告没发成——均为终态、正文从未出门）、下次尝试时间、最早外发时间 `not_before`、租约信息、对账状态（`reconcile_state`、对账时限、回执结果、重投次数）、**确认代号 `confirmation_generation`**、**只跟着看快照 `observe_only`（扇出时从地址复制；为 true 的副本照常外发/重试/隔离/死信/对账，但其回执结果从不改变整笔事件的 `reconcile_status`/传输状态，也不进事件级重投名单）**、**预告闸门（`phase='preview'` 为预告、`'body'` 为正文；正文的 `release_state` 为 `held`/`released`/`release_denied`/`release_expired`/`release_voided`，`preview_delivery_id`/`body_delivery_id` 互指同一对，`consent_deadline` 在预告真正投妥时写入、`consent_timeout_seconds` 是该事件快照的点头时限，`released_at`/`voided_at`/`void_reason` 记录放行/作废）** 和**死信信息（连续传输失败次数 `consecutive_failures`、死信原因 `dead_letter_reason`、进入时间 `dead_lettered_at`；原因取值为传输失败耗尽 `delivery_attempts_exhausted`、回执超时耗尽 `receipt_timeout_exhausted`、失败回执耗尽 `receipt_failure_exhausted`）**（换位置后老代号排队副本置 `superseded`，领取闸门也会挡住老代号副本）；Worker 只消费这张表且只领取 `pending`/`in_flight`、并且 gated 正文还要 `release_state='released'`，死信与 release 终态副本永不自动外发、也不挡后续副本。
+- `destination_subscriptions`：地址订阅的事件类型集合；`filter_spec`（JSONB，可空）是该"地址×类型"的订阅条件——只有事件正文对得上才扇出，空表示该类型照收；条件只在入库扇出时读取（之后改只影响下一条事件）。
+- `subscription_filter_evaluations`：订阅条件判定记录，每次入库/更正扇出时，每个已确认且挂了条件的订户一行（更正判定挂在更正事件上），含 `matched`、判定时的**条件快照**与 `observe_only`。`matched=false` 就是"这家自己的条件没对上所以没拿到"——没有任何副本、不发出，但与压根没人订（`unrouted`）是明确不同的两种记录；`(event_id, destination_id)` 唯一，同一份正文对同一条件只判一次。
+- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled` / `superseded` / `dead_lettered` / `failed`——`failed` 只出现在更正副本上：外发失败一次即终态，不原地重试、不计地址连续失败、不挡后续副本；`release_denied` / `release_expired` / `release_voided` 只出现在 gated 事件的正文副本上：地址回了不要、预告过点没点头、或人工作废/预告没发成——均为终态、正文从未出门）、下次尝试时间、最早外发时间 `not_before`、租约信息、对账状态（`reconcile_state`、对账时限、回执结果、重投次数）、**确认代号 `confirmation_generation`**、**只跟着看快照 `observe_only`（扇出时从地址复制；为 true 的副本照常外发/重试/隔离/死信/对账，但其回执结果从不改变整笔事件的 `reconcile_status`/传输状态，也不进事件级重投名单）**、**订阅条件快照 `filter_spec`（扇出时从 `destination_subscriptions` 复制；空表示该订阅无条件；非空表示这份正文当时对得上这条条件才生成副本——对不上的根本不会有这行，判定留痕在 `subscription_filter_evaluations`）**、**预告闸门（`phase='preview'` 为预告、`'body'` 为正文；正文的 `release_state` 为 `held`/`released`/`release_denied`/`release_expired`/`release_voided`，`preview_delivery_id`/`body_delivery_id` 互指同一对，`consent_deadline` 在预告真正投妥时写入、`consent_timeout_seconds` 是该事件快照的点头时限，`released_at`/`voided_at`/`void_reason` 记录放行/作废）** 和**死信信息（连续传输失败次数 `consecutive_failures`、死信原因 `dead_letter_reason`、进入时间 `dead_lettered_at`；原因取值为传输失败耗尽 `delivery_attempts_exhausted`、回执超时耗尽 `receipt_timeout_exhausted`、失败回执耗尽 `receipt_failure_exhausted`）**（换位置后老代号排队副本置 `superseded`，领取闸门也会挡住老代号副本）；Worker 只消费这张表且只领取 `pending`/`in_flight`、并且 gated 正文还要 `release_state='released'`，死信与 release 终态副本永不自动外发、也不挡后续副本。
 - `delivery_attempts`：每次 HTTP 投递尝试的审计轨迹（关联事件与副本）。
 - `confirmation_attempts`：上线握手轨迹，一行对应一次确认探测（`challenge`）、应答（`echo`，含回错的 `invalid`）或轮次过期（`expired`），带轮次号、HTTP 状态码、响应片段或错误信息。
 - `receipts`：接收方回执日志，一条回执一行，含处置结果（`applied`/`duplicate`/`late`/`orphan`/`premature`）与匹配到的副本；重复、迟到、查无副本的回执都留在这里可查。

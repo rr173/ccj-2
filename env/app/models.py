@@ -199,6 +199,13 @@ SCHEMA_STATEMENTS = [
         -- event's acknowledgement standing, are targeted by event-level
         -- requeue, or are counted among the event's for-real copies.
         observe_only BOOLEAN NOT NULL DEFAULT FALSE,
+        -- Snapshot of the subscription condition this copy was fanned out
+        -- under (destination_subscriptions.filter_spec at fan-out). NULL means
+        -- the subscription had no condition, so every body was delivered; a
+        -- non-null condition matched the body (a non-matching body creates no
+        -- row at all — see subscription_filter_evaluations). The snapshot is
+        -- never rewritten, so later condition edits only affect later events.
+        filter_spec JSONB,
         -- Preview-consent gate ("预告 + 点头才给正文"). Gated events fan out
         -- into two copies per subscriber: phase 'preview' (the notice, queued
         -- first, no real payload, no receipt reconciliation) and phase 'body'
@@ -476,6 +483,10 @@ SCHEMA_STATEMENTS = [
             'accepted',
             'unrouted',
             'pending_confirmation',
+            -- accepted/stored, but every confirmed subscriber's own
+            -- subscription condition withheld its copy (no deliveries); the
+            -- per-address judgements are in subscription_filter_evaluations.
+            'filtered',
             'duplicate',
             'source_unknown',
             'source_disabled',
@@ -507,8 +518,55 @@ SCHEMA_STATEMENTS = [
         destination_id UUID NOT NULL REFERENCES destinations(id) ON DELETE CASCADE,
         event_type TEXT NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        -- Optional per-(destination, event type) condition over the event
+        -- body. NULL means "receive every event of this type"; a non-null
+        -- condition is evaluated once at ingest against the exact body, and a
+        -- non-matching body creates no delivery at all (its outcome is
+        -- recorded in subscription_filter_evaluations). Conditions are
+        -- evaluated at fan-out time, so replacing one here only ever affects
+        -- later events; copies already fanned out keep the snapshot on the
+        -- delivery row (deliveries.filter_spec).
+        filter_spec JSONB,
         PRIMARY KEY (destination_id, event_type)
     )
+    """,
+    # One row per fan-out evaluation of a destination's own subscription
+    # condition (only rows for subscriptions that actually carry a condition
+    # appear here). matched=true: the condition held and a delivery was
+    # created; matched=false: the body did not satisfy THIS destination's own
+    # condition, so no delivery was created and nothing was sent to it. This
+    # is deliberately separate from an event being "unrouted" (nobody
+    # subscribes at all) and from "pending confirmation" (the subscriber has
+    # not finished the handshake; the condition is not even evaluated). The
+    # exact condition is snapshotted, so re-inspecting the row shows precisely
+    # what was judged; the pure evaluator gives the same answer again.
+    """
+    CREATE TABLE IF NOT EXISTS subscription_filter_evaluations (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        event_id UUID NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        destination_id UUID NOT NULL REFERENCES destinations(id) ON DELETE CASCADE,
+        event_type TEXT NOT NULL,
+        matched BOOLEAN NOT NULL,
+        filter_spec JSONB NOT NULL,
+        observe_only BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        -- At most one judgement per (event, destination): the same body is
+        -- evaluated exactly once against the same condition snapshot.
+        UNIQUE (event_id, destination_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS subscription_filter_evaluations_event_idx
+        ON subscription_filter_evaluations (event_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS subscription_filter_evaluations_destination_idx
+        ON subscription_filter_evaluations (destination_id, created_at DESC, id DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS subscription_filter_evaluations_unmatched_idx
+        ON subscription_filter_evaluations (created_at DESC, id DESC)
+        WHERE matched = FALSE
     """,
     """
     CREATE TABLE IF NOT EXISTS delivery_attempts (
@@ -717,7 +775,7 @@ SCHEMA_STATEMENTS = [
     """
     ALTER TABLE ingestion_attempts ADD CONSTRAINT ingestion_attempts_disposition_check
         CHECK (disposition IN (
-            'accepted', 'unrouted', 'pending_confirmation', 'duplicate',
+            'accepted', 'unrouted', 'pending_confirmation', 'filtered', 'duplicate',
             'source_unknown', 'source_disabled', 'bad_signature',
             'stale_timestamp', 'future_timestamp', 'invalid_timestamp',
             'invalid_body'
@@ -792,7 +850,31 @@ SCHEMA_STATEMENTS = [
     ALTER TABLE events ADD CONSTRAINT events_required_ack_count_check
         CHECK (required_ack_count IS NULL OR required_ack_count >= 0)
     """,
-    # Idempotent upgrades for operator-marked "not receiving" windows. The
+    # Idempotent upgrades for per-destination, per-event-type subscription
+    # filters ("订阅条件"). A subscription may carry a JSON condition over the
+    # event body: at fan-out the condition is evaluated once by a pure
+    # evaluator, a matching body is fanned out (with the condition snapshotted
+    # onto deliveries.filter_spec) and a non-matching body creates no delivery
+    # at all — its judgement is recorded in
+    # subscription_filter_evaluations, so it never reads as "sent" and stays
+    # distinct from an event with no subscribers ('unrouted'). Existing
+    # subscriptions have no condition (NULL) and behave exactly as before.
+    "ALTER TABLE destination_subscriptions ADD COLUMN IF NOT EXISTS filter_spec JSONB",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS filter_spec JSONB",
+    "ALTER TABLE subscription_filter_evaluations ADD COLUMN IF NOT EXISTS observe_only BOOLEAN NOT NULL DEFAULT FALSE",
+    # Widen the ingestion disposition check to include 'filtered': accepted
+    # and stored, but every confirmed subscriber's own subscription condition
+    # withheld its copy.
+    "ALTER TABLE ingestion_attempts DROP CONSTRAINT IF EXISTS ingestion_attempts_disposition_check",
+    """
+    ALTER TABLE ingestion_attempts ADD CONSTRAINT ingestion_attempts_disposition_check
+        CHECK (disposition IN (
+            'accepted', 'unrouted', 'pending_confirmation', 'filtered', 'duplicate',
+            'source_unknown', 'source_disabled', 'bad_signature',
+            'stale_timestamp', 'future_timestamp', 'invalid_timestamp',
+            'invalid_body'
+        ))
+    """,
     # window is a claim-time gate only: while it is in effect the destination
     # is never picked, its copies keep their queue positions, nothing is
     # attempted (nothing counts toward failure isolation) and no reconcile
