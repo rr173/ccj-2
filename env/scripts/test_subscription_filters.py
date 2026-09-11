@@ -593,6 +593,41 @@ check("global evaluations endpoint lists the withheld judgement",
       len(rows) == 1 and rows[0]["destination_id"] == ONLY
       and rows[0]["observe_only"] is False, rows)
 
+# The WHOLE list (no matched filter at all) must return every judgement for
+# the event — passed AND withheld — and must never come back empty just
+# because the boolean parameter is omitted. The withheld rows found with
+# matched=false must be present in the unfiltered pull too.
+mixed_event = e_hw  # DHIGH matched, DEAST withheld, DSHADOW matched
+whole = client.get(
+    "/v1/filter-evaluations", params={"event_id": mixed_event}
+).json()
+withheld = client.get(
+    "/v1/filter-evaluations",
+    params={"event_id": mixed_event, "matched": False},
+).json()
+passed = client.get(
+    "/v1/filter-evaluations",
+    params={"event_id": mixed_event, "matched": True},
+).json()
+whole_ids = {row["id"] for row in whole}
+check(
+    "whole unfiltered list is non-empty and equals passed + withheld",
+    len(whole) >= 2
+    and len(whole) == len(passed) + len(withheld)
+    and {row["id"] for row in withheld} <= whole_ids,
+    {
+        "whole": len(whole),
+        "passed": len(passed),
+        "withheld": len(withheld),
+    },
+)
+check(
+    "the withheld address found with matched=false is in the whole list",
+    any(row["destination_id"] == DEAST and row["matched"] is False
+        for row in whole),
+    [(row["destination_id"][:8], row["matched"]) for row in whole],
+)
+
 # ===========================================================================
 # Gated type: a withheld subscriber gets neither preview nor body.
 # ===========================================================================

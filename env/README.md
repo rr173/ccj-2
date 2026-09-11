@@ -200,7 +200,7 @@
     - `outcome = "unsubscribed"`：现在已不订这个类型。每行还带当前订阅条件 `filter_spec`、当前是否仍订阅 `subscribed`、是否影子 `observe_only`、正文副本状态 `body_status`。
   - trace 另有 `filter_evaluations` 段，逐地址列出原始判定（`matched`、条件快照、是否影子）；每份真实副本也带自己的 `filter_spec` 快照。
   - 事件响应/汇总新增当真/影子被条件挡住的计数 `filtered_out_count` / `shadow_filtered_out_count`。
-  - 全局可查：`GET /v1/filter-evaluations?event_id=...&destination_id=...&matched=false&event_type=...`。
+  - 全局可查：`GET /v1/filter-evaluations?event_id=...&destination_id=...&matched=false&event_type=...`。**不加任何筛选（尤其不带 `matched`）时返回这一笔的整份名单——对上的和没对上的都在里面**；`matched=false` 只是把名单收窄到没对上的，绝不是"整份名单只有带筛选才查得到"。trace 里的 `routing` 段同理，每个相关地址一行。
   - **与"压根没人订"明确区分**：所有已确认订户的条件都不满足时，事件照收照存，传输状态是 `filtered`，准入记录 disposition 也是 `filtered`；没有任何订户的类型仍是 `unrouted`（trace 的 `routing` 段为空）。两种都没有副本、都不会写成已发，但任何查询都不会把它们混成一种。
 - **预告放行（gated）类型同样适用**：条件不成立时连预告都不生成（预告本身也会暴露"有这么一件事"）；该地址点头/不要接口对它返回 `orphan`。
 - **更正（correction）按更正自己的正文、用当前条件重判**：更正扇出名单原本是"原事件真正投妥过的地址"，现在还要用**更正自己的正文**对每个地址**当前**的条件再判一次；对不上的地址不补，判定同样落 `subscription_filter_evaluations`（挂在更正这笔事件上）。所有候选地址都被挡住时更正返回 409、什么都不创建，也不占用 `dedupe_key`（之后内容对得上还能用同一个键提交）。

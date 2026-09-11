@@ -1881,10 +1881,15 @@ def list_filter_evaluations(
     limit: int = Query(default=100, ge=1, le=1000),
     db: Session = Depends(get_db),
 ):
-    # Audit trail of subscription-condition judgements. Filter
-    # matched=false&destination_id=... to answer "why did this address not get
-    # this one"; each row carries the exact condition snapshot that was
-    # judged, so the outcome never collapses into "nobody subscribed".
+    # Audit trail of subscription-condition judgements. Pulled WITHOUT a
+    # matched filter it must return the WHOLE list (both passed and withheld
+    # rows for the event): note the explicit CAST(:matched AS BOOLEAN) —
+    # sending an untyped NULL parameter into "matched = :matched" makes
+    # Postgres fail with "could not determine data type of parameter", which
+    # previously masqueraded as an empty list. Filter matched=false /
+    # destination_id=... to answer "why did this address not get this one";
+    # each row carries the exact condition snapshot judged, so the outcome
+    # never collapses into "nobody subscribed".
     try:
         return db.execute(
             text(
@@ -1896,7 +1901,8 @@ def list_filter_evaluations(
                        OR event_id = CAST(:event_id AS UUID))
                   AND (CAST(:destination_id AS UUID) IS NULL
                        OR destination_id = CAST(:destination_id AS UUID))
-                  AND (:matched IS NULL OR matched = :matched)
+                  AND (CAST(:matched AS BOOLEAN) IS NULL
+                       OR matched = CAST(:matched AS BOOLEAN))
                   AND (CAST(:event_type AS TEXT) IS NULL
                        OR event_type = CAST(:event_type AS TEXT))
                 ORDER BY created_at DESC, id DESC
@@ -1911,9 +1917,11 @@ def list_filter_evaluations(
                 "limit": limit,
             },
         ).mappings().all()
-    except Exception:
-        # Pre-filter-feature database without the table: report an empty
-        # audit trail rather than failing the query.
+    except SQLAlchemyError:
+        # Only a genuine missing table on a pre-filter-feature database
+        # degrades to an empty audit trail; any other query error must not be
+        # silently turned into an empty whole-list answer (that previously hid
+        # the untyped-NULL parameter bug).
         db.rollback()
         logger.warning(
             "subscription-filter evaluations table unavailable; "
