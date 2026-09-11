@@ -29,6 +29,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.config import settings
 from app.db import SessionLocal, build_engine
 from app.models import init_db
+from app import release as release_gate
 
 logger = logging.getLogger("reconciler")
 
@@ -66,20 +67,39 @@ SWEEP_SQL = text(
 )
 
 
+def void_expired_gates(db) -> int:
+    """Void gated bodies whose preview landed but whose address never nodded
+    before the agreed deadline.
+
+    The voided body is terminal ('release_expired') and never goes out; the
+    already-delivered preview is deliberately left alone. A nod arriving after
+    the deadline is judged ``late_ignored`` by the consent endpoint (which
+    checks the deadline authoritatively) and can never revive the body.
+    """
+    return release_gate.sweep_expired_gates(db)
+
+
 def sweep_once() -> tuple[int, int]:
-    """Sweep overdue awaiting deliveries.
+    """Sweep overdue awaiting deliveries and expired preview gates.
 
     Returns ``(timed_out_count, dead_lettered_count)``: copies still within
     their requeue budget are simply marked timed out; copies whose requeue
     cycles are exhausted are moved to the dead-letter area.
     """
     db = SessionLocal()
+    expired_gates = 0
     try:
+        expired_gates = void_expired_gates(db)
         row = db.execute(
             SWEEP_SQL,
             {"max_requeue_cycles": settings.max_requeue_cycles},
         ).mappings().one()
         db.commit()
+        if expired_gates:
+            logger.info(
+                "voided %s gated bodies whose address did not nod in time",
+                expired_gates,
+            )
         return row["timed_out"], row["dead_lettered"]
     except SQLAlchemyError:
         db.rollback()

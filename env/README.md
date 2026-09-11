@@ -123,12 +123,45 @@
 
 更正本身是一笔普通事件：可以用 `/v1/events/{更正id}/trace` 查它自己的投递轨迹与整笔对账状态；它的副本照常过确认闸门、停收窗口、回执对账、超时/失败回执重投与死信规则（只有传输层失败不同——见上，直接 `failed` 不原地重试）。原来那笔的轨迹（`GET /v1/events/{event_id}/trace`）里新增 `corrections` 段，列出它名下的全部更正；投递给接收方的更正请求会带头 `X-Corrects-Event-Id` 和 body 字段 `corrects_event_id`，接收方可以据此把它和原来那笔关联起来。
 
+### 1.5 某类事件先给预告、地址点头才给正文（preview-consent gate）
+
+某些事件类型可以设成**预告放行**模式：这种类型的事件不再一份正文直投，而是给每个已确认订户**两份**消息，按该地址自己的 FIFO 顺序先后走：
+
+1. **预告（preview）**：先排先发。它不带业务正文（`payload` 为空），只有提交时给的可选 `preview_payload` 摘要和点头时限；它像普通副本一样外发、重试、隔离、进死信，但**不进回执对账**。
+2. **正文（body）**：紧跟在预告后面排队，落地即 `status=pending` 且 `release_state=held`（扣住）。**只有这个地址自己的预告真正投妥、并且它在约定时限内点了头，这份正文才会被放行外发。**
+
+- **开关（按事件类型）**：`PUT /v1/event-types/{event_type}/preview-policy`，body `{"consent_timeout_seconds": 86400}`（可省，省了用默认 `PREVIEW_CONSENT_TIMEOUT_SECONDS_DEFAULT`，86400 秒）；`GET .../preview-policy` 查单个，`GET /v1/event-types/preview-policies` 列全部，`DELETE .../preview-policy` 或 PUT 传 `{"consent_timeout_seconds": null}` 取消（该类型恢复成正文直投）。时限在事件入库成对扇出那一刻**快照到这一对上**，之后改/删策略只影响新事件，老事件按自己快照走。
+- **提交这类事件**：照常 `POST /v1/events`，可多带一个 `preview_payload`（预告里允许露出的短文本；真正内容仍只在 `payload` 里，随正文走）。给**没设预告策略的类型**带 `preview_payload` 会被 422 拒绝，不会悄悄吞掉。
+- **点头 / 不要**：接收方回调（地址 id 用**必填** query 参数，确保只代表它自己）：
+
+  ```bash
+  # 这个地址点头，放它自己那份正文
+  curl -s -X POST 'http://localhost:8000/v1/events/<event_id>/consent?destination_id=<dest>' \
+    -H 'Content-Type: application/json' -d '{"decision":"approve"}'
+  # 这个地址回了不要
+  curl -s -X POST 'http://localhost:8000/v1/events/<event_id>/consent?destination_id=<dest>' \
+    -H 'Content-Type: application/json' -d '{"decision":"deny"}'
+  ```
+
+  返回的 `disposition`：`released`（点头生效，正文可发）/ `denied`（不要生效）/ `duplicate`（同一个答案又来了，只算一次）/ `conflict`（有效答案已存在且与本次相反，不改变任何状态）/ `late_ignored`（已过点或正文已终态，不救活）/ `preview_not_delivered`（预告还没投到这个地址，点了也不放）/ `orphan`（这个地址根本没订/没确认这份 gated 事件）。
+
+- **正文不能比预告先到这个地址**：正文排在该地址队列里预告的后面（序号大 1），且 worker 的领取闸门额外要求 `release_state='released'` 才准领正文；预告没真正 2xx 投妥、或地址没点头，正文一直是 held 的 pending 行，绝不会出网。预告请求带头 `X-Message-Type: event_preview`、body 带 `"message_type":"event_preview"`，接收方应据此和正文区分。
+- **地址对预告回了不要**：它那份正文立即转终态 `release_denied`（`voided_at` 落时间），**永远不再给它**；已经发出去的预告不收回，之后再点头记 `conflict`、不能救活。
+- **预告过了约定点还没点头**：reconciler 周期扫描，把这种 held 正文作废成终态 `release_expired`。可以明确查到**是哪个地址没点**（`GET /v1/release-gates?release_state=release_expired` 或按事件 `GET /v1/events/{id}/release-gates`）；它**绝不会被写成"正文已发给它"**——`delivered_at` 为空、事件 `delivered_count` 不含它、事件传输状态可显示为 `release_closed`。**点头来晚了**（作废后才到）记 `late_ignored`，已作废正文不能复活，也不会再外发。
+- **点头只算这个地址自己的**：决定按 `(event_id, destination_id)` 定位正文行并锁行，A 点了只放 A 那份，B 的正文照样 held；拿 B 的地址 id 不能给 A 放行。并发/重复点头在该正文行上串行化，且有效决定对 `release_gate_decisions.delivery_id` 有唯一部分索引——**同一份预告同地址点两次只算一次**。
+- **作废还没出门的正文，预告不用动**：`POST /v1/deliveries/{body_delivery_id}/void-body` 把一份仍 held 的正文置终态 `release_voided`（`void_reason=manual`），它那份预告（无论排队还是已投妥）原样保留，其他地址的正文也不受影响；重复调幂等（返回 `voided:false`）。**已经出门（in_flight/delivered）的正文不能作废**（409）——发出去的收不回。
+- **预告本身没发成**：预告连续传输失败进死信（`preview_dead_lettered`）、或地址换位置导致预告被 `superseded` 时，它那份还没出门的 held 正文**自动连带作废**为 `release_voided`（地址压根没收到预告，绝不能收到正文）；预告正在投时地址换了位置，那次失败按换位置处理并连带作废正文。
+- **没订这类的地址**：与普通事件同一套扇出门槛——没订阅、或订阅了但还没完成上线确认的地址，**预告和正文都不会生成**，它的任何决定只记 `orphan`。
+- **对账与门槛**：只有**正文**副本进回执对账、计入 `delivery_count`/认完门槛；预告是 `phase=preview`，单独可见但永不计入。held/作废中的正文也不算"活跃正文"（与 `superseded` 同样处理）：所有当真正文都没点头/被作废的事件传输状态为 `release_closed`，认完要求按现存活跃正文算。影子（observe_only）地址同样收"预告+正文"两份并自己走闸门，但其结果不计入整笔。
+- **可查**：事件响应/`trace` 里每个副本带 `phase`、`release_state`、`consent_deadline`、`preview_delivery_id`/`body_delivery_id`、`released_at`/`voided_at`/`void_reason`；事件级汇总新增 `preview_gated`、`bodies_waiting_count`、`bodies_released_count`、`bodies_denied_count`、`bodies_expired_count`、`bodies_voided_count` 及对应 `shadow_*`。每一次点头/不要都落 `release_gate_decisions` 审计表，可用 `GET /v1/release-gate-decisions`（按 event/destination/disposition 过滤）查到"谁、什么时候、做了什么决定、怎么被处置"。
+- mock 接收方加 `--ingest-url http://... --preview-decision approve|deny|none` 即可在收到预告时自动回调决定（`none` 可用来观察超时作废）。
+
 ### 2. 同一接收地址严格按进入顺序投递
 
 扇出时，每个地址的副本在该地址行锁内分配 `(destination_id, destination_seq)` 单调递增序号。Worker 每次只选择某地址当前最小的待投递副本，并用 `FOR UPDATE SKIP LOCKED` 锁定该地址：
 
 - 同一个地址同一时刻只会被一个 Worker 线程处理；同一事件的不同地址副本互不等待。
-- Worker 会先检查地址队头：队头投递中、未到下次重试时间、**未到约定外发时间（`not_before`）**、**地址在停收窗口内（见 1.3 节）**或地址隔离时，后续副本不会越过它。
+- Worker 会先检查地址队头：队头投递中、未到下次重试时间、**未到约定外发时间（`not_before`）**、**队头是 gated 事件尚未被放行的正文（`release_state='held'`，此时可领的是排在它前面的预告）**、**地址在停收窗口内（见 1.3 节）**或地址隔离时，后续副本不会越过它。
 - Worker 崩溃时，队头会在租约超时后重新变为待投递，然后继续按序处理。
 - 不同接收地址之间互不阻塞，可以并行投递；一个地址被隔离不影响订了同一类型的其他地址。
 
@@ -354,6 +387,38 @@ curl -s http://localhost:8000/v1/event-types/paid/ack-threshold     # 查单个�
 curl -s http://localhost:8000/v1/event-types/ack-thresholds         # 列全部
 curl -s -X DELETE http://localhost:8000/v1/event-types/paid/ack-threshold  # 取消门槛（恢复"全部当真副本都认"）
 # PUT 传 {"ack_threshold": null} 同样是取消；ack_threshold 必须 >= 1，否则 422
+```
+
+把某类事件改成"先给预告、地址点头才给正文"（preview-consent gate）：
+
+```bash
+# paid 类型开启预告放行：预告投妥后，每个地址有 86400 秒可以点头（时限在事件入库时快照）
+curl -s -X PUT http://localhost:8000/v1/event-types/paid/preview-policy \
+  -H 'Content-Type: application/json' -d '{"consent_timeout_seconds": 86400}'
+curl -s http://localhost:8000/v1/event-types/paid/preview-policy         # 查单个（gated=false 即未开）
+curl -s http://localhost:8000/v1/event-types/preview-policies            # 列全部
+curl -s -X DELETE http://localhost:8000/v1/event-types/paid/preview-policy  # 取消（之后新事件恢复直投）
+```
+
+提交 gated 事件（`preview_payload` 可选；给没开策略的类型带它会 422）：
+
+```bash
+python3 scripts/push_event.py --source-id ... --secret "$SECRET" \
+  --event-type paid --dedupe-key order-1009-paid \
+  --payload '{"order_id":"1009","amount":99}' \
+  --preview-payload '{"teaser":"new paid order 1009"}'
+# 每个订户先收到带头 X-Message-Type: event_preview 的预告（payload 为空），
+# 正文扣住不放（release_state=held），等这个地址自己点头：
+curl -s -X POST 'http://localhost:8000/v1/events/<event_id>/consent?destination_id=<dest>' \
+  -H 'Content-Type: application/json' -d '{"decision":"approve"}'   # disposition=released 后正文才发
+# 这个地址回"不要" -> disposition=denied，它那份正文转 release_denied 永不发送（已发预告不收回）
+#   ... -d '{"decision":"deny"}'
+# 查谁没点头 / 每份正文状态：
+curl -s http://localhost:8000/v1/events/<event_id>/release-gates
+curl -s 'http://localhost:8000/v1/release-gates?status=release_expired'
+curl -s 'http://localhost:8000/v1/release-gate-decisions?event_id=<event_id>'
+# 人工作废一份还没出门的正文（已 in_flight/delivered 的 409，发出去的收不回）：
+curl -s -X POST http://localhost:8000/v1/deliveries/<body_delivery_id>/void-body
 ```
 
 返回示例（新地址**还没对上确认**，不会收到任何事件；字段以 `confirmation_` 开头）：
@@ -693,15 +758,18 @@ python3 scripts/mock_receiver.py --port 9000 \
 | `CONFIRM_BACKOFF_MAX_SECONDS` | `60` | 确认探测重试退避上限 |
 | `CONFIRM_POLL_INTERVAL_SECONDS` | `1` | confirmer 线程没有待确认地址时的轮询间隔 |
 | `CONFIRMATION_ENABLED` | `true` | worker 进程内是否运行发确认探测的 confirmer 线程；多 worker 副本时只保留一个为 true |
+| `PREVIEW_CONSENT_TIMEOUT_SECONDS_DEFAULT` | `86400` | 开启"预告+点头"策略时未显式给时限的兜底点头时限；从预告真正投妥那一刻起算 |
 
 ## 数据表概览
 
 - `event_sources`：登记的外部事件来源、状态（`disabled_at` 为空即启用）、当前签名密钥与最近换钥时间。密钥只在登记/换钥的响应里明文出现一次。
 - `ingestion_attempts`：入口准入日志，每次事件推送一行（含全部被拒的），带处置结果（`accepted` / `unrouted` / `pending_confirmation` / `duplicate` / `source_unknown` / `source_disabled` / `bad_signature` / `stale_timestamp` / `future_timestamp` / `invalid_timestamp` / `invalid_body`）、发送时间、拒因；被拒记录没有 `event_id`，不会在任何轨迹里显示成已收/已发。`pending_confirmation` 的事件有 `event_id`（确实收下了），但当时没有生成任何副本。
-- `events`：事件本体（来源 `source_id`、类型、去重键、负载、最早外发时间 `not_before`、取消时间 `cancelled_at`，以及入库时快照的认完门槛 `required_ack_count`：无门槛类型等于扇出的当真份数，定了门槛取门槛与当真订户数的较小值，只有影子订户/无人订阅时为 0；老事件该列为 NULL，按"现存每一份当真副本都认"处理），一条事件一行，与地址无关。**更正也是一行事件**：`corrects_event_id` 指向被更正的那笔（普通事件该列为 NULL），它有自己的去重键和副本，原来那笔的行不会被改写。
+- `events`：事件本体（来源 `source_id`、类型、去重键、负载、最早外发时间 `not_before`、取消时间 `cancelled_at`，以及入库时快照的认完门槛 `required_ack_count`：无门槛类型等于扇出的当真份数，定了门槛取门槛与当真订户数的较小值，只有影子订户/无人订阅时为 0；老事件该列为 NULL，按"现存每一份当真副本都认"处理；gated 类型另有 `preview_payload`：预告里允许露出的短文本，真正负载仍只在 `payload` 里随正文走），一条事件一行，与地址无关。**更正也是一行事件**：`corrects_event_id` 指向被更正的那笔（普通事件该列为 NULL），它有自己的去重键和副本，原来那笔的行不会被改写。
 - `event_type_ack_thresholds`：按事件类型配置的认完门槛（每个类型至多一行，`ack_threshold >= 1`）。改/删只影响之后入库的事件；事件自己的要求以 `events.required_ack_count` 的快照为准。
+- `event_type_preview_policies`：按事件类型开启的"预告+点头才给正文"策略（每类型至多一行，`consent_timeout_seconds >= 1`）。时限在事件入库时快照到该事件的每份副本（`deliveries.consent_timeout_seconds`）；改/删只影响之后入库的事件。
+- `release_gate_decisions`：预告决定（点头/不要）的审计表，一行对应一次回调，带决定、处置（`released`/`denied`/`duplicate`/`conflict`/`late_ignored`/`preview_not_delivered`/`orphan`）、关联的事件/地址/正文副本和原因。每扇闸门至多一行有效决定（对非空 `delivery_id` 的唯一部分索引），重复点头只产生 `duplicate` 审计行，不二次放行。
 - `destination_subscriptions`：地址订阅的事件类型集合。
-- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled` / `superseded` / `dead_lettered` / `failed`——`failed` 只出现在更正副本上：外发失败一次即终态，不原地重试、不计地址连续失败、不挡后续副本）、下次尝试时间、最早外发时间 `not_before`、租约信息、对账状态（`reconcile_state`、对账时限、回执结果、重投次数）、**确认代号 `confirmation_generation`**、**只跟着看快照 `observe_only`（扇出时从地址复制；为 true 的副本照常外发/重试/隔离/死信/对账，但其回执结果从不改变整笔事件的 `reconcile_status`/传输状态，也不进事件级重投名单）** 和**死信信息（连续传输失败次数 `consecutive_failures`、死信原因 `dead_letter_reason`、进入时间 `dead_lettered_at`；原因取值为传输失败耗尽 `delivery_attempts_exhausted`、回执超时耗尽 `receipt_timeout_exhausted`、失败回执耗尽 `receipt_failure_exhausted`）**（换位置后老代号排队副本置 `superseded`，领取闸门也会挡住老代号副本）；Worker 只消费这张表且只领取 `pending`/`in_flight`，死信副本永不自动外发、也不挡后续副本。
+- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled` / `superseded` / `dead_lettered` / `failed`——`failed` 只出现在更正副本上：外发失败一次即终态，不原地重试、不计地址连续失败、不挡后续副本；`release_denied` / `release_expired` / `release_voided` 只出现在 gated 事件的正文副本上：地址回了不要、预告过点没点头、或人工作废/预告没发成——均为终态、正文从未出门）、下次尝试时间、最早外发时间 `not_before`、租约信息、对账状态（`reconcile_state`、对账时限、回执结果、重投次数）、**确认代号 `confirmation_generation`**、**只跟着看快照 `observe_only`（扇出时从地址复制；为 true 的副本照常外发/重试/隔离/死信/对账，但其回执结果从不改变整笔事件的 `reconcile_status`/传输状态，也不进事件级重投名单）**、**预告闸门（`phase='preview'` 为预告、`'body'` 为正文；正文的 `release_state` 为 `held`/`released`/`release_denied`/`release_expired`/`release_voided`，`preview_delivery_id`/`body_delivery_id` 互指同一对，`consent_deadline` 在预告真正投妥时写入、`consent_timeout_seconds` 是该事件快照的点头时限，`released_at`/`voided_at`/`void_reason` 记录放行/作废）** 和**死信信息（连续传输失败次数 `consecutive_failures`、死信原因 `dead_letter_reason`、进入时间 `dead_lettered_at`；原因取值为传输失败耗尽 `delivery_attempts_exhausted`、回执超时耗尽 `receipt_timeout_exhausted`、失败回执耗尽 `receipt_failure_exhausted`）**（换位置后老代号排队副本置 `superseded`，领取闸门也会挡住老代号副本）；Worker 只消费这张表且只领取 `pending`/`in_flight`、并且 gated 正文还要 `release_state='released'`，死信与 release 终态副本永不自动外发、也不挡后续副本。
 - `delivery_attempts`：每次 HTTP 投递尝试的审计轨迹（关联事件与副本）。
 - `confirmation_attempts`：上线握手轨迹，一行对应一次确认探测（`challenge`）、应答（`echo`，含回错的 `invalid`）或轮次过期（`expired`），带轮次号、HTTP 状态码、响应片段或错误信息。
 - `receipts`：接收方回执日志，一条回执一行，含处置结果（`applied`/`duplicate`/`late`/`orphan`/`premature`）与匹配到的副本；重复、迟到、查无副本的回执都留在这里可查。

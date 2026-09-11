@@ -153,6 +153,11 @@ class EventIn(BaseModel):
     # Earliest time the event may be sent out. None means "as soon as its
     # per-destination queue position is reached".
     not_before: datetime | None = None
+    # Only meaningful when the event type is gated (preview-consent). This is
+    # the short text the preview is allowed to show; the real content stays in
+    # payload and only goes out with the body after this address nods. Sending
+    # it for a non-gated type is refused (422) rather than silently dropped.
+    preview_payload: dict[str, Any] | None = None
 
     @field_validator("event_type")
     @classmethod
@@ -258,6 +263,24 @@ class EventOut(BaseModel):
     # soon as the per-destination queue reaches it.
     not_before: datetime | None = None
     cancelled_at: datetime | None = None
+    # Preview-consent gate ("预告 + 点头才给正文"): true when this event's type
+    # is gated. A gated event fans out as a preview/body pair per subscriber;
+    # a body waits for that destination's own nod before its deadline.
+    preview_gated: bool = False
+    preview_payload: dict[str, Any] | None = None
+    # Gated for-real bodies waiting on, released by, or terminally closed by
+    # their destination's preview decision. release_closed counts the bodies
+    # that never went out (denied / expired / voided); they are not pending and
+    # never delivered.
+    bodies_waiting_count: int = 0
+    bodies_released_count: int = 0
+    bodies_denied_count: int = 0
+    bodies_expired_count: int = 0
+    bodies_voided_count: int = 0
+    # The same counters for observe-only ("shadow") subscribers, kept separate.
+    shadow_bodies_waiting_count: int = 0
+    shadow_bodies_released_count: int = 0
+    shadow_bodies_closed_count: int = 0
     created_at: datetime
     duplicate: bool = False
     # Fanned-out copies abandoned because their destination changed location
@@ -332,6 +355,29 @@ class DeliveryOut(BaseModel):
     # delivered and reconciled on its own, but its receipt outcome never
     # changes the whole event's reconcile_status or its for-real counts.
     observe_only: bool = False
+    # Preview-consent gate ("预告 + 点头才给正文"):
+    # preview: the notice queued ahead of the body for a gated event (no real
+    #          payload, no receipt reconciliation);
+    # body:    an ordinary copy, or the content copy of a gated event.
+    phase: str = "body"
+    # Gated body only:
+    # held            — waiting for the preview to land and this address to nod;
+    # released        — this address nodded in time, the body may go out;
+    # release_denied  — this address answered "no"; terminal, never sent;
+    # release_expired — no nod before the deadline; terminal, never sent;
+    # release_voided  — voided manually or because its preview never made it.
+    # Null on ordinary copies and on previews.
+    release_state: str | None = None
+    preview_delivery_id: UUID | None = None
+    body_delivery_id: UUID | None = None
+    # From when the address may decide until when (written when the preview
+    # really completes transport; null while the notice is still queued).
+    consent_deadline: datetime | None = None
+    consent_timeout_seconds: int | None = None
+    released_at: datetime | None = None
+    voided_at: datetime | None = None
+    # manual | preview_dead_lettered | preview_superseded (release_voided).
+    void_reason: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -585,3 +631,81 @@ class AckThresholdOut(BaseModel):
     configured: bool = True
 
     model_config = {"from_attributes": True}
+
+
+# --- Preview-consent gate ("预告 + 点头才给正文") ---------------------------
+
+
+class PreviewPolicyIn(BaseModel):
+    # How long after the preview really reaches the address the address has to
+    # nod before the body is voided. Counted from the preview's delivered
+    # time, never from ingest/queue time; must be at least 1 second. Omitted
+    # falls back to the service default (PREVIEW_CONSENT_TIMEOUT_SECONDS).
+    consent_timeout_seconds: int | None = Field(default=None, ge=1, le=2_147_483_647)
+
+
+class PreviewPolicyOut(BaseModel):
+    event_type: str
+    consent_timeout_seconds: int | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    # False when no policy row exists for the type (clear, or a GET miss):
+    # the type then behaves like an ordinary type, body sent straight away.
+    gated: bool = True
+
+    model_config = {"from_attributes": True}
+
+
+class ConsentIn(BaseModel):
+    # approve ("点头"): release this address's own body when the decision
+    # arrives in time; deny ("不要"): close that body for good. Exactly one
+    # effective decision per (event, destination); a repeated same answer is a
+    # duplicate and an opposite answer a conflict, neither changes anything.
+    decision: Literal["approve", "deny"]
+
+
+class ConsentOut(BaseModel):
+    event_id: UUID
+    destination_id: UUID
+    delivery_id: UUID | None = None
+    # released: the nod applied in time, the body is free to go out;
+    # denied: "不要" applied — the body never goes out;
+    # duplicate: the same answer was already applied once (counted once);
+    # conflict: an opposite answer had already been applied;
+    # late_ignored: arrived after the deadline / after the body was closed —
+    #   recorded but never revives it;
+    # preview_not_delivered: the notice has not reached this address yet;
+    # orphan: no gated body exists for this (event, destination).
+    disposition: str
+    release_state: str | None = None
+
+
+class ReleaseGateOut(DeliveryOut):
+    """A gated body with its preview's state for the gate query endpoint."""
+
+    # Preview ("预告") transport state and when it really landed; null until
+    # the notice completes transport. The consent window only opens then.
+    preview_status: str | None = None
+    preview_delivered_at: datetime | None = None
+    preview_delivery: UUID | None = None
+
+
+class ReleaseGateDecisionOut(BaseModel):
+    id: int
+    destination_id: UUID
+    event_id: UUID | None = None
+    delivery_id: UUID | None = None
+    decision: str
+    disposition: str
+    reason: str | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class BodyVoidOut(BaseModel):
+    delivery_id: UUID
+    # False when the body was already terminally closed (idempotent void).
+    voided: bool
+    status: str
+    release_state: str

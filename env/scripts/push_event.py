@@ -77,6 +77,11 @@ def push(base_url: str, args: argparse.Namespace) -> int:
         "dedupe_key": args.dedupe_key,
         "payload": payload,
     }
+    if args.preview_payload is not None:
+        # Only valid for a gated event type (one with a preview-consent
+        # policy); the real content stays in payload and only goes out with
+        # the body after this address nods.
+        event["preview_payload"] = json.loads(args.preview_payload)
     if args.not_before is not None:
         event["not_before"] = args.not_before
     raw_body = json.dumps(event).encode()
@@ -114,6 +119,11 @@ def main() -> None:
     parser.add_argument("--event-type")
     parser.add_argument("--dedupe-key")
     parser.add_argument("--payload", default="{}")
+    parser.add_argument(
+        "--preview-payload",
+        default=None,
+        help="short text for the preview of a gated event type (JSON)",
+    )
     parser.add_argument("--not_before", "--not-before", dest="not_before", default=None)
     args = parser.parse_args()
 

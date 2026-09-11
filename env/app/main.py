@@ -30,14 +30,19 @@ from app.ingest_auth import (
     parse_event_body,
 )
 from app.models import init_db
+from app import release as release_gate
+from app.config import settings
 from app.receipts import ingest_receipt
 from app.schemas import (
     AckThresholdIn,
     AckThresholdOut,
+    BodyVoidOut,
     BulkRequeueOut,
     ConfirmationAttemptOut,
     ConfirmationIn,
     ConfirmationOut,
+    ConsentIn,
+    ConsentOut,
     CorrectionIn,
     DeadLetterReviveOut,
     DeadLetterSummaryOut,
@@ -53,10 +58,14 @@ from app.schemas import (
     EventRescheduleIn,
     EventTraceOut,
     IngestionAttemptOut,
+    PreviewPolicyIn,
+    PreviewPolicyOut,
     ReceiptIn,
     ReceiptOut,
     ReconciliationSummaryOut,
     RecoveryOut,
+    ReleaseGateDecisionOut,
+    ReleaseGateOut,
     ReissueChallengeOut,
     RequeueOut,
     SourceCreatedOut,
@@ -75,7 +84,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Event Ingest Service",
-    version="2.8.0",
+    version="2.9.0",
     lifespan=lifespan,
 )
 
@@ -126,19 +135,31 @@ def event_status(
     shadow_superseded_count: int = 0,
     failed_count: int = 0,
     shadow_failed_count: int = 0,
+    release_closed_count: int = 0,
+    shadow_release_closed_count: int = 0,
 ) -> str:
     if cancelled_at is not None:
         return "cancelled"
+    # Bodies terminally closed by the preview gate ("no", deadline passed with
+    # no nod, manual/cascading void) never went out: they are excluded from
+    # live_count by the caller. Subtract them from the total elsewhere; here
+    # they simply don't count as pending or delivered.
     if live_count == 0:
         # No for-real live copies: nothing subscribed/confirmed for-real, or
-        # every for-real copy was abandoned because its destination moved.
-        # Shadow-only subscribers must never make an event look fully routed,
-        # so they do not count toward acknowledgement; but the transport
-        # status still says what actually happened to the shadow copies —
+        # every for-real copy was abandoned because its destination moved, or
+        # every gated body was closed before it could go out. Shadow-only
+        # subscribers must never make an event look fully routed, so they do
+        # not count toward acknowledgement; but the transport status still says
+        # what actually happened to the shadow copies —
         # delivered/pending/dead-lettered — instead of "unrouted".
         if shadow_live_count == 0:
             if superseded_count > 0 or shadow_superseded_count > 0:
                 return "superseded"
+            if release_closed_count > 0:
+                # Every for-real gated body was withheld and closed; nothing
+                # was ever sent to any for-real address. This is explicit and
+                # never "delivered".
+                return "release_closed"
             return "unrouted"
         if shadow_pending_count > 0:
             return "pending"
@@ -203,21 +224,39 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
     dead_lettered_count = result.get("dead_lettered_count", 0) or 0
     pending_count = result.get("pending_count", 0) or 0
     failed_count = result.get("failed_count", 0) or 0
+    bodies_denied_count = result.get("bodies_denied_count", 0) or 0
+    bodies_expired_count = result.get("bodies_expired_count", 0) or 0
+    bodies_voided_count = result.get("bodies_voided_count", 0) or 0
+    release_closed_count = (
+        bodies_denied_count + bodies_expired_count + bodies_voided_count
+    )
     shadow_superseded_count = result.get("shadow_superseded_count", 0) or 0
     shadow_dead_lettered_count = result.get("shadow_dead_lettered_count", 0) or 0
     shadow_pending_count = result.get("shadow_pending_count", 0) or 0
     shadow_failed_count = result.get("shadow_failed_count", 0) or 0
-    # delivery_count counts live for-real copies only — superseded copies
-    # never went out and must not be described as still pending or delivered.
-    live_count = result["delivery_count"] - superseded_count
+    shadow_closed_count = result.get("shadow_bodies_closed_count", 0) or 0
+    # delivery_count counts live for-real body copies only — superseded copies
+    # never went out, and a gated body closed before release (denied / expired
+    # / voided) never went out either; neither must be described as still
+    # pending or delivered.
+    live_count = (
+        result["delivery_count"]
+        - superseded_count
+        - release_closed_count
+    )
     result["delivery_count"] = live_count
     result["superseded_count"] = superseded_count
     result["dead_lettered_count"] = dead_lettered_count
     result["pending_count"] = pending_count
     result["failed_count"] = failed_count
+    result["bodies_denied_count"] = bodies_denied_count
+    result["bodies_expired_count"] = bodies_expired_count
+    result["bodies_voided_count"] = bodies_voided_count
     shadow_live_count = (
-        result.get("shadow_delivery_count", 0) or 0
-    ) - shadow_superseded_count
+        (result.get("shadow_delivery_count", 0) or 0)
+        - shadow_superseded_count
+        - shadow_closed_count
+    )
     result["shadow_delivery_count"] = shadow_live_count
     result["shadow_superseded_count"] = shadow_superseded_count
     result["shadow_dead_lettered_count"] = shadow_dead_lettered_count
@@ -237,14 +276,17 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
         shadow_superseded_count,
         failed_count,
         shadow_failed_count,
+        release_closed_count,
+        shadow_closed_count,
     )
     required_ack_count = result.get("required_ack_count")
     # No configured threshold (legacy rows) means "every live for-real copy".
     # Cap at live_count as well: a for-real copy that never went out because
-    # its destination relocated (terminal 'superseded') is not among the live
+    # its destination relocated (terminal 'superseded') or its gated body was
+    # closed before release (denied/expired/voided) is not among the live
     # copies and so cannot be part of the required number either. A zero
-    # effective requirement (unrouted / shadow-only / pending-confirmation)
-    # still never reads as acknowledged.
+    # effective requirement (unrouted / shadow-only / pending-confirmation /
+    # every body closed) still never reads as acknowledged.
     if required_ack_count is None:
         required_ack_count = live_count
     required_ack_count = min(required_ack_count, live_count)
@@ -269,58 +311,133 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
     return result
 
 
+# Full column list for delivery-shaped responses (trace, reconciliation
+# listing and dead-letter listing), including the preview-consent gate fields.
+DELIVERY_COLUMNS = (
+    "d.id, d.event_id, d.destination_id, dest.url AS destination_url, "
+    "d.destination_seq, d.dedupe_key, d.event_type, d.status, d.attempts, "
+    "d.next_attempt_at, d.not_before, d.last_error, d.created_at, d.updated_at, "
+    "d.delivered_at, d.reconcile_state, d.reconcile_deadline, "
+    "d.reconciled_at, d.receipt_result, d.requeue_count, "
+    "d.consecutive_failures, d.dead_letter_reason, d.dead_lettered_at, "
+    "d.confirmation_generation, d.observe_only, "
+    "d.phase, d.release_state, d.preview_delivery_id, d.body_delivery_id, "
+    "d.consent_deadline, d.consent_timeout_seconds, d.released_at, "
+    "d.voided_at, d.void_reason"
+)
+
+
 EVENT_WITH_COUNTS_SQL = """
     SELECT e.id, e.source_id, e.event_type, e.dedupe_key, e.payload, e.created_at,
            e.not_before, e.cancelled_at,
            e.required_ack_count,
+           e.preview_payload,
            e.corrects_event_id,
            t.ack_threshold AS configured_ack_threshold,
-           -- For-real copies decide the whole event's transport/reconcile
-           -- standing; observe-only ("shadow") copies are counted separately
-           -- and can never change it.
-           COUNT(d.id) FILTER (WHERE NOT d.observe_only)::int AS delivery_count,
+           -- A gated type fans out as a preview/body pair per subscriber.
+           -- Only body copies decide the whole event's transport/reconcile
+           -- standing; previews (the notices) are reported separately and
+           -- never count as a delivered body or toward acknowledgement.
+           p.event_type IS NOT NULL AS preview_gated,
+           COUNT(d.id) FILTER (WHERE NOT d.observe_only AND d.phase = 'body')::int AS delivery_count,
            COUNT(d.id) FILTER (
-               WHERE NOT d.observe_only AND d.status = 'delivered'
+               WHERE NOT d.observe_only AND d.phase = 'body' AND d.status = 'delivered'
            )::int AS delivered_count,
            COUNT(d.id) FILTER (
-               WHERE NOT d.observe_only AND d.status IN ('pending', 'in_flight')
+               WHERE NOT d.observe_only AND d.phase = 'body'
+                 AND d.status IN ('pending', 'in_flight')
            )::int AS pending_count,
            COUNT(d.id) FILTER (
-               WHERE NOT d.observe_only AND d.reconcile_state = 'acknowledged'
+               WHERE NOT d.observe_only AND d.phase = 'body'
+                 AND d.reconcile_state = 'acknowledged'
            )::int AS acknowledged_count,
            COUNT(d.id) FILTER (
-               WHERE NOT d.observe_only AND d.status = 'superseded'
+               WHERE NOT d.observe_only AND d.phase = 'body'
+                 AND d.status = 'superseded'
            )::int AS superseded_count,
            COUNT(d.id) FILTER (
-               WHERE NOT d.observe_only AND d.status = 'dead_lettered'
+               WHERE NOT d.observe_only AND d.phase = 'body'
+                 AND d.status = 'dead_lettered'
            )::int AS dead_lettered_count,
            COUNT(d.id) FILTER (
-               WHERE NOT d.observe_only AND d.status = 'failed'
+               WHERE NOT d.observe_only AND d.phase = 'body'
+                 AND d.status = 'failed'
            )::int AS failed_count,
-           COUNT(d.id) FILTER (WHERE d.observe_only)::int AS shadow_delivery_count,
+           COUNT(d.id) FILTER (WHERE d.observe_only AND d.phase = 'body')::int AS shadow_delivery_count,
            COUNT(d.id) FILTER (
-               WHERE d.observe_only AND d.status = 'delivered'
+               WHERE d.observe_only AND d.phase = 'body' AND d.status = 'delivered'
            )::int AS shadow_delivered_count,
            COUNT(d.id) FILTER (
-               WHERE d.observe_only AND d.status IN ('pending', 'in_flight')
+               WHERE d.observe_only AND d.phase = 'body'
+                 AND d.status IN ('pending', 'in_flight')
            )::int AS shadow_pending_count,
            COUNT(d.id) FILTER (
-               WHERE d.observe_only AND d.reconcile_state = 'acknowledged'
+               WHERE d.observe_only AND d.phase = 'body'
+                 AND d.reconcile_state = 'acknowledged'
            )::int AS shadow_acknowledged_count,
            COUNT(d.id) FILTER (
-               WHERE d.observe_only AND d.status = 'superseded'
+               WHERE d.observe_only AND d.phase = 'body'
+                 AND d.status = 'superseded'
            )::int AS shadow_superseded_count,
            COUNT(d.id) FILTER (
-               WHERE d.observe_only AND d.status = 'dead_lettered'
+               WHERE d.observe_only AND d.phase = 'body'
+                 AND d.status = 'dead_lettered'
            )::int AS shadow_dead_lettered_count,
            COUNT(d.id) FILTER (
-               WHERE d.observe_only AND d.status = 'failed'
-           )::int AS shadow_failed_count
+               WHERE d.observe_only AND d.phase = 'body'
+                 AND d.status = 'failed'
+           )::int AS shadow_failed_count,
+           -- Preview-consent gate body states (for-real). Waiting bodies are
+           -- a subset of pending_count above (held + already released but not
+           -- yet sent); closed bodies never went out and never get delivered.
+           COUNT(d.id) FILTER (
+               WHERE NOT d.observe_only AND d.phase = 'body'
+                 AND d.release_state = 'held'
+           )::int AS bodies_waiting_count,
+           COUNT(d.id) FILTER (
+               WHERE NOT d.observe_only AND d.phase = 'body'
+                 AND d.release_state = 'released'
+           )::int AS bodies_released_count,
+           COUNT(d.id) FILTER (
+               WHERE NOT d.observe_only AND d.phase = 'body'
+                 AND d.status = 'release_denied'
+           )::int AS bodies_denied_count,
+           COUNT(d.id) FILTER (
+               WHERE NOT d.observe_only AND d.phase = 'body'
+                 AND d.status = 'release_expired'
+           )::int AS bodies_expired_count,
+           COUNT(d.id) FILTER (
+               WHERE NOT d.observe_only AND d.phase = 'body'
+                 AND d.status = 'release_voided'
+           )::int AS bodies_voided_count,
+           -- Shadow subscriber gate states, kept separate.
+           COUNT(d.id) FILTER (
+               WHERE d.observe_only AND d.phase = 'body'
+                 AND d.release_state = 'held'
+           )::int AS shadow_bodies_waiting_count,
+           COUNT(d.id) FILTER (
+               WHERE d.observe_only AND d.phase = 'body'
+                 AND d.release_state = 'released'
+           )::int AS shadow_bodies_released_count,
+           COUNT(d.id) FILTER (
+               WHERE d.observe_only AND d.phase = 'body'
+                 AND d.status IN ('release_denied', 'release_expired', 'release_voided')
+           )::int AS shadow_bodies_closed_count,
+           -- Notices themselves: did each preview reach the wire.
+           COUNT(d.id) FILTER (
+               WHERE NOT d.observe_only AND d.phase = 'preview'
+                 AND d.status = 'delivered'
+           )::int AS previews_delivered_count,
+           COUNT(d.id) FILTER (
+               WHERE d.observe_only AND d.phase = 'preview'
+                 AND d.status = 'delivered'
+           )::int AS shadow_previews_delivered_count
     FROM events e
     LEFT JOIN deliveries d ON d.event_id = e.id
     LEFT JOIN event_type_ack_thresholds t ON t.event_type = e.event_type
+    LEFT JOIN event_type_preview_policies p ON p.event_type = e.event_type
     WHERE {where}
-    GROUP BY e.id, t.ack_threshold
+    GROUP BY e.id, t.ack_threshold, p.event_type
 """
 
 
@@ -925,18 +1042,50 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
         {"event_type": body.event_type},
     ).mappings().first()
     ack_threshold = ack_threshold["ack_threshold"] if ack_threshold else None
+    # Preview-consent policy ("预告 + 点头才给正文"). A gated type fans out as a
+    # preview/body pair per confirmed subscriber; the body waits for that
+    # address's own nod. preview_payload on a non-gated type is a client
+    # mistake (it would otherwise be silently dropped), so refuse it loudly.
+    policy = release_gate.get_policy(db, body.event_type)
+    if policy is None and body.preview_payload is not None:
+        log_attempt(
+            db,
+            disposition=INVALID_BODY,
+            source_id=str(source["id"]),
+            source_name=source["name"],
+            dedupe_key=body.dedupe_key,
+            event_type=body.event_type,
+            signed_at=source["signed_at"],
+            reason=(
+                "preview_payload is only valid for an event type with a "
+                "preview-consent policy (gated type)"
+            ),
+            remote_addr=None,
+            commit=True,
+        )
+        raise AdmissionError(
+            422,
+            INVALID_BODY,
+            "preview_payload is only valid for a gated event type",
+        )
+    preview_payload = (
+        json.dumps(body.preview_payload)
+        if policy is not None and body.preview_payload is not None
+        else None
+    )
     event = db.execute(
         text(
             """
             INSERT INTO events (source_id, event_type, dedupe_key, payload,
-                                not_before, required_ack_count)
+                                not_before, required_ack_count, preview_payload)
             VALUES (CAST(:source_id AS UUID), :event_type, :dedupe_key,
                     CAST(:payload AS JSONB), CAST(:not_before AS TIMESTAMPTZ),
-                    CAST(:required_ack_count AS INTEGER))
+                    CAST(:required_ack_count AS INTEGER),
+                    CAST(:preview_payload AS JSONB))
             ON CONFLICT (dedupe_key) DO NOTHING
             RETURNING id, source_id, event_type, dedupe_key, payload, not_before,
                       cancelled_at, created_at, required_ack_count,
-                      corrects_event_id
+                      corrects_event_id, preview_payload
             """
         ),
         {
@@ -948,6 +1097,7 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
             # Filled in after fan-out below; the row stays inside this
             # transaction so nobody can observe the placeholder.
             "required_ack_count": 0,
+            "preview_payload": preview_payload,
         },
     ).mappings().first()
 
@@ -1021,49 +1171,74 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     real_subscribers = [row for row in subscribers if not row[1]]
     shadow_subscribers = [row for row in subscribers if row[1]]
 
-    for row in subscribers:
-        db.execute(
-            text(
-                """
-                WITH bumped AS (
-                    UPDATE destinations
-                    SET next_event_seq = next_event_seq + 1
-                    WHERE id = :destination_id
-                      AND confirmation_state = 'confirmed'
-                    RETURNING id, next_event_seq, confirmation_generation
-                )
-                INSERT INTO deliveries
-                    (event_id, destination_id, event_type, dedupe_key, payload,
-                     destination_seq, not_before, confirmation_generation,
-                     observe_only)
-                SELECT :event_id, id, :event_type, :dedupe_key,
-                       CAST(:payload AS JSONB), next_event_seq,
-                       CAST(:not_before AS TIMESTAMPTZ), confirmation_generation,
-                       :observe_only
-                FROM bumped
-                """
-            ),
-            {
-                "event_id": event["id"],
-                "destination_id": row[0],
-                "event_type": body.event_type,
-                "dedupe_key": body.dedupe_key,
-                "payload": payload,
-                "not_before": body.not_before,
-                "observe_only": row[1],
-            },
+    if policy is not None:
+        # Gated type: every confirmed subscriber gets a preview first and a
+        # held body behind it. Destinations not subscribed (or not confirmed)
+        # get neither — there is no pair row for them. The body claim gate in
+        # the worker refuses every body until this same address's preview has
+        # landed and the address nods before its deadline, so the body can
+        # never overtake or precede its notice.
+        pair_counts = release_gate.fan_out_gated_event(
+            db,
+            event_id=str(event["id"]),
+            event_type=body.event_type,
+            dedupe_key=body.dedupe_key,
+            payload=payload,
+            preview_payload=preview_payload,
+            not_before=body.not_before,
+            consent_timeout_seconds=policy["consent_timeout_seconds"],
+            destinations=subscribers,
         )
+        real_pair_count = pair_counts["real_pairs"]
+        shadow_pair_count = pair_counts["shadow_pairs"]
+    else:
+        real_pair_count = len(real_subscribers)
+        shadow_pair_count = len(shadow_subscribers)
+        for row in subscribers:
+            db.execute(
+                text(
+                    """
+                    WITH bumped AS (
+                        UPDATE destinations
+                        SET next_event_seq = next_event_seq + 1
+                        WHERE id = :destination_id
+                          AND confirmation_state = 'confirmed'
+                        RETURNING id, next_event_seq, confirmation_generation
+                    )
+                    INSERT INTO deliveries
+                        (event_id, destination_id, event_type, dedupe_key, payload,
+                         destination_seq, not_before, confirmation_generation,
+                         observe_only)
+                    SELECT :event_id, id, :event_type, :dedupe_key,
+                           CAST(:payload AS JSONB), next_event_seq,
+                           CAST(:not_before AS TIMESTAMPTZ), confirmation_generation,
+                           :observe_only
+                    FROM bumped
+                    """
+                ),
+                {
+                    "event_id": event["id"],
+                    "destination_id": row[0],
+                    "event_type": body.event_type,
+                    "dedupe_key": body.dedupe_key,
+                    "payload": payload,
+                    "not_before": body.not_before,
+                    "observe_only": row[1],
+                },
+            )
 
     # Snapshot this event's acknowledgement requirement onto the event row in
     # the same transaction: a configured threshold capped at the current
     # for-real confirmed subscribers, otherwise every for-real copy. Shadow
-    # subscribers never count toward it. A zero snapshot (unrouted /
-    # shadow-only / pending-confirmation) keeps reconcile_status pending —
-    # acknowledgement still requires at least one for-real success receipt.
+    # subscribers never count toward it. For gated events the requirement is
+    # the number of for-real *bodies* (one per for-real pair). A zero snapshot
+    # (unrouted / shadow-only / pending-confirmation) keeps reconcile_status
+    # pending — acknowledgement still requires at least one for-real success
+    # receipt on a body.
     required_ack_count = (
-        min(ack_threshold, len(real_subscribers))
+        min(ack_threshold, real_pair_count)
         if ack_threshold is not None
-        else len(real_subscribers)
+        else real_pair_count
     )
     db.execute(
         text(
@@ -1102,20 +1277,35 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     result = dict(event)
     result["required_ack_count"] = required_ack_count
     result["configured_ack_threshold"] = ack_threshold
-    result["delivery_count"] = len(real_subscribers)
+    result["preview_gated"] = policy is not None
+    # The counts SQL below groups bodies and previews separately; on the
+    # immediate ingest response every for-real body is a live pending copy.
+    result["delivery_count"] = real_pair_count
     result["delivered_count"] = 0
-    result["pending_count"] = len(real_subscribers)
+    result["pending_count"] = real_pair_count
     result["acknowledged_count"] = 0
     result["superseded_count"] = 0
     result["dead_lettered_count"] = 0
     result["failed_count"] = 0
-    result["shadow_delivery_count"] = len(shadow_subscribers)
+    result["bodies_waiting_count"] = real_pair_count if policy is not None else 0
+    result["bodies_released_count"] = 0
+    result["bodies_denied_count"] = 0
+    result["bodies_expired_count"] = 0
+    result["bodies_voided_count"] = 0
+    result["previews_delivered_count"] = 0
+    result["shadow_delivery_count"] = shadow_pair_count
     result["shadow_delivered_count"] = 0
-    result["shadow_pending_count"] = len(shadow_subscribers)
+    result["shadow_pending_count"] = shadow_pair_count
     result["shadow_acknowledged_count"] = 0
     result["shadow_superseded_count"] = 0
     result["shadow_dead_lettered_count"] = 0
     result["shadow_failed_count"] = 0
+    result["shadow_bodies_waiting_count"] = (
+        shadow_pair_count if policy is not None else 0
+    )
+    result["shadow_bodies_released_count"] = 0
+    result["shadow_bodies_closed_count"] = 0
+    result["shadow_previews_delivered_count"] = 0
     return event_response(result), 201
 
 
@@ -1130,16 +1320,8 @@ def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
 
     deliveries = db.execute(
         text(
-            """
-            SELECT d.id, d.event_id, d.destination_id, dest.url AS destination_url,
-                   d.destination_seq, d.dedupe_key, d.event_type, d.status, d.attempts,
-                   d.next_attempt_at,
-                   d.not_before, d.last_error, d.created_at, d.updated_at,
-                   d.delivered_at, d.reconcile_state, d.reconcile_deadline,
-                   d.reconciled_at, d.receipt_result, d.requeue_count,
-                   d.consecutive_failures, d.dead_letter_reason,
-                   d.dead_lettered_at, d.confirmation_generation,
-                   d.observe_only
+            f"""
+            SELECT {DELIVERY_COLUMNS}
             FROM deliveries d
             JOIN destinations dest ON dest.id = d.destination_id
             WHERE d.event_id = CAST(:event_id AS UUID)
@@ -1528,11 +1710,23 @@ def cancel_event(event_id: UUID, db: Session = Depends(get_db)):
     # Every copy is still queued and now locked by this transaction, so the
     # worker cannot claim any of them (its SKIP LOCKED pick skips locked
     # rows). Cancel them all: cancelled is terminal, they will never go out.
+    # A held gated body keeps the whole-event 'cancelled' status too (its
+    # release gate is moot once the event itself is cancelled).
     db.execute(
         text(
             """
             UPDATE deliveries
             SET status = 'cancelled',
+                release_state = CASE
+                    WHEN release_state = 'held' THEN 'release_voided'
+                    ELSE release_state
+                END,
+                voided_at = CASE
+                    WHEN release_state = 'held' THEN now() ELSE voided_at
+                END,
+                void_reason = CASE
+                    WHEN release_state = 'held' THEN 'manual' ELSE void_reason
+                END,
                 updated_at = now()
             WHERE event_id = CAST(:event_id AS UUID)
               AND status = 'pending'
@@ -2138,6 +2332,288 @@ def clear_ack_threshold(event_type: str, db: Session = Depends(get_db)):
 
 # --- Receipt ingestion and reconciliation ---------------------------------
 
+PREVIEW_CONSENT_DISPOSITIONS = (
+    "released",
+    "denied",
+    "duplicate",
+    "late_ignored",
+    "conflict",
+    "preview_not_delivered",
+    "not_gated",
+    "orphan",
+)
+
+
+@app.get("/v1/event-types/preview-policies", response_model=list[PreviewPolicyOut])
+def list_preview_policies(
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    return db.execute(
+        text(
+            f"""
+            SELECT {release_gate.POLICY_COLUMNS}
+            FROM event_type_preview_policies
+            ORDER BY event_type ASC
+            LIMIT :limit
+            """
+        ),
+        {"limit": limit},
+    ).mappings().all()
+
+
+@app.get(
+    "/v1/event-types/{event_type}/preview-policy",
+    response_model=PreviewPolicyOut,
+)
+def get_preview_policy(event_type: str, db: Session = Depends(get_db)):
+    event_type = _normalize_event_type_path(event_type)
+    row = release_gate.get_policy(db, event_type)
+    if row is None:
+        return {
+            "event_type": event_type,
+            "consent_timeout_seconds": None,
+            "created_at": None,
+            "updated_at": None,
+            "gated": False,
+        }
+    return dict(row) | {"gated": True}
+
+
+@app.put(
+    "/v1/event-types/{event_type}/preview-policy",
+    response_model=PreviewPolicyOut,
+)
+def set_preview_policy(
+    event_type: str,
+    body: PreviewPolicyIn,
+    db: Session = Depends(get_db),
+):
+    # Mark the type gated: events ingested afterwards fan out as
+    # preview/body pairs. The timeout is snapshotted per event pair, so the
+    # change never rewrites events already accepted.
+    event_type = _normalize_event_type_path(event_type)
+    timeout_seconds = (
+        body.consent_timeout_seconds
+        if body.consent_timeout_seconds is not None
+        else int(settings.preview_consent_timeout_seconds_default)
+    )
+    row = release_gate.upsert_policy(db, event_type, timeout_seconds)
+    db.commit()
+    return dict(row) | {"gated": True}
+
+
+@app.delete(
+    "/v1/event-types/{event_type}/preview-policy",
+    response_model=PreviewPolicyOut,
+)
+def clear_preview_policy(event_type: str, db: Session = Depends(get_db)):
+    event_type = _normalize_event_type_path(event_type)
+    release_gate.delete_policy(db, event_type)
+    db.commit()
+    return {
+        "event_type": event_type,
+        "consent_timeout_seconds": None,
+        "created_at": None,
+        "updated_at": None,
+        "gated": False,
+    }
+
+
+@app.post("/v1/events/{event_id}/consent", response_model=ConsentOut)
+def post_consent(
+    event_id: UUID,
+    body: ConsentIn,
+    destination_id: UUID = Query(...),
+    db: Session = Depends(get_db),
+):
+    # The gate is always (event, destination): the destination_id query
+    # parameter is mandatory so another address's answer can never release
+    # this one. Idempotent — the same address answering the same preview twice
+    # only ever produces one effective answer.
+    try:
+        outcome = release_gate.ingest_decision(
+            db,
+            destination_id=str(destination_id),
+            event_id=str(event_id),
+            decision=body.decision,
+        )
+    except release_gate.ConsentError as exc:
+        db.rollback()
+        raise HTTPException(status_code=exc.status_code, detail=exc.reason)
+    return {
+        "event_id": event_id,
+        "destination_id": destination_id,
+        "delivery_id": outcome.get("delivery_id"),
+        "disposition": outcome["disposition"],
+        "release_state": outcome["release_state"],
+    }
+
+
+# Gate row columns plus the preview's state for the gate query.
+_GATE_COLUMNS = (
+    DELIVERY_COLUMNS
+    + ", p.status AS preview_status, p.delivered_at AS preview_delivered_at, "
+    + "p.id AS preview_delivery"
+)
+
+
+def _gate_rows(db: Session, where_sql: str, params: dict) -> list:
+    return db.execute(
+        text(
+            f"""
+            SELECT {_GATE_COLUMNS}
+            FROM deliveries d
+            JOIN destinations dest ON dest.id = d.destination_id
+            JOIN deliveries p ON p.id = d.preview_delivery_id
+            WHERE d.phase = 'body'
+              AND d.release_state IS NOT NULL
+              AND {where_sql}
+            ORDER BY d.created_at ASC, d.id ASC
+            LIMIT :limit
+            """
+        ),
+        {"limit": params.pop("limit", 500), **params},
+    ).mappings().all()
+
+
+@app.get("/v1/release-gates", response_model=list[ReleaseGateOut])
+def list_release_gates(
+    event_id: UUID | None = None,
+    destination_id: UUID | None = None,
+    release_state: str | None = None,
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    # "This address did not nod" is answerable: filter release_state=held with
+    # an expired deadline (release_expired after the sweep), or
+    # status=release_expired/release_denied/release_voided for closed bodies.
+    # A closed body is never reported as delivered.
+    if release_state is not None and release_state not in (
+        release_gate.HELD,
+        release_gate.RELEASED,
+        release_gate.DENIED,
+        release_gate.EXPIRED,
+        release_gate.VOIDED,
+    ):
+        raise HTTPException(status_code=422, detail="invalid release_state")
+    if status_filter is not None and status_filter not in (
+        "pending",
+        "in_flight",
+        "delivered",
+        "release_denied",
+        "release_expired",
+        "release_voided",
+        "dead_lettered",
+    ):
+        raise HTTPException(status_code=422, detail="invalid status")
+    clauses = [
+        "(CAST(:event_id AS UUID) IS NULL OR d.event_id = CAST(:event_id AS UUID))",
+        "(CAST(:destination_id AS UUID) IS NULL OR d.destination_id = CAST(:destination_id AS UUID))",
+        "(CAST(:release_state AS TEXT) IS NULL OR d.release_state = CAST(:release_state AS TEXT))",
+        "(CAST(:status_filter AS TEXT) IS NULL OR d.status = CAST(:status_filter AS TEXT))",
+    ]
+    return _gate_rows(
+        db,
+        " AND ".join(clauses),
+        {
+            "event_id": str(event_id) if event_id else None,
+            "destination_id": str(destination_id) if destination_id else None,
+            "release_state": release_state,
+            "status_filter": status_filter,
+            "limit": limit,
+        },
+    )
+
+
+@app.get(
+    "/v1/events/{event_id}/release-gates",
+    response_model=list[ReleaseGateOut],
+)
+def list_event_release_gates(
+    event_id: UUID,
+    destination_id: UUID | None = None,
+    release_state: str | None = None,
+    db: Session = Depends(get_db),
+):
+    if release_state is not None and release_state not in (
+        release_gate.HELD,
+        release_gate.RELEASED,
+        release_gate.DENIED,
+        release_gate.EXPIRED,
+        release_gate.VOIDED,
+    ):
+        raise HTTPException(status_code=422, detail="invalid release_state")
+    return _gate_rows(
+        db,
+        "d.event_id = CAST(:event_id AS UUID) "
+        "AND (CAST(:destination_id AS UUID) IS NULL "
+        "     OR d.destination_id = CAST(:destination_id AS UUID)) "
+        "AND (CAST(:release_state AS TEXT) IS NULL "
+        "     OR d.release_state = CAST(:release_state AS TEXT))",
+        {
+            "event_id": str(event_id),
+            "destination_id": str(destination_id) if destination_id else None,
+            "release_state": release_state,
+        },
+    )
+
+
+@app.get(
+    "/v1/release-gate-decisions",
+    response_model=list[ReleaseGateDecisionOut],
+)
+def list_release_gate_decisions(
+    event_id: UUID | None = None,
+    destination_id: UUID | None = None,
+    disposition: str | None = None,
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    # Audit trail of every nod/"no": effective answers (released/denied),
+    # duplicates, conflicts, late answers, pre-delivery answers and orphans.
+    if disposition is not None and disposition not in PREVIEW_CONSENT_DISPOSITIONS:
+        raise HTTPException(status_code=422, detail="invalid disposition")
+    return db.execute(
+        text(
+            """
+            SELECT id, destination_id, event_id, delivery_id, decision,
+                   disposition, reason, created_at
+            FROM release_gate_decisions
+            WHERE (CAST(:event_id AS UUID) IS NULL
+                   OR event_id = CAST(:event_id AS UUID))
+              AND (CAST(:destination_id AS UUID) IS NULL
+                   OR destination_id = CAST(:destination_id AS UUID))
+              AND (CAST(:disposition AS TEXT) IS NULL
+                   OR disposition = CAST(:disposition AS TEXT))
+            ORDER BY created_at DESC, id DESC
+            LIMIT :limit
+            """
+        ),
+        {
+            "event_id": str(event_id) if event_id else None,
+            "destination_id": str(destination_id) if destination_id else None,
+            "disposition": disposition,
+            "limit": limit,
+        },
+    ).mappings().all()
+
+
+@app.post("/v1/deliveries/{delivery_id}/void-body", response_model=BodyVoidOut)
+def void_gated_body_endpoint(delivery_id: UUID, db: Session = Depends(get_db)):
+    # Manually void a gated body that has not gone out. The preview (already
+    # delivered or still queued) is deliberately untouched; a body already in
+    # flight or delivered can no longer be taken back (409).
+    try:
+        return release_gate.void_gated_body(db, str(delivery_id))
+    except release_gate.ConsentError as exc:
+        db.rollback()
+        raise HTTPException(status_code=exc.status_code, detail=exc.reason)
+
+
+# --- Receipt ingestion and reconciliation ---------------------------------
+
 RECONCILE_STATES = ("awaiting", "acknowledged", "receipt_failed", "timed_out")
 
 
@@ -2300,16 +2776,8 @@ def list_reconciliation_deliveries(
         raise HTTPException(status_code=422, detail="invalid reconcile_state")
     return db.execute(
         text(
-            """
-            SELECT d.id, d.event_id, d.destination_id, dest.url AS destination_url,
-                   d.destination_seq, d.dedupe_key, d.event_type, d.status, d.attempts,
-                   d.next_attempt_at,
-                   d.not_before, d.last_error, d.created_at, d.updated_at,
-                   d.delivered_at, d.reconcile_state, d.reconcile_deadline,
-                   d.reconciled_at, d.receipt_result, d.requeue_count,
-                   d.consecutive_failures, d.dead_letter_reason,
-                   d.dead_lettered_at, d.confirmation_generation,
-                   d.observe_only
+            f"""
+            SELECT {DELIVERY_COLUMNS}
             FROM deliveries d
             JOIN destinations dest ON dest.id = d.destination_id
             WHERE d.reconcile_state = :reconcile_state
@@ -2484,16 +2952,8 @@ def list_dead_letters(
         raise HTTPException(status_code=422, detail="invalid dead_letter_reason")
     return db.execute(
         text(
-            """
-            SELECT d.id, d.event_id, d.destination_id, dest.url AS destination_url,
-                   d.destination_seq, d.dedupe_key, d.event_type, d.status, d.attempts,
-                   d.next_attempt_at,
-                   d.not_before, d.last_error, d.created_at, d.updated_at,
-                   d.delivered_at, d.reconcile_state, d.reconcile_deadline,
-                   d.reconciled_at, d.receipt_result, d.requeue_count,
-                   d.consecutive_failures, d.dead_letter_reason,
-                   d.dead_lettered_at, d.confirmation_generation,
-                   d.observe_only
+            f"""
+            SELECT {DELIVERY_COLUMNS}
             FROM deliveries d
             JOIN destinations dest ON dest.id = d.destination_id
             WHERE d.status = 'dead_lettered'

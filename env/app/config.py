@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     ingest_max_age_seconds: float = 300.0
     ingest_max_future_skew_seconds: float = 60.0
 
+    # Preview-consent gate ("预告 + 点头才给正文"). A gated event type is
+    # configured per type with its own consent timeout; this value is only the
+    # fallback used when the policy row is created without one. The window
+    # starts when the preview really completes transport, never from ingest.
+    preview_consent_timeout_seconds_default: float = 86400.0
+
 
 @lru_cache
 def get_settings() -> Settings:

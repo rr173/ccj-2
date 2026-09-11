@@ -53,6 +53,29 @@ def send_receipt(url: str, destination_id: str, dedupe_key: str, result: str, de
         print(f"receipt for {dedupe_key} failed: {exc}")
 
 
+def send_consent(ingest_url: str, event_id: str, destination_id: str, decision: str) -> None:
+    url = (
+        f"{ingest_url}/v1/events/{event_id}/consent"
+        f"?destination_id={destination_id}"
+    )
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({"decision": decision}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read() or b"{}")
+        print(
+            f"consent {decision} for event {event_id}: "
+            f"disposition={payload.get('disposition')} "
+            f"release_state={payload.get('release_state')}"
+        )
+    except Exception as exc:  # noqa: BLE001 - demo script, log and continue
+        print(f"consent for event {event_id} failed: {exc}")
+
+
 class Handler(BaseHTTPRequestHandler):
     fail_times = 0
     receipt_url: str | None = None
@@ -64,6 +87,12 @@ class Handler(BaseHTTPRequestHandler):
     # destination immediately. When false, challenges get a 200 without an
     # echo so the handshake stays pending (use the confirm API manually).
     auto_confirm = True
+    # Preview-consent gate ("预告 + 点头才给正文"): when an ingest URL is set,
+    # an event_preview is answered by calling the consent endpoint. "approve"
+    # releases this address's own body; "deny" refuses it; "none" leaves it
+    # held so the body can be observed expiring/voiding.
+    ingest_url: str | None = None
+    preview_decision = "approve"
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib API
         length = int(self.headers.get("Content-Length", "0"))
@@ -88,6 +117,29 @@ class Handler(BaseHTTPRequestHandler):
                 )
             else:
                 self._write(200, {"type": "activation_response", "received": True})
+            return
+
+        # Preview notice ("预告") of a gated event: it never carries the real
+        # payload. Answer via the consent endpoint so the body is (or is not)
+        # released for this address.
+        is_preview = (
+            self.headers.get("X-Message-Type") == "event_preview"
+            or body.get("message_type") == "event_preview"
+        )
+        if is_preview:
+            key = self.headers.get("Idempotency-Key")
+            self._write(200, {"status": "preview_received", "key": key})
+            if self.ingest_url and self.preview_decision in ("approve", "deny"):
+                threading.Thread(
+                    target=send_consent,
+                    args=(
+                        self.ingest_url,
+                        body["event_id"],
+                        body["destination_id"],
+                        self.preview_decision,
+                    ),
+                    daemon=True,
+                ).start()
             return
 
         key = self.headers.get("Idempotency-Key")
@@ -154,6 +206,19 @@ def main() -> None:
         action="store_true",
         help="answer activation probes without echoing the challenge (stay pending)",
     )
+    parser.add_argument(
+        "--ingest-url",
+        default=None,
+        help="base URL of the ingest API; when set, previews are answered "
+             "via the consent endpoint",
+    )
+    parser.add_argument(
+        "--preview-decision",
+        default="approve",
+        choices=["approve", "deny", "none"],
+        help="how to answer a gated event's preview (default approve; "
+             "'none' leaves the body held so it can be watched expiring)",
+    )
     args = parser.parse_args()
     Handler.fail_times = args.fail_times
     Handler.receipt_url = args.receipt_url
@@ -161,6 +226,8 @@ def main() -> None:
     Handler.receipt_delay = args.receipt_delay
     Handler.response_delay = args.response_delay
     Handler.auto_confirm = not args.no_auto_confirm
+    Handler.ingest_url = args.ingest_url
+    Handler.preview_decision = args.preview_decision
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"mock receiver listening on http://{args.host}:{args.port}")
     server.serve_forever()

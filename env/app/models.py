@@ -131,6 +131,10 @@ SCHEMA_STATEMENTS = [
         not_before TIMESTAMPTZ,
         cancelled_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        -- Optional short text a gated event's preview is allowed to show.
+        -- The real content stays in payload and only goes out with the body,
+        -- after this destination nods. Null on ordinary events.
+        preview_payload JSONB,
         -- Number of for-real copies whose success receipts are required to
         -- mark the whole event acknowledged. Snapshot taken at fan-out time:
         -- all for-real confirmed subscribers by default, or the configured
@@ -195,6 +199,30 @@ SCHEMA_STATEMENTS = [
         -- event's acknowledgement standing, are targeted by event-level
         -- requeue, or are counted among the event's for-real copies.
         observe_only BOOLEAN NOT NULL DEFAULT FALSE,
+        -- Preview-consent gate ("预告 + 点头才给正文"). Gated events fan out
+        -- into two copies per subscriber: phase 'preview' (the notice, queued
+        -- first, no real payload, no receipt reconciliation) and phase 'body'
+        -- (the content, queued behind it). A body is claimable only when its
+        -- own preview is delivered and release_state = 'released'. Ordinary
+        -- (non-gated) events and corrections are a single phase 'body' copy
+        -- with a null release_state and behave exactly as before.
+        phase TEXT NOT NULL DEFAULT 'body',
+        release_state TEXT,
+        -- preview copy points at its body (preview_delivery_id); a gated body
+        -- points back at its preview (body_delivery_id). The self-reference is
+        -- kept loose (no FK) so the pair inserts in either order inside one
+        -- transaction.
+        preview_delivery_id UUID,
+        body_delivery_id UUID,
+        -- From when the address may decide, and until when. The deadline is
+        -- written when the preview really completes transport, snapshotting
+        -- delivered_at + the per-event consent timeout; after it, a missing
+        -- nod voids the body terminally and a late nod is never applied.
+        consent_deadline TIMESTAMPTZ,
+        consent_timeout_seconds BIGINT,
+        released_at TIMESTAMPTZ,
+        voided_at TIMESTAMPTZ,
+        void_reason TEXT,
         UNIQUE (destination_id, destination_seq),
         UNIQUE (destination_id, dedupe_key),
         -- superseded: the destination changed location before this copy was
@@ -207,7 +235,33 @@ SCHEMA_STATEMENTS = [
         -- that copy only: corrections are not retried in place, the failure
         -- is never charged to the destination's consecutive-failure tally
         -- (no isolation), and the copy no longer blocks later copies.
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed')),
+        -- release_denied / release_expired / release_voided: terminal states
+        -- of a gated body that never went out — the address answered "no",
+        -- did not nod before the agreed deadline, or the not-yet-out body was
+        -- voided manually / because its preview never made it through.
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
+                          'release_denied', 'release_expired', 'release_voided')),
+        CHECK (phase IN ('preview', 'body')),
+        CHECK (
+            release_state IS NULL
+            OR release_state IN (
+                'held', 'released', 'release_denied',
+                'release_expired', 'release_voided'
+            )
+        ),
+        -- Only preview rows self-mark body_delivery_id; bodies leave it null.
+        -- A preview points at its body, a body back at its preview.
+        CHECK (
+            (phase = 'preview' AND body_delivery_id IS NOT NULL
+                 AND preview_delivery_id IS NULL)
+            OR
+            (phase = 'body' AND body_delivery_id IS NULL)
+        ),
+        CHECK (
+            void_reason IS NULL OR void_reason IN (
+                'manual', 'preview_dead_lettered', 'preview_superseded'
+            )
+        ),
         CHECK (attempts >= 0),
         CHECK (destination_seq >= 0),
         CHECK (reconcile_state IN ('none', 'awaiting', 'acknowledged', 'receipt_failed', 'timed_out')),
@@ -224,6 +278,149 @@ SCHEMA_STATEMENTS = [
             )
         )
     )
+    """,
+
+    # --- Preview-consent gate ("预告 + 点头才给正文"), idempotent -----
+    # Placed after the deliveries/events tables exist (a fresh database
+    # already declares these columns/constraints inline, so every
+    # statement here is IF NOT EXISTS / drop-and-readd and is a no-op there;
+    # upgraded databases gain the new tables, columns and checks here.
+    # Copies of gated events come in two phases:
+    #  * 'preview' — the notice, queued first. It carries no business payload,
+    #    only preview_payload (which may be empty), and never enters receipt
+    #    reconciliation.
+    #  * 'body'    — the actual content, queued behind the preview. It stays
+    #    pending with release_state 'held' until this same destination's own
+    #    preview is delivered and that destination approves before the
+    #    consent deadline; the worker claim gate refuses every other body.
+    # Ordinary (non-gated) events and corrections have phase 'body' and a null
+    # release_state, so they behave exactly as before.
+    #
+    # release_state lifecycle of a gated body:
+    #   held -> released   (this destination nodded yes, in time)
+    #   held -> release_denied    (this destination answered "no")
+    #   held -> release_expired   (deadline passed with no nod; a later nod
+    #                              can never revive it)
+    #   held -> release_voided    (manual void of a not-yet-out body, or the
+    #                              preview itself never made it through)
+    # All four non-held states are terminal: such a body never goes out.
+    """
+    ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT 'body'
+    """,
+    """
+    ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS release_state TEXT
+    """,
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS preview_delivery_id UUID",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS body_delivery_id UUID",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS consent_deadline TIMESTAMPTZ",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS consent_timeout_seconds BIGINT",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS released_at TIMESTAMPTZ",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS voided_at TIMESTAMPTZ",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS void_reason TEXT",
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_phase_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_phase_check
+        CHECK (phase IN ('preview', 'body'))
+    """,
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_release_state_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_release_state_check
+        CHECK (
+            release_state IS NULL
+            OR release_state IN (
+                'held', 'released', 'release_denied',
+                'release_expired', 'release_voided'
+            )
+        )
+    """,
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_release_shape_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_release_shape_check
+        CHECK (
+            -- preview rows point at their body via body_delivery_id; body
+            -- rows point back at their preview via preview_delivery_id.
+            (phase = 'preview' AND body_delivery_id IS NOT NULL
+                 AND preview_delivery_id IS NULL)
+            OR
+            (phase = 'body' AND body_delivery_id IS NULL)
+        )
+    """,
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_void_reason_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_void_reason_check
+        CHECK (
+            void_reason IS NULL OR void_reason IN (
+                'manual', 'preview_dead_lettered', 'preview_superseded'
+            )
+        )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS deliveries_release_due_idx
+        ON deliveries (consent_deadline)
+        WHERE phase = 'body'
+          AND release_state = 'held'
+          AND status = 'pending'
+    """,
+    # Optional short text for a gated event: what the notice is allowed to
+    # show. The real content stays in payload and only goes out with the body.
+    "ALTER TABLE events ADD COLUMN IF NOT EXISTS preview_payload JSONB",
+    # Preview-consent gate ("预告 + 点头才给正文"). One row per event type that
+    # is *gated*: instead of one copy per subscriber, an event of a gated type
+    # fans out into two sequential copies per subscriber — a preview first and,
+    # only after that address itself nods yes before the agreed deadline, the
+    # body. The deadline (preview_consent_timeout_seconds) is snapshotted onto
+    # every pair at fan-out (deliveries.consent_timeout_seconds), so changing
+    # or removing the policy here only ever affects later events. A gated type
+    # with no row behaves like every ordinary type (body straight away).
+    """
+    CREATE TABLE IF NOT EXISTS event_type_preview_policies (
+        event_type TEXT PRIMARY KEY,
+        consent_timeout_seconds BIGINT NOT NULL CHECK (consent_timeout_seconds >= 1),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    # One row per consent decision ("点头/不要") returned by a destination
+    # against a gated event's preview. This is the audit trail: it records
+    # *whose* answer it was (destination + event — never another address's),
+    # when it arrived and how it was judged. A nod counts exactly once: the
+    # row key is (delivery_id, decision) plus a unique delivery_id for the
+    # applied answer, so a second nod on the same gate is logged 'duplicate'
+    # and never re-applies. A row whose delivery_id stays null is an 'orphan'
+    # (no outstanding gate for that address/event), kept for inspection.
+    """
+    CREATE TABLE IF NOT EXISTS release_gate_decisions (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        destination_id UUID NOT NULL,
+        event_id UUID,
+        delivery_id UUID REFERENCES deliveries(id),
+        decision TEXT NOT NULL,
+        disposition TEXT NOT NULL,
+        reason TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CHECK (decision IN ('approve', 'deny')),
+        CHECK (disposition IN (
+            'released', 'denied', 'duplicate', 'late_ignored',
+            'conflict', 'preview_not_delivered', 'not_gated', 'orphan'
+        ))
+    )
+    """,
+    # Exactly one effective answer (released / denied) per gated body. Audit
+    # rows for duplicate/conflict/late/pre-delivery/orphan decisions carry a
+    # null delivery_id and are outside this index.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS release_gate_decisions_effective_uniq
+        ON release_gate_decisions (delivery_id)
+        WHERE delivery_id IS NOT NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS release_gate_decisions_event_idx
+        ON release_gate_decisions (event_id, created_at DESC, id DESC)
+        WHERE event_id IS NOT NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS release_gate_decisions_destination_idx
+        ON release_gate_decisions (destination_id, created_at DESC, id DESC)
     """,
     # One row per callback receipt sent by a receiver. The disposition records
     # how the receipt was judged at ingestion time, so late/duplicate/orphan
@@ -431,7 +628,8 @@ SCHEMA_STATEMENTS = [
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed'))
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
+                          'release_denied', 'release_expired', 'release_voided'))
     """,
     # Idempotent upgrades for databases created before inbound source auth.
     # Every newly accepted event belongs to the registered source that pushed
@@ -511,7 +709,8 @@ SCHEMA_STATEMENTS = [
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed'))
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
+                          'release_denied', 'release_expired', 'release_voided'))
     """,
     # Widen the ingestion disposition check to include pending_confirmation.
     "ALTER TABLE ingestion_attempts DROP CONSTRAINT IF EXISTS ingestion_attempts_disposition_check",
@@ -538,7 +737,8 @@ SCHEMA_STATEMENTS = [
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed'))
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
+                          'release_denied', 'release_expired', 'release_voided'))
     """,
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_consecutive_failures_check",
     """
@@ -633,14 +833,16 @@ SCHEMA_STATEMENTS = [
         WHERE corrects_event_id IS NOT NULL
     """,
     # A correction copy that fails its send attempt ends in the terminal
-    # 'failed' state (see the deliveries table comment above). Widen the
-    # status check everywhere it is re-asserted so re-running init_db on a
-    # database that already has failed rows validates.
+    # 'failed' state (see the deliveries table comment above). Gated bodies
+    # that never go out end in release_denied / release_expired /
+    # release_voided. Widen the status check everywhere it is re-asserted so
+    # re-running init_db on a database that already has such rows validates.
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_status_check",
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
-        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed'))
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
+                          'release_denied', 'release_expired', 'release_voided'))
     """,
 ]
 

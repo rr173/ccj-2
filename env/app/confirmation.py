@@ -131,6 +131,33 @@ def arm_round(
     # an in-flight copy is left to finish its current HTTP call (already sent,
     # not recalled) but its generation now mismatches, so the worker neither
     # retries it on failure nor blocks the new queue on it for long.
+    #
+    # Close still-held gated bodies FIRST, with the gate's own terminal state
+    # (release_voided): the queued preview can never reach the address at the
+    # old location, so its content must not later read as a plain 'superseded'
+    # row that is still 'held'. Bodies already released and still queued are
+    # left for the generic supersede below.
+    from app import release as release_gate
+
+    release_gate.relocate_held_bodies(db, destination_id)
+    superseded_previews = db.execute(
+        text(
+            """
+            UPDATE deliveries
+            SET status = 'superseded',
+                updated_at = now()
+            WHERE destination_id = CAST(:destination_id AS UUID)
+              AND confirmation_generation < (
+                  SELECT confirmation_generation FROM destinations
+                  WHERE id = CAST(:destination_id AS UUID)
+              )
+              AND status = 'pending'
+              AND phase = 'preview'
+            RETURNING id
+            """
+        ),
+        {"destination_id": destination_id},
+    ).mappings().all()
     db.execute(
         text(
             """
@@ -147,6 +174,14 @@ def arm_round(
         ),
         {"destination_id": destination_id},
     )
+    # Defensive: a preview abandoned in the queue (e.g. one whose body escaped
+    # the generation-scoped pass) voids the held body behind it.
+    for row in superseded_previews:
+        release_gate.void_body_after_preview_failure(
+            db,
+            preview_id=str(row["id"]),
+            reason="preview_superseded",
+        )
     return dict(result)
 
 

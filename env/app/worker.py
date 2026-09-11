@@ -21,6 +21,7 @@ from app.confirmation import (
 from app.config import settings
 from app.db import SessionLocal, build_engine
 from app.models import init_db
+from app import release as release_gate
 
 logger = logging.getLogger("event-worker")
 
@@ -86,6 +87,17 @@ CLAIM_SQL = text(
             FROM deliveries e
             WHERE e.destination_id = d.id
               AND e.status IN ('pending', 'in_flight')
+              -- Preview-consent gate ("预告 + 点头才给正文"). The head is
+              -- picked only among deliverable copies: a gated body stays
+              -- pending and queues in seq order, but it is not deliverable
+              -- until this same address has nodded (release_state
+              -- 'released'), so the preview queued immediately before it is
+              -- what becomes the head. Previews, ordinary copies and
+              -- corrections (release_state NULL) pass as before.
+              AND (
+                    e.release_state IS NULL
+                 OR e.release_state = 'released'
+              )
             ORDER BY e.destination_seq
             LIMIT 1
         ) oldest
@@ -137,10 +149,15 @@ CLAIM_SQL = text(
         FROM candidate_destination d,
         LATERAL (
             SELECT id, status, next_attempt_at, not_before,
-                   confirmation_generation
+                   confirmation_generation, phase, release_state,
+                   preview_delivery_id
             FROM deliveries
             WHERE destination_id = d.id
               AND status IN ('pending', 'in_flight')
+              -- Same deliverable gate as the candidate head: held gated
+              -- bodies are skipped here too so the preceding preview is the
+              -- copy picked.
+              AND (release_state IS NULL OR release_state = 'released')
             ORDER BY destination_seq
             LIMIT 1
             FOR UPDATE SKIP LOCKED
@@ -150,6 +167,7 @@ CLAIM_SQL = text(
           AND picked.next_attempt_at <= now()
           AND (picked.not_before IS NULL OR picked.not_before <= now())
           AND picked.confirmation_generation = d.confirmation_generation
+          AND (picked.release_state IS NULL OR picked.release_state = 'released')
         RETURNING
             e.*,
             CASE
@@ -179,6 +197,10 @@ CLAIM_SQL = text(
         e.claim_token,
         e.consecutive_failures,
         e.confirmation_generation,
+        e.phase,
+        e.release_state,
+        e.body_delivery_id,
+        e.consent_timeout_seconds,
         d.url AS destination_url,
         e.recovered_destination,
         ev.corrects_event_id,
@@ -468,15 +490,25 @@ def deliver(
     payload: dict[str, Any],
     destination_seq: int,
     corrects_event_id: str | None = None,
+    phase: str = "body",
+    preview_payload: dict[str, Any] | None = None,
+    consent_timeout_seconds: int | None = None,
+    body_delivery_id: str | None = None,
 ) -> dict[str, Any]:
-    body = {
+    # Previews ("预告") and bodies ("正文") are two distinct messages. A
+    # preview never carries the real payload: the receiver only sees the
+    # optional short preview text, how long it has to nod, and which event the
+    # notice is about. The body message keeps the existing shape and is only
+    # ever sent after this same address's nod.
+    is_preview = phase == "preview"
+    body: dict[str, Any] = {
         "event_id": event_id,
         "delivery_id": delivery_id,
         "event_type": event_type,
         "destination_id": destination_id,
         "destination_seq": destination_seq,
         "dedupe_key": dedupe_key,
-        "payload": payload,
+        "payload": payload if not is_preview else {},
     }
     headers = {
         "Content-Type": "application/json",
@@ -486,6 +518,15 @@ def deliver(
     }
     if event_type is not None:
         headers["X-Event-Type"] = event_type
+    if is_preview:
+        # Lets the receiver route the notice apart from a body delivery and
+        # answer via the consent endpoint instead of a business receipt.
+        headers["X-Message-Type"] = "event_preview"
+        body["message_type"] = "event_preview"
+        body["preview_payload"] = preview_payload or {}
+        body["consent_timeout_seconds"] = consent_timeout_seconds
+        if body_delivery_id is not None:
+            body["body_delivery_id"] = body_delivery_id
     if corrects_event_id is not None:
         # A correction is an additional send, not a recall: the receiver can
         # tell it apart and link it to the original event it corrects.
@@ -581,6 +622,12 @@ def record_result(
     # never dead-letters through the transport budget and never retries in
     # place — it ends terminally 'failed' further below.
     is_correction = bool(claim["is_correction"])
+    # A preview ("预告") is transported/retried like any copy but it never
+    # enters receipt reconciliation: a 2xx opens the consent window on its
+    # body instead. A preview that exhausts transport attempts dead-letters and
+    # its still-held body is cascaded to a terminal void — the address never
+    # got the notice, so it can never receive the body.
+    is_preview = claim["phase"] == "preview"
     if not result["success"] and not is_correction:
         should_isolate = claim["attempts"] >= settings.failure_threshold
         if should_isolate:
@@ -611,20 +658,26 @@ def record_result(
     )
 
     if result["success"]:
-        updated = db.execute(
-            EVENT_SUCCESS_SQL,
-            {
-                "delivery_id": claim["delivery_id"],
-                "claim_token": claim["claim_token"],
-                "receipt_timeout_seconds": settings.receipt_timeout_seconds,
-            },
-        )
-        if updated.rowcount != 1:
-            raise StaleClaimError(f"delivery {claim['delivery_id']} is no longer owned by this worker")
-        db.execute(
-            DESTINATION_SUCCESS_SQL,
-            {"destination_id": claim["destination_id"]},
-        )
+        if is_preview:
+            # The notice landed: mark it delivered (no receipt reconciliation)
+            # and open the consent deadline on the still-held body. The body's
+            # queue position never changes.
+            release_gate.mark_preview_delivered(db, claim["delivery_id"])
+        else:
+            updated = db.execute(
+                EVENT_SUCCESS_SQL,
+                {
+                    "delivery_id": claim["delivery_id"],
+                    "claim_token": claim["claim_token"],
+                    "receipt_timeout_seconds": settings.receipt_timeout_seconds,
+                },
+            )
+            if updated.rowcount != 1:
+                raise StaleClaimError(f"delivery {claim['delivery_id']} is no longer owned by this worker")
+            db.execute(
+                DESTINATION_SUCCESS_SQL,
+                {"destination_id": claim["destination_id"]},
+            )
     elif stale_generation:
         updated = db.execute(
             SUPERSEDE_FAILED_SQL,
@@ -636,6 +689,16 @@ def record_result(
         )
         if updated.rowcount != 1:
             raise StaleClaimError(f"delivery {claim['delivery_id']} is no longer owned by this worker")
+        if is_preview:
+            # A preview that died while the destination was relocating never
+            # reached this address: its still-held body is voided too (the
+            # queued copies are separately superseded by arm_round / the
+            # stale cleanup).
+            release_gate.void_body_after_preview_failure(
+                db,
+                preview_id=claim["delivery_id"],
+                reason="preview_superseded",
+            )
         logger.info(
             "superseded failed in-flight delivery_id=%s after destination location change",
             claim["delivery_id"],
@@ -666,6 +729,17 @@ def record_result(
         )
         if updated.rowcount != 1:
             raise StaleClaimError(f"delivery {claim['delivery_id']} is no longer owned by this worker")
+        if is_preview and should_dead_letter:
+            # The notice exhausted every transport attempt and is parked in
+            # the dead-letter area. Void its still-held body: the address
+            # never received the preview, so the content must never go out and
+            # must be queryable as "closed (preview never delivered)", not as
+            # a delivered body.
+            release_gate.void_body_after_preview_failure(
+                db,
+                preview_id=claim["delivery_id"],
+                reason="preview_dead_lettered",
+            )
 
     db.execute(
         ATTEMPT_SQL,
@@ -752,6 +826,16 @@ def process_once() -> bool:
             corrects_event_id=(
                 str(claim["corrects_event_id"])
                 if claim["corrects_event_id"]
+                else None
+            ),
+            phase=claim["phase"],
+            # Preview rows store the short preview text in payload itself; the
+            # real content only exists on the body row queued behind it.
+            preview_payload=claim["payload"] if claim["phase"] == "preview" else None,
+            consent_timeout_seconds=claim.get("consent_timeout_seconds"),
+            body_delivery_id=(
+                str(claim["body_delivery_id"])
+                if claim.get("body_delivery_id")
                 else None
             ),
         )
