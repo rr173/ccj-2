@@ -183,6 +183,13 @@ def eval_for(tr, destination_id):
     )
 
 
+def route_for(tr, destination_id):
+    return next(
+        (r for r in tr["routing"] if r["destination_id"] == destination_id),
+        None,
+    )
+
+
 # --- receivers --------------------------------------------------------------
 
 recv_match = MockReceiver()   # condition: amount >= 100
@@ -328,6 +335,17 @@ check(
     "withheld body was never delivered: receiver got nothing",
     fresh.events == [],
 )
+# The per-address routing summary must say "filtered" for that address, with
+# no body copy — and the trace itself must not have errored.
+routing = route_for(tr, ONLY)
+check(
+    "routing summary shows the address withheld (filtered)",
+    routing is not None and routing["outcome"] == "filtered"
+    and routing["matched"] is False
+    and routing["body_delivery_id"] is None
+    and routing["subscribed"] is True,
+    routing,
+)
 
 # A type with NO subscribers is still explicitly unrouted.
 r = push_event(K("u-none"), event_type=f"nobody{RUN}", payload={})
@@ -368,6 +386,29 @@ check(
     "the fanned copy carries the condition snapshot it was born with",
     copy["filter_spec"] == COND_HIGH,
     copy["filter_spec"],
+)
+
+# The per-address routing summary lists every relevant address and never
+# errors; outcomes agree with who actually got a body.
+tr_le = client.get(f"/v1/events/{e_le}/trace").json()
+expected_outcomes = {
+    DHIGH: "filtered",     # amount 10 < 100, no body
+    DSHADOW: "filtered",   # shadow withheld too, counted on its own
+    DEAST: "matched",      # region east, got a body
+    DPLAIN: "no_condition",  # unconditional, got a body
+}
+for did, outcome in expected_outcomes.items():
+    row = route_for(tr_le, did)
+    check(
+        f"routing row for {did[:8]} is {outcome}",
+        row is not None and row["outcome"] == outcome
+        and (row["body_delivery_id"] is not None) == (outcome == "matched" or outcome == "no_condition"),
+        row,
+    )
+check(
+    "routing covers exactly the four ETYPE subscribers",
+    len(tr_le["routing"]) == 4,
+    [r["outcome"] for r in tr_le["routing"]],
 )
 
 # ===========================================================================
@@ -587,6 +628,23 @@ check("withheld gated address received no preview and no body",
       g_recv.previews == [] and g_recv.events == [])
 check("the other gated address got its preview",
       [p["dedupe_key"] for p in g_other.previews] == [f"prev:{K('g-withheld')}"])
+# Routing summary on a gated withheld event: the conditional address filtered
+# (no body row), the unconditional one is present with a held/released body.
+gtr = client.get(f"/v1/events/{g_withheld_id}/trace").json()
+grow = route_for(gtr, DG)
+check(
+    "gated withheld routing says filtered with no body",
+    grow["outcome"] == "filtered" and grow["matched"] is False
+    and grow["body_delivery_id"] is None,
+    grow,
+)
+grow2 = route_for(gtr, DG2)
+check(
+    "gated unconditional address routed with a body copy",
+    grow2["outcome"] == "no_condition"
+    and grow2["body_delivery_id"] is not None,
+    grow2,
+)
 
 r = push_event(
     K("g-allowed"),
@@ -671,6 +729,14 @@ check(
     eval_for(ctr, DCA)["matched"] is False
     and eval_for(ctr, DCA)["filter_spec"]
     == {"path": "v", "op": "eq", "value": 3},
+)
+check(
+    "correction routing: DCA filtered, DCB matched with a body",
+    route_for(ctr, DCA)["outcome"] == "filtered"
+    and route_for(ctr, DCA)["body_delivery_id"] is None
+    and route_for(ctr, DCB)["outcome"] == "matched"
+    and route_for(ctr, DCB)["body_delivery_id"] is not None,
+    [route_for(ctr, DCA), route_for(ctr, DCB)],
 )
 
 # A correction whose corrected body is withheld by everyone is refused and

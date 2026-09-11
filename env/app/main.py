@@ -1,4 +1,5 @@
 import json
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
@@ -7,8 +8,10 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, s
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import text
 from sqlalchemy.engine import RowMapping
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger("ingest-api")
 
 from app.confirmation import (
     DESTINATION_CONFIRM_COLUMNS,
@@ -611,24 +614,7 @@ EVENT_WITH_COUNTS_SQL = """
            COUNT(d.id) FILTER (
                WHERE d.observe_only AND d.phase = 'preview'
                  AND d.status = 'delivered'
-           )::int AS shadow_previews_delivered_count,
-           -- Subscription conditions ("订阅条件"): judgements live in their
-           -- own table (one row per confirmed, condition-carrying subscriber),
-           -- so they are correlated scalar subqueries, not deliveries
-           -- aggregates — joining them here would multiply the counts above.
-           -- A withheld (matched=false) copy never existed; these counts are
-           -- what keeps "this address's own condition did not match" distinct
-           -- from "nobody subscribed" (unrouted).
-           (
-               SELECT COUNT(*)::int
-               FROM subscription_filter_evaluations fe
-               WHERE fe.event_id = e.id AND NOT fe.matched AND NOT fe.observe_only
-           ) AS filtered_out_count,
-           (
-               SELECT COUNT(*)::int
-               FROM subscription_filter_evaluations fe
-               WHERE fe.event_id = e.id AND NOT fe.matched AND fe.observe_only
-           ) AS shadow_filtered_out_count
+           )::int AS shadow_previews_delivered_count
     FROM events e
     LEFT JOIN deliveries d ON d.event_id = e.id
     LEFT JOIN event_type_ack_thresholds t ON t.event_type = e.event_type
@@ -636,6 +622,65 @@ EVENT_WITH_COUNTS_SQL = """
     WHERE {where}
     GROUP BY e.id, t.ack_threshold, p.event_type
 """
+
+
+# Subscription-condition ("订阅条件") withheld counts are deliberately kept
+# OUT of EVENT_WITH_COUNTS_SQL above: that SQL backs nearly every event
+# response, and joining a newer table into it would make every event query
+# fail together if the migration/table is missing. These counts live in their
+# own table (subscription_filter_evaluations) and are attached separately,
+# best-effort, by fetch_event_counts.
+FILTER_COUNTS_BY_IDS_SQL = """
+    SELECT event_id,
+           COUNT(*) FILTER (WHERE NOT observe_only)::int AS filtered_out_count,
+           COUNT(*) FILTER (WHERE observe_only)::int AS shadow_filtered_out_count
+    FROM subscription_filter_evaluations
+    WHERE NOT matched
+      AND event_id = ANY(CAST(:event_ids AS UUID[]))
+    GROUP BY event_id
+"""
+
+
+def attach_filter_counts(db: Session, rows: list[dict]) -> None:
+    """Best-effort: add withheld counts to already-materialized count dicts.
+
+    Every row must be a plain mutable dict carrying an ``id``. Any failure (a
+    missing table/column on a partially upgraded database, a transient DB
+    error) is swallowed and both counts stay zero, so attaching the condition
+    summary can never take an event query down."""
+    if not rows:
+        return
+    try:
+        ids = [str(row["id"]) for row in rows if row.get("id") is not None]
+        if not ids:
+            return
+        counts_rows = db.execute(
+            text(FILTER_COUNTS_BY_IDS_SQL), {"event_ids": ids}
+        ).all()
+        counts = {str(r[0]): (r[1], r[2]) for r in counts_rows}
+    except Exception:
+        db.rollback()
+        logger.warning(
+            "subscription-filter counts unavailable; defaulting to zero",
+        )
+        counts = {}
+    for row in rows:
+        real_n, shadow_n = counts.get(str(row["id"]), (0, 0))
+        row["filtered_out_count"] = real_n
+        row["shadow_filtered_out_count"] = shadow_n
+
+
+def fetch_event_counts(db: Session, where_sql: str, params: dict) -> dict:
+    """Run the core counts SQL for one event and attach the condition
+    counts, returning a materialized dict ready for event_response."""
+    event = db.execute(
+        text(EVENT_WITH_COUNTS_SQL.format(where=where_sql)), params
+    ).mappings().first()
+    if event is None:
+        return None
+    event = dict(event)
+    attach_filter_counts(db, [event])
+    return event
 
 
 @app.post(
@@ -1300,6 +1345,8 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
         if existing is None:  # pragma: no cover - cannot happen after a conflict
             db.rollback()
             raise HTTPException(status_code=500, detail="event insert conflict lost")
+        existing = dict(existing)
+        attach_filter_counts(db, [existing])
         signed_at = source["signed_at"]
         log_attempt(
             db,
@@ -1572,27 +1619,62 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     return event_response(result), 201
 
 
+@app.get("/v1/events/{event_id}", response_model=EventOut)
+def get_event(event_id: UUID, db: Session = Depends(get_db)):
+    # Direct single-event lookup; same row the trace wraps. Distinct 404
+    # from a trace-shaped response so callers do not have to parse trace.
+    event = fetch_event_counts(
+        db, "e.id = CAST(:event_id AS UUID)", {"event_id": str(event_id)}
+    )
+    if event is None:
+        raise HTTPException(status_code=404, detail="event not found")
+    return event_response(event)
+
+
 @app.get("/v1/events/{event_id}/trace", response_model=EventTraceOut)
 def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
-    event = db.execute(
-        text(EVENT_WITH_COUNTS_SQL.format(where="e.id = CAST(:event_id AS UUID)")),
-        {"event_id": event_id},
-    ).mappings().first()
+    event = fetch_event_counts(
+        db, "e.id = CAST(:event_id AS UUID)", {"event_id": str(event_id)}
+    )
     if event is None:
         raise HTTPException(status_code=404, detail="event not found")
 
-    deliveries = db.execute(
-        text(
-            f"""
-            SELECT {DELIVERY_COLUMNS}
-            FROM deliveries d
-            JOIN destinations dest ON dest.id = d.destination_id
-            WHERE d.event_id = CAST(:event_id AS UUID)
-            ORDER BY dest.url ASC, d.destination_seq ASC
-            """
-        ),
-        {"event_id": event_id},
-    ).mappings().all()
+    try:
+        deliveries = db.execute(
+            text(
+                f"""
+                SELECT {DELIVERY_COLUMNS}
+                FROM deliveries d
+                JOIN destinations dest ON dest.id = d.destination_id
+                WHERE d.event_id = CAST(:event_id AS UUID)
+                ORDER BY dest.url ASC, d.destination_seq ASC
+                """
+            ),
+            {"event_id": event_id},
+        ).mappings().all()
+    except Exception:
+        # Half-upgraded database (deliveries.filter_spec column missing):
+        # never let the trace fail. Retry without the filter-feature column;
+        # filter_spec on each copy then stays null.
+        db.rollback()
+        logger.warning(
+            "deliveries query with filter columns failed for event_id=%s; "
+            "retrying without them",
+            event_id,
+        )
+        fallback_columns = DELIVERY_COLUMNS.replace("d.filter_spec, ", "")
+        deliveries = db.execute(
+            text(
+                f"""
+                SELECT {fallback_columns}
+                FROM deliveries d
+                JOIN destinations dest ON dest.id = d.destination_id
+                WHERE d.event_id = CAST(:event_id AS UUID)
+                ORDER BY dest.url ASC, d.destination_seq ASC
+                """
+            ),
+            {"event_id": event_id},
+        ).mappings().all()
 
     attempts = db.execute(
         text(
@@ -1627,7 +1709,133 @@ def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
         "receipts": receipts,
         "corrections": list_corrections_of(db, event_id),
         "filter_evaluations": list_filter_evaluations_of(db, event_id),
+        "routing": build_event_routing(db, event_id),
     }
+
+
+# Row-per-address routing for one event. A single query brings together, per
+# address: the CURRENT subscription to this event's type (and its condition),
+# the fan-out verdict taken against this exact body
+# (subscription_filter_evaluations, including a null "never judged" row for
+# confirmed unconditional subscribers), and the body copy that was created.
+# Everything is LEFT-joined and COALESCEd so a partially-upgraded database or
+# a missing judgement row degrades to an explicit outcome ("unconfirmed" /
+# "unsubscribed") instead of failing the whole trace.
+EVENT_ROUTING_SQL = """
+    WITH ev AS (
+        SELECT id, event_type FROM events WHERE id = CAST(:event_id AS UUID)
+    )
+    SELECT dest.id AS destination_id,
+           dest.url AS destination_url,
+           dest.observe_only AS observe_only,
+           dest.confirmation_state = 'confirmed' AS is_confirmed,
+           (sub.destination_id IS NOT NULL) AS subscribed,
+           sub.filter_spec AS current_filter_spec,
+           fe.matched AS matched,
+           fe.filter_spec AS evaluated_filter_spec,
+           body.id AS body_delivery_id,
+           body.status AS body_status
+    FROM ev
+    -- The address universe relevant to this event: anything that currently
+    -- subscribes to the type, OR got a copy, OR was judged at fan-out.
+    JOIN destinations dest ON dest.id IN (
+        SELECT s.destination_id
+        FROM destination_subscriptions s
+        JOIN ev ON ev.event_type = s.event_type
+        UNION
+        SELECT d.destination_id FROM deliveries d
+        JOIN ev ON ev.id = d.event_id
+        UNION
+        SELECT fe.destination_id
+        FROM subscription_filter_evaluations fe
+        JOIN ev ON ev.id = fe.event_id
+    )
+    LEFT JOIN destination_subscriptions sub
+           ON sub.destination_id = dest.id
+          AND sub.event_type = (SELECT event_type FROM ev)
+    LEFT JOIN subscription_filter_evaluations fe
+           ON fe.destination_id = dest.id
+          AND fe.event_id = (SELECT id FROM ev)
+    LEFT JOIN LATERAL (
+        SELECT bd.id, bd.status
+        FROM deliveries bd
+        WHERE bd.event_id = CAST(:event_id AS UUID)
+          AND bd.destination_id = dest.id
+          AND bd.phase = 'body'
+        ORDER BY bd.destination_seq DESC
+        LIMIT 1
+    ) body ON TRUE
+    ORDER BY dest.url ASC NULLS LAST, dest.id
+"""
+
+
+def _routing_outcome(row: RowMapping) -> str:
+    """Derive the single routing verdict for an address from the joined row.
+
+    Order matters: a body copy or an explicit fan-out verdict is
+    authoritative; only when neither exists do we say why no copy was made
+    (still unconfirmed, or no longer subscribed)."""
+    if row["body_delivery_id"] is not None:
+        # A body copy exists: the address passed its condition, or it had
+        # none. The body's own lifecycle (release_*/dead-lettered/...) is
+        # visible in body_status.
+        return "matched" if row["evaluated_filter_spec"] is not None else "no_condition"
+    if row["matched"] is not None:
+        # Judged at fan-out but no body copy: false means withheld by its
+        # own condition; true without a body can only be a gated body closed
+        # before release — it passed the condition, so this is still matched.
+        return "matched" if row["matched"] else "filtered"
+    # No copy and no fan-out judgement row.
+    if not row["subscribed"]:
+        return "unsubscribed"
+    if not row["is_confirmed"]:
+        return "unconfirmed"
+    # Confirmed and still subscribed. A condition-carrying address would have
+    # an evaluation row, so a missing one with a current condition means the
+    # judgement has aged out / predates this feature: report it honestly as
+    # an unconfirmed-at-fan-out style "not routed" rather than as a pass.
+    return "unconfirmed" if row["current_filter_spec"] is not None else "no_condition"
+
+
+def build_event_routing(db: Session, event_id: UUID) -> list[dict]:
+    """Collect one routing row per relevant address.
+
+    This section is best-effort: the condition verdicts are the point of the
+    trace, so a failure to assemble the summary must never take the whole
+    event query down. Anything unexpected falls back to an empty list while
+    the detailed deliveries/filter_evaluations sections are still returned.
+    """
+    try:
+        rows = db.execute(
+            text(EVENT_ROUTING_SQL), {"event_id": str(event_id)}
+        ).mappings().all()
+    except Exception:
+        # A pre-filter-feature database that has not yet gained the table (or
+        # any other structural mismatch) must still answer the event query.
+        db.rollback()
+        logger.warning(
+            "event routing summary unavailable for event_id=%s; returning "
+            "detailed sections only",
+            event_id,
+        )
+        return []
+    result = []
+    for row in rows:
+        result.append(
+            {
+                "destination_id": row["destination_id"],
+                "destination_url": row["destination_url"],
+                "observe_only": bool(row["observe_only"]),
+                "subscribed": bool(row["subscribed"]),
+                "filter_spec": row["current_filter_spec"],
+                "outcome": _routing_outcome(row),
+                "matched": row["matched"],
+                "evaluated_filter_spec": row["evaluated_filter_spec"],
+                "body_delivery_id": row["body_delivery_id"],
+                "body_status": row["body_status"],
+            }
+        )
+    return result
 
 
 def list_filter_evaluations_of(db: Session, event_id: UUID) -> list:
@@ -1635,19 +1843,30 @@ def list_filter_evaluations_of(db: Session, event_id: UUID) -> list:
     # matched=false rows are exactly the "this address's own condition did not
     # match, so it got no copy" outcomes — distinct from an unrouted event
     # (nobody subscribed) and from a subscriber still waiting on confirmation
-    # (which is never evaluated and never appears here).
-    return db.execute(
-        text(
-            """
-            SELECT id, event_id, destination_id, event_type, matched,
-                   filter_spec, observe_only, created_at
-            FROM subscription_filter_evaluations
-            WHERE event_id = CAST(:event_id AS UUID)
-            ORDER BY created_at ASC, id ASC
-            """
-        ),
-        {"event_id": str(event_id)},
-    ).mappings().all()
+    # (which is never evaluated and never appears here). Best-effort: a
+    # pre-filter-feature database without the table must still return the
+    # trace, just with an empty section.
+    try:
+        return db.execute(
+            text(
+                """
+                SELECT id, event_id, destination_id, event_type, matched,
+                       filter_spec, observe_only, created_at
+                FROM subscription_filter_evaluations
+                WHERE event_id = CAST(:event_id AS UUID)
+                ORDER BY created_at ASC, id ASC
+                """
+            ),
+            {"event_id": str(event_id)},
+        ).mappings().all()
+    except Exception:
+        db.rollback()
+        logger.warning(
+            "subscription-filter evaluations unavailable for event_id=%s; "
+            "returning an empty section",
+            event_id,
+        )
+        return []
 
 
 @app.get(
@@ -1666,31 +1885,41 @@ def list_filter_evaluations(
     # matched=false&destination_id=... to answer "why did this address not get
     # this one"; each row carries the exact condition snapshot that was
     # judged, so the outcome never collapses into "nobody subscribed".
-    return db.execute(
-        text(
-            """
-            SELECT id, event_id, destination_id, event_type, matched,
-                   filter_spec, observe_only, created_at
-            FROM subscription_filter_evaluations
-            WHERE (CAST(:event_id AS UUID) IS NULL
-                   OR event_id = CAST(:event_id AS UUID))
-              AND (CAST(:destination_id AS UUID) IS NULL
-                   OR destination_id = CAST(:destination_id AS UUID))
-              AND (:matched IS NULL OR matched = :matched)
-              AND (CAST(:event_type AS TEXT) IS NULL
-                   OR event_type = CAST(:event_type AS TEXT))
-            ORDER BY created_at DESC, id DESC
-            LIMIT :limit
-            """
-        ),
-        {
-            "event_id": str(event_id) if event_id else None,
-            "destination_id": str(destination_id) if destination_id else None,
-            "matched": matched,
-            "event_type": event_type,
-            "limit": limit,
-        },
-    ).mappings().all()
+    try:
+        return db.execute(
+            text(
+                """
+                SELECT id, event_id, destination_id, event_type, matched,
+                       filter_spec, observe_only, created_at
+                FROM subscription_filter_evaluations
+                WHERE (CAST(:event_id AS UUID) IS NULL
+                       OR event_id = CAST(:event_id AS UUID))
+                  AND (CAST(:destination_id AS UUID) IS NULL
+                       OR destination_id = CAST(:destination_id AS UUID))
+                  AND (:matched IS NULL OR matched = :matched)
+                  AND (CAST(:event_type AS TEXT) IS NULL
+                       OR event_type = CAST(:event_type AS TEXT))
+                ORDER BY created_at DESC, id DESC
+                LIMIT :limit
+                """
+            ),
+            {
+                "event_id": str(event_id) if event_id else None,
+                "destination_id": str(destination_id) if destination_id else None,
+                "matched": matched,
+                "event_type": event_type,
+                "limit": limit,
+            },
+        ).mappings().all()
+    except Exception:
+        # Pre-filter-feature database without the table: report an empty
+        # audit trail rather than failing the query.
+        db.rollback()
+        logger.warning(
+            "subscription-filter evaluations table unavailable; "
+            "returning an empty audit trail",
+        )
+        return []
 
 
 # --- Corrections ("补一笔更正") ------------------------------------------------
@@ -1718,6 +1947,8 @@ def list_corrections_of(db: Session, event_id: UUID) -> list[dict]:
     rows = db.execute(
         text(CORRECTIONS_OF_EVENT_SQL), {"event_id": str(event_id)}
     ).mappings().all()
+    rows = [dict(row) for row in rows]
+    attach_filter_counts(db, rows)
     return [event_response(row) for row in rows]
 
 
@@ -1902,6 +2133,8 @@ def create_correction(
             text(EVENT_WITH_COUNTS_SQL.format(where="e.id = CAST(:correction_id AS UUID)")),
             {"correction_id": str(existing["id"])},
         ).mappings().first()
+        duplicate = dict(duplicate)
+        attach_filter_counts(db, [duplicate])
         db.commit()
         result = event_response(duplicate)
         result["duplicate"] = True
@@ -2095,11 +2328,9 @@ def lock_event_deliveries(db: Session, event_id: UUID):
 
 
 def fetch_event_response(db: Session, event_id: UUID) -> dict:
-    row = db.execute(
-        text(EVENT_WITH_COUNTS_SQL.format(where="e.id = CAST(:event_id AS UUID)")),
-        {"event_id": str(event_id)},
-    ).mappings().first()
-    return event_response(row)
+    return event_response(fetch_event_counts(
+        db, "e.id = CAST(:event_id AS UUID)", {"event_id": str(event_id)}
+    ))
 
 
 def event_already_sent(deliveries) -> bool:

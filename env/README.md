@@ -190,11 +190,18 @@
 - **条件后来改了只接下一条**：条件只在入库扇出时读当前值；已经排给该地址的副本带着出生时的快照，改/删条件不影响它们，也不会把旧副本收回来。副本上永远能查到它是对哪条条件成立才生成的。
 - **各家条件各算各的**：判定按 `(事件, 地址)` 独立进行，A 的条件成立与否绝不影响 B；同一事件里 A 被挡、B 照发是常态。当真地址和 `observe_only` 影子地址的判定也各自独立、分别计数（`filtered_out_count` / `shadow_filtered_out_count`）。
 - **没订这个类型的，写了条件也不要给**：条件必须依附订阅；退订（从 `event_types` 移除）后该类型的新事件既不生成副本也不产生判定记录。还没完成上线确认的地址在扇出时根本不参与，条件**不会**被求值（保持 `pending_confirmation` 语义，不与"条件没对上"混淆）。
-- **查这一笔要能看出是"这家条件没对上"**：
-  - 事件 trace（`GET /v1/events/{id}/trace`）新增 `filter_evaluations` 段，逐地址列出 `matched`、条件快照、是否影子；每份真实副本也带自己的 `filter_spec`。
+- **查这一笔要能看出是"这家条件没对上"**（查询绝不能因为条件信息缺失/部分升级而报错——条件相关的统计都是独立、容错的查询，缺表/缺列时降级为 0/空段，事件本体与 `deliveries` 照常返回）：
+  - `GET /v1/events/{id}`：直接查单笔事件（返回 `EventOut`）；`GET /v1/events/{id}/trace` 返回完整轨迹。
+  - trace 新增 **`routing` 段：每个相关地址一行，一眼看到它过没过条件**：
+    - `outcome = "matched"`：有条件且正文对上了（`body_delivery_id` 指向它那份正文副本）；
+    - `outcome = "filtered"`：**这家自己的条件没对上，没给它、也没有副本**（`matched=false`、`body_delivery_id=null`、`evaluated_filter_spec` 是当时判定的条件快照）；
+    - `outcome = "no_condition"`：订了但没挂条件，照收；
+    - `outcome = "unconfirmed"`：当时还没完成上线确认，既没副本也没判条件（对应 `pending_confirmation`）；
+    - `outcome = "unsubscribed"`：现在已不订这个类型。每行还带当前订阅条件 `filter_spec`、当前是否仍订阅 `subscribed`、是否影子 `observe_only`、正文副本状态 `body_status`。
+  - trace 另有 `filter_evaluations` 段，逐地址列出原始判定（`matched`、条件快照、是否影子）；每份真实副本也带自己的 `filter_spec` 快照。
   - 事件响应/汇总新增当真/影子被条件挡住的计数 `filtered_out_count` / `shadow_filtered_out_count`。
   - 全局可查：`GET /v1/filter-evaluations?event_id=...&destination_id=...&matched=false&event_type=...`。
-  - **与"压根没人订"明确区分**：所有已确认订户的条件都不满足时，事件照收照存，传输状态是 `filtered`，准入记录 disposition 也是 `filtered`；没有任何订户的类型仍是 `unrouted`。两种都没有副本、都不会写成已发，但任何查询都不会把它们混成一种。
+  - **与"压根没人订"明确区分**：所有已确认订户的条件都不满足时，事件照收照存，传输状态是 `filtered`，准入记录 disposition 也是 `filtered`；没有任何订户的类型仍是 `unrouted`（trace 的 `routing` 段为空）。两种都没有副本、都不会写成已发，但任何查询都不会把它们混成一种。
 - **预告放行（gated）类型同样适用**：条件不成立时连预告都不生成（预告本身也会暴露"有这么一件事"）；该地址点头/不要接口对它返回 `orphan`。
 - **更正（correction）按更正自己的正文、用当前条件重判**：更正扇出名单原本是"原事件真正投妥过的地址"，现在还要用**更正自己的正文**对每个地址**当前**的条件再判一次；对不上的地址不补，判定同样落 `subscription_filter_evaluations`（挂在更正这笔事件上）。所有候选地址都被挡住时更正返回 409、什么都不创建，也不占用 `dedupe_key`（之后内容对得上还能用同一个键提交）。
 - **确定性**：求值是 `(条件, 正文)` 的纯函数（无时钟、无随机、无网络、不求值表达式）；同一份正文对着同一套条件再看一次，给/不给必然一致。
@@ -637,7 +644,7 @@ curl -s http://localhost:8000/v1/events/<correction_event_id>/trace
 curl -s http://localhost:8000/v1/events/<event_id>/trace
 ```
 
-返回事件当前传输状态和整笔对账状态（`reconcile_status`，以及已认/未认数量）、每个地址的副本（`deliveries`：状态、序号、已尝试次数、下次尝试时间、最近错误、对账状态 `reconcile_state`、对账时限 `reconcile_deadline`、回执结果 `receipt_result`、连续失败次数与死信原因/进入时间，以及 `observe_only` 是否只跟着看、`filter_spec` 这份副本出生时命中的订阅条件快照）、全部投递尝试（`attempts`：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息；若某次调用是在租约丢失后返回的，会带 `lost_lease: true`）和该事件命中的回执（`receipts`）。`filter_evaluations` 段逐地址列出订阅条件判定（`matched`、条件快照、是否影子）：`matched=false` 的行就是"这家自己的条件没对上所以没拿到"，与压根没人订（`unrouted`、`deliveries` 与本段都为空）一眼分得开。部分地址已认时，整笔是 `partially_acknowledged`，不会写成已认完；逐个查看副本即可知道谁认了、谁还没认——其中 `observe_only: true` 的副本只是跟着看：它认了不会让整笔变 `acknowledged`，它没认/超时/进死信也不会把已经认完的整笔拖回去（影子计数单列在 `shadow_*` 字段）。没人订的事件在这里能看到 `status: "unrouted"` 且 `deliveries` 为空——是明确的“没送出去”，不是成功；有订户但条件全没对上的事件则是 `status: "filtered"` 且 `filter_evaluations` 里每家一条 `matched=false`。所有活动副本都进了死信处、且没有还在排队/投递中的副本时，事件整体 `status` 为 `dead_lettered`。轨迹里另有 `corrections` 段，列出这笔事件名下的全部更正（每笔更正都是一个带 `corrects_event_id` 的普通事件响应，可再用它自己的 `/trace` 追查；更正也有自己的 `filter_evaluations`——用更正正文对当前条件重判的结果）；没有更正时为空列表——没人订或没打出去过的事件永远查不到更正，不会写成已经发出去。
+返回事件当前传输状态和整笔对账状态（`reconcile_status`，以及已认/未认数量）、每个地址的副本（`deliveries`：状态、序号、已尝试次数、下次尝试时间、最近错误、对账状态 `reconcile_state`、对账时限 `reconcile_deadline`、回执结果 `receipt_result`、连续失败次数与死信原因/进入时间，以及 `observe_only` 是否只跟着看、`filter_spec` 这份副本出生时命中的订阅条件快照）、全部投递尝试（`attempts`：开始/结束时间、是否成功、HTTP 状态码、响应片段或错误信息；若某次调用是在租约丢失后返回的，会带 `lost_lease: true`）和该事件命中的回执（`receipts`）。`filter_evaluations` 段逐地址列出订阅条件判定（`matched`、条件快照、是否影子），`routing` 段则把**每个相关地址过没过条件**汇成一行（`matched` 过了 / `filtered` 自家条件没对上 / `no_condition` 无条件照收 / `unconfirmed` 当时没确认 / `unsubscribed` 已退订）：`matched=false` 或 `outcome="filtered"` 就是"这家自己的条件没对上所以没拿到"，与压根没人订（`unrouted`、`deliveries`/`routing` 都为空）一眼分得开。部分地址已认时，整笔是 `partially_acknowledged`，不会写成已认完；逐个查看副本即可知道谁认了、谁还没认——其中 `observe_only: true` 的副本只是跟着看：它认了不会让整笔变 `acknowledged`，它没认/超时/进死信也不会把已经认完的整笔拖回去（影子计数单列在 `shadow_*` 字段）。没人订的事件在这里能看到 `status: "unrouted"` 且 `deliveries` 为空——是明确的“没送出去”，不是成功；有订户但条件全没对上的事件则是 `status: "filtered"` 且 `filter_evaluations` 里每家一条 `matched=false`。所有活动副本都进了死信处、且没有还在排队/投递中的副本时，事件整体 `status` 为 `dead_lettered`。轨迹里另有 `corrections` 段，列出这笔事件名下的全部更正（每笔更正都是一个带 `corrects_event_id` 的普通事件响应，可再用它自己的 `/trace` 追查；更正也有自己的 `filter_evaluations`——用更正正文对当前条件重判的结果）；没有更正时为空列表——没人订或没打出去过的事件永远查不到更正，不会写成已经发出去。
 
 ### 回执接入（接收方回调）
 

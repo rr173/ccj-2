@@ -530,13 +530,15 @@ class EventTraceOut(BaseModel):
     # them. Empty when nothing was ever corrected — in particular for events
     # that never went out anywhere.
     corrections: list[EventOut] = []
-    # One row per confirmed subscriber whose subscription carries a
-    # condition, evaluated once against this exact body at fan-out: matched
-    # copies were created, withheld ("条件没对上") ones were not. This is what
-    # distinguishes "this address's own condition did not match" from an event
-    # with no subscribers (unrouted). Subscriptions without a condition and
-    # still-unconfirmed subscribers do not appear here.
+    # One row per condition-carrying confirmed subscriber judged at fan-out.
+    # The per-address routing list below additionally covers unconditional and
+    # not-yet-confirmed subscribers, so every receiving address's pass/withhold
+    # outcome is visible in one place without cross-referencing tables.
     filter_evaluations: list["SubscriptionFilterEvaluationOut"] = []
+    # One row per relevant address (it has a copy, a condition judgement, a
+    # current subscription, or is otherwise connected to this event type):
+    # pass / withheld / unconfirmed / unsubscribed, all in one list.
+    routing: list["EventRoutingOut"] = []
 
 
 class SubscriptionFilterEvaluationOut(BaseModel):
@@ -553,6 +555,47 @@ class SubscriptionFilterEvaluationOut(BaseModel):
     filter_spec: dict[str, Any]
     observe_only: bool = False
     created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# Per-destination routing outcome for ONE event, collected from everything the
+# system knew about the address at fan-out: its current subscription (and
+# condition snapshot), whether this exact body passed that address's OWN
+# condition, and the body copy it ended up with (null when no copy was made).
+# This is the row-per-address answer to "did each receiving address pass its
+# condition" — it must never collapse a withheld address into "nobody
+# subscribed" and must stay queryable even when part of the surrounding data
+# is missing.
+class EventRoutingOut(BaseModel):
+    destination_id: UUID
+    destination_url: str | None = None
+    observe_only: bool = False
+    # Subscribed to the event's type at query time.
+    subscribed: bool
+    # The address's CURRENT condition for the type (null = no condition, the
+    # address receives every event of the type). For a judgement taken at
+    # fan-out time see `matched` / `filter_spec` (the snapshot then judged).
+    filter_spec: dict[str, Any] | None = None
+    # confirmed: handshake done and the address was an eligible subscriber at
+    #            fan-out, so its condition WAS evaluated:
+    #              no_condition  — it subscribes without a condition, receives;
+    #              matched       — its own condition held, a copy was created;
+    #              filtered      — its own condition withheld the body, no copy;
+    # unconfirmed: it subscribed but had not completed the handshake then — no
+    #              copy and no condition evaluation (pending_confirmation);
+    # unsubscribed: it is no longer subscribed to the type (no copy).
+    outcome: str
+    # The fan-out verdict for this address when it carried a condition at
+    # ingest/correction time; null for unconditional / unconfirmed / no-longer-
+    # subscribed addresses.
+    matched: bool | None = None
+    # Condition snapshot that was actually judged (null when none was judged).
+    evaluated_filter_spec: dict[str, Any] | None = None
+    # The body copy this address got (the preview of a gated pair is reached
+    # via its preview_delivery_id); null when no copy was created.
+    body_delivery_id: UUID | None = None
+    body_status: str | None = None
 
     model_config = {"from_attributes": True}
 
