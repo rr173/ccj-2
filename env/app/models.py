@@ -230,6 +230,26 @@ SCHEMA_STATEMENTS = [
         released_at TIMESTAMPTZ,
         voided_at TIMESTAMPTZ,
         void_reason TEXT,
+        -- Relay chain ("接力"): when this copy is a station of an
+        -- event-type relay chain, relay_chain_id is the chain VERSION the
+        -- event set out under and relay_station_no is this station's
+        -- position in it (1-based). Both are snapshotted onto the copy at
+        -- fan-out: re-defining the chain order only applies to events
+        -- accepted afterwards; an event already on its way keeps walking
+        -- exactly the stations it set out with. Null on every ordinary
+        -- (non-relay) copy and on corrections.
+        relay_chain_id UUID,
+        relay_station_no INTEGER,
+        -- Set only on stations permanently skipped ("不再补") because an
+        -- earlier station of the same relay run stopped; relay_skipped_at
+        -- says when and relay_skip_reason why (copied from the triggering
+        -- station's stop reason). relay_stopped_by_delivery_id points at the
+        -- station that triggered the cascade. A skipped row is terminal,
+        -- never sent and never backfilled, so it can never be written as
+        -- "sent to a later station".
+        relay_skipped_at TIMESTAMPTZ,
+        relay_skip_reason TEXT,
+        relay_stopped_by_delivery_id UUID,
         UNIQUE (destination_id, destination_seq),
         UNIQUE (destination_id, dedupe_key),
         -- superseded: the destination changed location before this copy was
@@ -247,8 +267,38 @@ SCHEMA_STATEMENTS = [
         -- did not nod before the agreed deadline, or the not-yet-out body was
         -- voided manually / because its preview never made it through.
         CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
-                          'release_denied', 'release_expired', 'release_voided')),
+                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped')),
         CHECK (phase IN ('preview', 'body')),
+        CHECK (
+            -- Relay-chain snapshots come as a pair and only ever appear on
+            -- body copies (relay types are never preview-gated); station
+            -- numbers start at 1.
+            (relay_chain_id IS NULL) = (relay_station_no IS NULL)
+        ),
+        CHECK (relay_station_no IS NULL OR relay_station_no >= 1),
+        CHECK (
+            -- The skip audit columns exist only together and only on a
+            -- terminal relay_skipped row.
+            (status = 'relay_skipped') = (relay_skip_reason IS NOT NULL)
+        ),
+        CHECK (
+            relay_skip_reason IS NULL OR relay_skip_reason IN (
+                -- The previous station exhausted its transport retries /
+                -- dead-lettered, or dead-lettered after receipt cycles.
+                'delivery_attempts_exhausted',
+                'receipt_timeout_exhausted',
+                'receipt_failure_exhausted',
+                -- The previous station answered with a failure receipt while
+                -- still inside its requeue budget.
+                'receipt_failed',
+                -- Reconciliation timed out for the previous station while it
+                -- still had requeue budget.
+                'receipt_timeout',
+                -- The previous station's destination changed location before
+                -- the copy could be sent.
+                'superseded'
+            )
+        ),
         CHECK (
             release_state IS NULL
             OR release_state IN (
@@ -687,7 +737,7 @@ SCHEMA_STATEMENTS = [
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
         CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
-                          'release_denied', 'release_expired', 'release_voided'))
+                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped'))
     """,
     # Idempotent upgrades for databases created before inbound source auth.
     # Every newly accepted event belongs to the registered source that pushed
@@ -768,7 +818,7 @@ SCHEMA_STATEMENTS = [
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
         CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
-                          'release_denied', 'release_expired', 'release_voided'))
+                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped'))
     """,
     # Widen the ingestion disposition check to include pending_confirmation.
     "ALTER TABLE ingestion_attempts DROP CONSTRAINT IF EXISTS ingestion_attempts_disposition_check",
@@ -796,7 +846,7 @@ SCHEMA_STATEMENTS = [
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
         CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
-                          'release_denied', 'release_expired', 'release_voided'))
+                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped'))
     """,
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_consecutive_failures_check",
     """
@@ -924,7 +974,100 @@ SCHEMA_STATEMENTS = [
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
         CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
-                          'release_denied', 'release_expired', 'release_voided'))
+                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped'))
+    """,
+    # Idempotent upgrades for per-event-type relay chains ("接力"). One
+    # ACTIVE chain per event type; stations are an ordered list of
+    # destinations (no destination may occupy two stations of one chain).
+    # Events of that type accepted AFTER the chain is defined go only to its
+    # stations, one station at a time, each later station created pending and
+    # withheld until the previous station carries a matching success receipt.
+    # Re-defining a chain never mutates a version already in flight: every
+    # PUT creates a new version row, and each delivery snapshots
+    # (relay_chain_id, relay_station_no) at fan-out, so an event already
+    # walking a chain keeps the stations it set out with while only later
+    # accepted events follow the new order.
+    """
+    CREATE TABLE IF NOT EXISTS relay_chains (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_type TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (event_type, version)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS relay_chains_active_uniq
+        ON relay_chains (event_type) WHERE active = TRUE
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS relay_chain_stations (
+        chain_id UUID NOT NULL REFERENCES relay_chains(id),
+        station_no INTEGER NOT NULL,
+        destination_id UUID NOT NULL REFERENCES destinations(id),
+        PRIMARY KEY (chain_id, station_no),
+        -- The same destination can never occupy two stations of one chain.
+        UNIQUE (chain_id, destination_id),
+        CHECK (station_no >= 1)
+    )
+    """,
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS relay_chain_id UUID",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS relay_station_no INTEGER",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS relay_skipped_at TIMESTAMPTZ",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS relay_skip_reason TEXT",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS relay_stopped_by_delivery_id UUID",
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.table_constraints
+            WHERE constraint_name = 'deliveries_relay_chain_fkey'
+        ) THEN
+            ALTER TABLE deliveries
+                ADD CONSTRAINT deliveries_relay_chain_fkey
+                FOREIGN KEY (relay_chain_id) REFERENCES relay_chains(id);
+        END IF;
+    END $$
+    """,
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_relay_snapshot_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_relay_snapshot_check
+        CHECK ((relay_chain_id IS NULL) = (relay_station_no IS NULL))
+    """,
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_relay_station_no_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_relay_station_no_check
+        CHECK (relay_station_no IS NULL OR relay_station_no >= 1)
+    """,
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_relay_skip_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_relay_skip_check
+        CHECK (
+            (status = 'relay_skipped') = (relay_skip_reason IS NOT NULL)
+        )
+    """,
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_relay_skip_reason_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_relay_skip_reason_check
+        CHECK (
+            relay_skip_reason IS NULL OR relay_skip_reason IN (
+                'delivery_attempts_exhausted',
+                'receipt_timeout_exhausted',
+                'receipt_failure_exhausted',
+                'receipt_failed',
+                'receipt_timeout',
+                'superseded'
+            )
+        )
+    """,
+    # Worker claim gate: relay stations are selected but their pending rows
+    # only become deliverable once the previous station of the same run is
+    # acknowledged; relay_skipped rows are terminal and never selected.
+    """
+    CREATE INDEX IF NOT EXISTS deliveries_relay_gate_idx
+        ON deliveries (event_id, relay_chain_id, relay_station_no)
+        WHERE relay_chain_id IS NOT NULL
     """,
 ]
 

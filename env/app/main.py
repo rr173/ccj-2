@@ -35,6 +35,7 @@ from app.ingest_auth import (
 )
 from app.models import init_db
 from app import release as release_gate
+from app import relay
 from app.config import settings
 from app.receipts import ingest_receipt
 from app.subfilters import (
@@ -73,6 +74,8 @@ from app.schemas import (
     ReceiptOut,
     ReconciliationSummaryOut,
     RecoveryOut,
+    RelayChainIn,
+    RelayChainOut,
     ReleaseGateDecisionOut,
     ReleaseGateOut,
     ReissueChallengeOut,
@@ -304,9 +307,18 @@ def event_status(
     shadow_release_closed_count: int = 0,
     filtered_count: int = 0,
     shadow_filtered_count: int = 0,
+    relay_skipped_count: int = 0,
+    relay_halted: bool = False,
 ) -> str:
     if cancelled_at is not None:
         return "cancelled"
+    # Relay chain ("接力"): a run that stopped at some station (failure
+    # receipt / reconcile timeout / dead-letter / superseded) with no live
+    # copy left to send is reported as its own state, distinct from a fully
+    # delivered run and from ordinary dead-lettering. Earlier stations may
+    # well have acknowledged; the relay view says exactly where it stopped.
+    if relay_halted and live_count == 0:
+        return "relay_halted"
     # Bodies terminally closed by the preview gate ("no", deadline passed with
     # no nod, manual/cascading void) never went out: they are excluded from
     # live_count by the caller. Subtract them from the total elsewhere; here
@@ -346,6 +358,15 @@ def event_status(
     # For-real copies decide the transport state. A shadow copy being parked
     # (dead-letter) or still pending can never hold the whole event back here,
     # and a shadow's 2xx can never make the event look delivered either.
+    if relay_halted:
+        # A relay run that stopped at some station (failure receipt /
+        # reconcile timeout / dead-letter / supersede) and has no copy still
+        # advancing reads as its own state, distinct from a fully delivered
+        # run: the triggering station may still be status=delivered (a failure
+        # receipt does not un-deliver transport), so this must precede the
+        # "every live copy got a 2xx" branch. Earlier stations may well have
+        # acknowledged; the relay view says exactly where it stopped.
+        return "relay_halted"
     if pending_count > 0:
         return "pending"
     if dead_lettered_count > 0:
@@ -397,6 +418,7 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
     dead_lettered_count = result.get("dead_lettered_count", 0) or 0
     pending_count = result.get("pending_count", 0) or 0
     failed_count = result.get("failed_count", 0) or 0
+    relay_skipped_count = result.get("relay_skipped_count", 0) or 0
     bodies_denied_count = result.get("bodies_denied_count", 0) or 0
     bodies_expired_count = result.get("bodies_expired_count", 0) or 0
     bodies_voided_count = result.get("bodies_voided_count", 0) or 0
@@ -417,19 +439,22 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
     result["filtered_out_count"] = filtered_out_count
     result["shadow_filtered_out_count"] = shadow_filtered_out_count
     # delivery_count counts live for-real body copies only — superseded copies
-    # never went out, and a gated body closed before release (denied / expired
-    # / voided) never went out either; neither must be described as still
-    # pending or delivered.
+    # never went out, a gated body closed before release (denied / expired /
+    # voided) never went out, and a relay station skipped because an earlier
+    # station stopped never went out either; neither must be described as
+    # still pending or delivered.
     live_count = (
         result["delivery_count"]
         - superseded_count
         - release_closed_count
+        - relay_skipped_count
     )
     result["delivery_count"] = live_count
     result["superseded_count"] = superseded_count
     result["dead_lettered_count"] = dead_lettered_count
     result["pending_count"] = pending_count
     result["failed_count"] = failed_count
+    result["relay_skipped_count"] = relay_skipped_count
     result["bodies_denied_count"] = bodies_denied_count
     result["bodies_expired_count"] = bodies_expired_count
     result["bodies_voided_count"] = bodies_voided_count
@@ -461,6 +486,8 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
         shadow_closed_count,
         filtered_out_count,
         shadow_filtered_out_count,
+        relay_skipped_count,
+        result.get("_relay_halted", False),
     )
     required_ack_count = result.get("required_ack_count")
     # No configured threshold (legacy rows) means "every live for-real copy".
@@ -484,6 +511,10 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
         and result["acknowledged_count"] >= required_ack_count
     )
     result["unacknowledged_count"] = live_count - result["acknowledged_count"]
+    # Internal relay halt flag consumed above; the run view itself is
+    # attached by callers (so event_response stays pure for batch callers).
+    result.pop("_relay_halted", None)
+    result.pop("relay_stopped_count", None)
     # The type-wide threshold as configured right now (null = no threshold);
     # required_ack_count above is this event's own ingest-time snapshot.
     result["ack_threshold"] = result.get("configured_ack_threshold")
@@ -506,7 +537,9 @@ DELIVERY_COLUMNS = (
     "d.confirmation_generation, d.observe_only, d.filter_spec, "
     "d.phase, d.release_state, d.preview_delivery_id, d.body_delivery_id, "
     "d.consent_deadline, d.consent_timeout_seconds, d.released_at, "
-    "d.voided_at, d.void_reason"
+    "d.voided_at, d.void_reason, "
+    "d.relay_chain_id, d.relay_station_no, d.relay_skipped_at, "
+    "d.relay_skip_reason, d.relay_stopped_by_delivery_id"
 )
 
 
@@ -546,6 +579,25 @@ EVENT_WITH_COUNTS_SQL = """
                WHERE NOT d.observe_only AND d.phase = 'body'
                  AND d.status = 'failed'
            )::int AS failed_count,
+           -- Relay chain ("接力"): later stations closed relay_skipped after
+           -- an earlier station stopped. They never went out and are excluded
+           -- from the live/pending/delivered counts, like superseded copies.
+           COUNT(d.id) FILTER (
+               WHERE NOT d.observe_only AND d.phase = 'body'
+                 AND d.status = 'relay_skipped'
+           )::int AS relay_skipped_count,
+           -- A run is halted when some station stopped (failure receipt,
+           -- reconcile timeout, dead-letter, supersede) while it still had
+           -- later stations in the run; the skipped rows above are the tail.
+           -- This counts station copies in ANY stop state so a stop at the
+           -- last station (which has no later rows to skip) is visible too.
+           COUNT(d.id) FILTER (
+               WHERE d.relay_chain_id IS NOT NULL
+                 AND (
+                     d.status IN ('dead_lettered', 'superseded')
+                     OR d.reconcile_state IN ('receipt_failed', 'timed_out')
+                 )
+           )::int AS relay_stopped_count,
            COUNT(d.id) FILTER (WHERE d.observe_only AND d.phase = 'body')::int AS shadow_delivery_count,
            COUNT(d.id) FILTER (
                WHERE d.observe_only AND d.phase = 'body' AND d.status = 'delivered'
@@ -681,6 +733,42 @@ def fetch_event_counts(db: Session, where_sql: str, params: dict) -> dict:
     event = dict(event)
     attach_filter_counts(db, [event])
     return event
+
+
+def event_response_with_relay(db: Session, event: dict) -> dict:
+    """Build the event response and attach its relay run view (best-effort)."""
+    _mark_relay_halt(event)
+    response = event_response(event)
+    try:
+        response["relay"] = relay.build_event_relay(db, response)
+    except Exception:  # noqa: BLE001 - half-upgraded DB: no relay view
+        db.rollback()
+        logger.warning(
+            "relay run view unavailable for event_id=%s; defaulting to null",
+            response.get("id"),
+        )
+        response["relay"] = None
+    return response
+
+
+def _mark_relay_halt(event: dict) -> None:
+    """Flag a relay run that stopped short, using the raw counts from
+    EVENT_WITH_COUNTS_SQL (delivery_count there is the total body-copy count,
+    before event_response subtracts superseded/skipped rows).
+
+    A run is halted when a station is in a stop state (dead-letter /
+    superseded / failure receipt / reconcile timeout, counted as
+    relay_stopped_count in the counts SQL) while not every station
+    acknowledged; the cascade then closes the tail relay_skipped, so the
+    state is sticky. Ordinary events carry no relay rows and stay unflagged.
+    """
+    stopped = event.get("relay_stopped_count", 0) or 0
+    if not stopped:
+        return
+    total = event.get("delivery_count", 0) or 0
+    ack = event.get("acknowledged_count", 0) or 0
+    if ack < total:
+        event["_relay_halted"] = True
 
 
 @app.post(
@@ -1306,6 +1394,14 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
         if policy is not None and body.preview_payload is not None
         else None
     )
+    # Relay chain ("接力"). At most one ACTIVE chain per event type: when one
+    # exists, this event goes ONLY to its stations, one at a time, instead of
+    # fanning out to every confirmed subscriber. The chain lookup happens
+    # before the event row is written, so only events accepted AFTER the chain
+    # was defined walk it — an event accepted earlier has no relay snapshot and
+    # keeps its ordinary lifecycle. Relay types are never preview-gated
+    # (chain definition refuses that combination).
+    active_chain = relay.get_active_chain(db, body.event_type)
     event = db.execute(
         text(
             """
@@ -1360,7 +1456,7 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
             reason="dedupe_key already ingested; no new event or deliveries created",
         )
         db.commit()
-        result = event_response(existing)
+        result = event_response_with_relay(db, existing)
         result["duplicate"] = True
         return result, 200
 
@@ -1377,159 +1473,210 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     # statements the row is not created. The schedule gate (not_before) is
     # copied onto every delivery; each copy keeps its queue position while it
     # waits for its time.
-    subscribers = db.execute(
-        text(
-            """
-            SELECT s.destination_id, d.observe_only, s.filter_spec
-            FROM destination_subscriptions s
-            JOIN destinations d ON d.id = s.destination_id
-            WHERE s.event_type = :event_type
-              AND d.confirmation_state = 'confirmed'
-            ORDER BY s.destination_id
-            FOR UPDATE OF d
-            """
-        ),
-        {"event_type": body.event_type},
-    ).all()
-
-    total_subscribers = db.execute(
-        text(
-            """
-            SELECT COUNT(*)::int AS count
-            FROM destination_subscriptions
-            WHERE event_type = :event_type
-            """
-        ),
-        {"event_type": body.event_type},
-    ).mappings().one()["count"]
-
-    # Per-address subscription conditions ("订阅条件"). Each confirmed
-    # subscriber carrying a condition gets exactly one evaluation against
-    # THIS exact body: matching subscribers stay in the fan-out list (the
-    # condition is snapshotted onto their copies); non-matching subscribers
-    # are taken out of it and recorded in subscription_filter_evaluations
-    # with matched=false, so no delivery exists for them (nothing is sent and
-    # it is never written as sent) while the trace still says "this address's
-    # own condition did not match" — distinct from 'unrouted' (nobody
-    # subscribes). The judgement is a pure function of (condition snapshot,
-    # body), so re-evaluating the same pair always yields the same answer.
-    # Conditions are evaluated here, once, so a later edit only affects later
-    # events; already-fanned copies are never recalled.
-    routed_subscribers = []
-    filtered_real = 0
-    filtered_shadow = 0
-    for row in subscribers:
-        destination_id, is_shadow, filter_spec = row
-        if filter_spec is None:
-            routed_subscribers.append(row)
-            continue
-        matches = evaluate_filter(filter_spec, body.payload)
-        db.execute(
-            text(
-                """
-                INSERT INTO subscription_filter_evaluations
-                    (event_id, destination_id, event_type, matched,
-                     filter_spec, observe_only)
-                VALUES (
-                    CAST(:event_id AS UUID), CAST(:destination_id AS UUID),
-                    :event_type, :matched, CAST(:filter_spec AS JSONB),
-                    :observe_only
-                )
-                ON CONFLICT (event_id, destination_id) DO NOTHING
-                """
-            ),
-            {
-                "event_id": event["id"],
-                "destination_id": destination_id,
-                "event_type": body.event_type,
-                "matched": matches,
-                "filter_spec": json.dumps(filter_spec),
-                "observe_only": is_shadow,
-            },
-        )
-        if matches:
-            routed_subscribers.append(row)
-        elif is_shadow:
-            filtered_shadow += 1
-        else:
-            filtered_real += 1
-
-    if policy is not None:
-        # Gated type: every confirmed subscriber whose condition held gets a
-        # preview first and a held body behind it. A non-matching subscriber
-        # gets neither (the preview would itself reveal the event): its
-        # withheld judgement is the evaluation row inserted above.
-        pair_counts = release_gate.fan_out_gated_event(
+    if active_chain is not None:
+        # Relay-chain routing ("接力"). Only the stations of the chain version
+        # active at ingest receive a copy, one station at a time: each later
+        # station's pending row is withheld by the worker claim gate until the
+        # previous station acknowledges, and a stop at any station closes the
+        # rest relay_skipped. Subscriptions, subscription conditions, observe
+        # flags and confirmation state are all irrelevant here — the chain is
+        # the whole routing decision, snapshotted onto every copy so re-defining
+        # the order later only applies to later accepted events.
+        relay.fan_out_relay_event(
             db,
             event_id=str(event["id"]),
-            event_type=body.event_type,
+            chain=active_chain,
             dedupe_key=body.dedupe_key,
             payload=payload,
-            preview_payload=preview_payload,
             not_before=body.not_before,
-            consent_timeout_seconds=policy["consent_timeout_seconds"],
-            destinations=routed_subscribers,
-            filter_specs={
-                str(row[0]): row[2]
-                for row in routed_subscribers
-                if row[2] is not None
-            },
         )
-        real_pair_count = pair_counts["real_pairs"]
-        shadow_pair_count = pair_counts["shadow_pairs"]
+        station_count = len(active_chain["stations"])
+        real_pair_count = station_count
+        shadow_pair_count = 0
+        filtered_real = 0
+        filtered_shadow = 0
+        routed_subscribers = list(active_chain["stations"])
+        disposition = ACCEPTED
     else:
-        real_pair_count = len(
-            [row for row in routed_subscribers if not row[1]]
-        )
-        shadow_pair_count = len(
-            [row for row in routed_subscribers if row[1]]
-        )
-        for row in routed_subscribers:
+        subscribers = db.execute(
+            text(
+                """
+                SELECT s.destination_id, d.observe_only, s.filter_spec
+                FROM destination_subscriptions s
+                JOIN destinations d ON d.id = s.destination_id
+                WHERE s.event_type = :event_type
+                  AND d.confirmation_state = 'confirmed'
+                ORDER BY s.destination_id
+                FOR UPDATE OF d
+                """
+            ),
+            {"event_type": body.event_type},
+        ).all()
+
+        total_subscribers = db.execute(
+            text(
+                """
+                SELECT COUNT(*)::int AS count
+                FROM destination_subscriptions
+                WHERE event_type = :event_type
+                """
+            ),
+            {"event_type": body.event_type},
+        ).mappings().one()["count"]
+
+        # Per-address subscription conditions ("订阅条件"). Each confirmed
+        # subscriber carrying a condition gets exactly one evaluation against
+        # THIS exact body: matching subscribers stay in the fan-out list (the
+        # condition is snapshotted onto their copies); non-matching subscribers
+        # are taken out of it and recorded in subscription_filter_evaluations
+        # with matched=false, so no delivery exists for them (nothing is sent and
+        # it is never written as sent) while the trace still says "this address's
+        # own condition did not match" — distinct from 'unrouted' (nobody
+        # subscribes). The judgement is a pure function of (condition snapshot,
+        # body), so re-evaluating the same pair always yields the same answer.
+        # Conditions are evaluated here, once, so a later edit only affects later
+        # events; already-fanned copies are never recalled.
+        routed_subscribers = []
+        filtered_real = 0
+        filtered_shadow = 0
+        for row in subscribers:
+            destination_id, is_shadow, filter_spec = row
+            if filter_spec is None:
+                routed_subscribers.append(row)
+                continue
+            matches = evaluate_filter(filter_spec, body.payload)
             db.execute(
                 text(
                     """
-                    WITH bumped AS (
-                        UPDATE destinations
-                        SET next_event_seq = next_event_seq + 1
-                        WHERE id = :destination_id
-                          AND confirmation_state = 'confirmed'
-                        RETURNING id, next_event_seq, confirmation_generation
+                    INSERT INTO subscription_filter_evaluations
+                        (event_id, destination_id, event_type, matched,
+                         filter_spec, observe_only)
+                    VALUES (
+                        CAST(:event_id AS UUID), CAST(:destination_id AS UUID),
+                        :event_type, :matched, CAST(:filter_spec AS JSONB),
+                        :observe_only
                     )
-                    INSERT INTO deliveries
-                        (event_id, destination_id, event_type, dedupe_key, payload,
-                         destination_seq, not_before, confirmation_generation,
-                         observe_only, filter_spec)
-                    SELECT :event_id, id, :event_type, :dedupe_key,
-                           CAST(:payload AS JSONB), next_event_seq,
-                           CAST(:not_before AS TIMESTAMPTZ), confirmation_generation,
-                           :observe_only, CAST(:filter_spec AS JSONB)
-                    FROM bumped
+                    ON CONFLICT (event_id, destination_id) DO NOTHING
                     """
                 ),
                 {
                     "event_id": event["id"],
-                    "destination_id": row[0],
+                    "destination_id": destination_id,
                     "event_type": body.event_type,
-                    "dedupe_key": body.dedupe_key,
-                    "payload": payload,
-                    "not_before": body.not_before,
-                    "observe_only": row[1],
-                    "filter_spec": json.dumps(row[2]) if row[2] is not None else None,
+                    "matched": matches,
+                    "filter_spec": json.dumps(filter_spec),
+                    "observe_only": is_shadow,
                 },
             )
+            if matches:
+                routed_subscribers.append(row)
+            elif is_shadow:
+                filtered_shadow += 1
+            else:
+                filtered_real += 1
+
+        if policy is not None:
+            # Gated type: every confirmed subscriber whose condition held gets a
+            # preview first and a held body behind it. A non-matching subscriber
+            # gets neither (the preview would itself reveal the event): its
+            # withheld judgement is the evaluation row inserted above.
+            pair_counts = release_gate.fan_out_gated_event(
+                db,
+                event_id=str(event["id"]),
+                event_type=body.event_type,
+                dedupe_key=body.dedupe_key,
+                payload=payload,
+                preview_payload=preview_payload,
+                not_before=body.not_before,
+                consent_timeout_seconds=policy["consent_timeout_seconds"],
+                destinations=routed_subscribers,
+                filter_specs={
+                    str(row[0]): row[2]
+                    for row in routed_subscribers
+                    if row[2] is not None
+                },
+            )
+            real_pair_count = pair_counts["real_pairs"]
+            shadow_pair_count = pair_counts["shadow_pairs"]
+        else:
+            real_pair_count = len(
+                [row for row in routed_subscribers if not row[1]]
+            )
+            shadow_pair_count = len(
+                [row for row in routed_subscribers if row[1]]
+            )
+            for row in routed_subscribers:
+                db.execute(
+                    text(
+                        """
+                        WITH bumped AS (
+                            UPDATE destinations
+                            SET next_event_seq = next_event_seq + 1
+                            WHERE id = :destination_id
+                              AND confirmation_state = 'confirmed'
+                            RETURNING id, next_event_seq, confirmation_generation
+                        )
+                        INSERT INTO deliveries
+                            (event_id, destination_id, event_type, dedupe_key, payload,
+                             destination_seq, not_before, confirmation_generation,
+                             observe_only, filter_spec)
+                        SELECT :event_id, id, :event_type, :dedupe_key,
+                               CAST(:payload AS JSONB), next_event_seq,
+                               CAST(:not_before AS TIMESTAMPTZ), confirmation_generation,
+                               :observe_only, CAST(:filter_spec AS JSONB)
+                        FROM bumped
+                        """
+                    ),
+                    {
+                        "event_id": event["id"],
+                        "destination_id": row[0],
+                        "event_type": body.event_type,
+                        "dedupe_key": body.dedupe_key,
+                        "payload": payload,
+                        "not_before": body.not_before,
+                        "observe_only": row[1],
+                        "filter_spec": json.dumps(row[2]) if row[2] is not None else None,
+                    },
+                )
+
+        # No confirmed subscribers: still accepted and persisted. The
+        # disposition says which case this is without ever describing the event
+        # as sent:
+        # - nobody subscribes to this type at all        -> unrouted
+        # - subscribers exist but none has confirmed yet -> pending_confirmation
+        # - every confirmed subscriber's own condition
+        #   withheld this exact body                      -> filtered
+        # Each withheld judgement carries its condition snapshot in
+        # subscription_filter_evaluations and stays distinct from "nobody
+        # subscribed"; an unconditional subscriber (or a matching one) is simply
+        # accepted/fanned out.
+        if not routed_subscribers:
+            if not subscribers:
+                disposition = (
+                    UNROUTED if total_subscribers == 0 else PENDING_CONFIRMATION
+                )
+            else:
+                disposition = FILTERED
+        else:
+            disposition = ACCEPTED
 
     # Snapshot this event's acknowledgement requirement onto the event row in
     # the same transaction: a configured threshold capped at the current
     # for-real confirmed subscribers, otherwise every for-real copy. Shadow
     # subscribers never count toward it. For gated events the requirement is
-    # the number of for-real *bodies* (one per for-real pair). A zero snapshot
-    # (unrouted / shadow-only / pending-confirmation) keeps reconcile_status
-    # pending — acknowledgement still requires at least one for-real success
-    # receipt on a body.
+    # the number of for-real *bodies* (one per for-real pair). A relay run
+    # completes only when EVERY station acknowledges, regardless of any
+    # configured type threshold. A zero snapshot (unrouted / shadow-only /
+    # pending-confirmation) keeps reconcile_status pending — acknowledgement
+    # still requires at least one for-real success receipt on a body.
     required_ack_count = (
-        min(ack_threshold, real_pair_count)
-        if ack_threshold is not None
-        else real_pair_count
+        real_pair_count
+        if active_chain is not None
+        else (
+            min(ack_threshold, real_pair_count)
+            if ack_threshold is not None
+            else real_pair_count
+        )
     )
     db.execute(
         text(
@@ -1546,23 +1693,6 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     )
 
     signed_at = source["signed_at"]
-    # No confirmed subscribers: still accepted and persisted. The disposition
-    # says which case this is without ever describing the event as sent:
-    # - nobody subscribes to this type at all        -> unrouted
-    # - subscribers exist but none has confirmed yet -> pending_confirmation
-    # - every confirmed subscriber's own condition
-    #   withheld this exact body                      -> filtered
-    # Each withheld judgement carries its condition snapshot in
-    # subscription_filter_evaluations and stays distinct from "nobody
-    # subscribed"; an unconditional subscriber (or a matching one) is simply
-    # accepted/fanned out.
-    if not routed_subscribers:
-        if not subscribers:
-            disposition = UNROUTED if total_subscribers == 0 else PENDING_CONFIRMATION
-        else:
-            disposition = FILTERED
-    else:
-        disposition = ACCEPTED
     log_attempt(
         db,
         disposition=disposition,
@@ -1616,7 +1746,21 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     # deliveries.
     result["filtered_out_count"] = filtered_real
     result["shadow_filtered_out_count"] = filtered_shadow
-    return event_response(result), 201
+    if active_chain is not None:
+        # Raw totals for the relay ingest response: all station bodies are
+        # pending for-real copies, none skipped/stopped yet.
+        result["relay_skipped_count"] = 0
+        result["relay_stopped_count"] = 0
+    response_event = event_response(result)
+    if active_chain is not None:
+        # Immediate ingest response: no round trip through the counts SQL;
+        # build the relay run view from station 1 deliverable and every later
+        # station waiting. event_response already cleared the internal halt
+        # flag/count.
+        response_event["relay"] = relay.build_event_relay(db, response_event)
+    else:
+        response_event["relay"] = None
+    return response_event, 201
 
 
 @app.get("/v1/events/{event_id}", response_model=EventOut)
@@ -1628,7 +1772,7 @@ def get_event(event_id: UUID, db: Session = Depends(get_db)):
     )
     if event is None:
         raise HTTPException(status_code=404, detail="event not found")
-    return event_response(event)
+    return event_response_with_relay(db, event)
 
 
 @app.get("/v1/events/{event_id}/trace", response_model=EventTraceOut)
@@ -1647,22 +1791,25 @@ def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
                 FROM deliveries d
                 JOIN destinations dest ON dest.id = d.destination_id
                 WHERE d.event_id = CAST(:event_id AS UUID)
-                ORDER BY dest.url ASC, d.destination_seq ASC
+                ORDER BY
+                    COALESCE(d.relay_station_no, 0) ASC,
+                    dest.url ASC, d.destination_seq ASC
                 """
             ),
             {"event_id": event_id},
         ).mappings().all()
     except Exception:
-        # Half-upgraded database (deliveries.filter_spec column missing):
-        # never let the trace fail. Retry without the filter-feature column;
-        # filter_spec on each copy then stays null.
+        # Half-upgraded database (a newer feature column missing): never let
+        # the trace fail. Retry without the condition/relay feature columns;
+        # those fields then stay null on each copy.
         db.rollback()
         logger.warning(
-            "deliveries query with filter columns failed for event_id=%s; "
+            "deliveries query with feature columns failed for event_id=%s; "
             "retrying without them",
             event_id,
         )
         fallback_columns = DELIVERY_COLUMNS.replace("d.filter_spec, ", "")
+        fallback_columns = fallback_columns.split("d.relay_chain_id")[0].rstrip(", ")
         deliveries = db.execute(
             text(
                 f"""
@@ -1703,7 +1850,7 @@ def get_event_trace(event_id: UUID, db: Session = Depends(get_db)):
         {"event_id": event_id},
     ).mappings().all()
     return {
-        "event": event_response(event),
+        "event": event_response_with_relay(db, event),
         "deliveries": deliveries,
         "attempts": attempts,
         "receipts": receipts,
@@ -2336,9 +2483,10 @@ def lock_event_deliveries(db: Session, event_id: UUID):
 
 
 def fetch_event_response(db: Session, event_id: UUID) -> dict:
-    return event_response(fetch_event_counts(
+    event = fetch_event_counts(
         db, "e.id = CAST(:event_id AS UUID)", {"event_id": str(event_id)}
-    ))
+    )
+    return event_response_with_relay(db, event)
 
 
 def event_already_sent(deliveries) -> bool:
@@ -2484,7 +2632,7 @@ def requeue_event_unreconciled(event_id: UUID, db: Session = Depends(get_db)):
             FROM deliveries
             WHERE event_id = CAST(:event_id AS UUID)
               AND NOT observe_only
-              AND status <> 'superseded'
+              AND status NOT IN ('superseded', 'relay_skipped')
             ORDER BY destination_id, destination_seq
             FOR UPDATE
             """
@@ -2512,7 +2660,7 @@ def requeue_event_unreconciled(event_id: UUID, db: Session = Depends(get_db)):
             FROM events e
             LEFT JOIN deliveries d
                    ON d.event_id = e.id
-                  AND d.status <> 'superseded'
+                  AND d.status NOT IN ('superseded', 'relay_skipped')
             WHERE e.id = CAST(:event_id AS UUID)
             GROUP BY e.id, e.required_ack_count
             """
@@ -2988,6 +3136,71 @@ def clear_ack_threshold(event_type: str, db: Session = Depends(get_db)):
     }
 
 
+# --- Per-event-type relay chains ("接力") ---------------------------------
+
+
+@app.get("/v1/event-types/relay-chains", response_model=list[RelayChainOut])
+def list_relay_chains(db: Session = Depends(get_db)):
+    # The currently active chain per event type. Old versions stay stored
+    # (in-flight runs keep using them) but are not listed here.
+    return relay.list_active_chains(db)
+
+
+@app.get(
+    "/v1/event-types/{event_type}/relay-chain",
+    response_model=RelayChainOut,
+)
+def get_relay_chain(event_type: str, db: Session = Depends(get_db)):
+    event_type = _normalize_event_type_path(event_type)
+    chain = relay.get_active_chain(db, event_type)
+    if chain is None:
+        raise HTTPException(
+            status_code=404,
+            detail="no active relay chain configured for this event type",
+        )
+    return chain
+
+
+@app.put(
+    "/v1/event-types/{event_type}/relay-chain",
+    response_model=RelayChainOut,
+)
+def set_relay_chain(
+    event_type: str,
+    body: RelayChainIn,
+    db: Session = Depends(get_db),
+):
+    # Define (or re-define) the station order. Re-defining creates a new chain
+    # VERSION: events accepted afterwards follow the new order, events already
+    # walking the chain keep the version they set out with. At most one active
+    # chain per type; the same destination cannot occupy two stations.
+    event_type = _normalize_event_type_path(event_type)
+    try:
+        chain = relay.define_chain(
+            db, event_type, [str(d) for d in body.destination_ids]
+        )
+    except relay.RelayConfigError as exc:
+        db.rollback()
+        raise HTTPException(status_code=exc.status_code, detail=exc.reason)
+    db.commit()
+    return chain
+
+
+@app.delete("/v1/event-types/{event_type}/relay-chain")
+def clear_relay_chain(event_type: str, db: Session = Depends(get_db)):
+    # Only events accepted afterwards return to ordinary fan-out; runs already
+    # walking the old version keep their stations until they finish/stop.
+    event_type = _normalize_event_type_path(event_type)
+    removed = relay.delete_active_chain(db, event_type)
+    db.commit()
+    if not removed:
+        raise HTTPException(
+            status_code=404,
+            detail="no active relay chain configured for this event type",
+        )
+    return {"event_type": event_type, "active": False, "removed": True}
+
+
 # --- Receipt ingestion and reconciliation ---------------------------------
 
 PREVIEW_CONSENT_DISPOSITIONS = (
@@ -3051,6 +3264,17 @@ def set_preview_policy(
     # preview/body pairs. The timeout is snapshotted per event pair, so the
     # change never rewrites events already accepted.
     event_type = _normalize_event_type_path(event_type)
+    # A type cannot be both preview-gated and relay-chained: the preview gate
+    # is per-destination while a relay is cross-destination sequential.
+    if relay.get_active_chain(db, event_type) is not None:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "event type already has an active relay chain; a type cannot "
+                "be both preview-gated and relay-chained"
+            ),
+        )
     timeout_seconds = (
         body.consent_timeout_seconds
         if body.consent_timeout_seconds is not None

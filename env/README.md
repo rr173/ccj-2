@@ -2,7 +2,7 @@
 
 这是一个接收事件、按事件类型分发给订阅地址，把事件按顺序推送到外部 Webhook，并对推送结果做**回执对账**的系统：
 
-- **ingest-api**：登记**事件来源**（发放只属于它的签名密钥、可停用/可换钥）、登记接收地址（含订阅的事件类型；可把任一地址标成**只跟着看 `observe_only`**——照样收副本、按它自己的生命周期外发/重试/隔离/死信，但它的回执认不认、超时或进死信都不影响整笔算不算认完；**地址得先完成一次上线握手确认才会收到投递**，换接收位置要重新确认；**每个"地址×事件类型"还可以挂一条只看正文的订阅条件 `filters`——正文对得上才给它、对不上不给且绝不写成已发，条件后来改了只接下一条；可给任一地址标一段**现在不收**的时间——窗口内副本在原队列位置等、不算失败、对账不倒计时，订了同一类型的其他地址照打）、**按事件类型设定认完门槛**（当真副本认够份数整笔即认完且终态不可逆，影子副本不凑数；没定门槛的类型仍要求所有当真副本都认）、**验签 + 发送时间校验后**接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**给已收下的事件补一笔更正**（另补一笔新事件，只补给当初真正打到过的地址，排在各地址队尾，对账从真正打出才算，更正失败只算它自己的）、**接入回执与确认应答**、查询**入口准入记录（含每一条被拒事件，以及"收了但还没确认、一份没发"的事件）**、事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（整笔重投在认够门槛后不再拉名单；没认够时只重投某一笔事件中尚未认的那些**当真**副本，只跟着看的副本不在名单内）。
+- **ingest-api**：登记**事件来源**（发放只属于它的签名密钥、可停用/可换钥）、登记接收地址（含订阅的事件类型；可把任一地址标成**只跟着看 `observe_only`**——照样收副本、按它自己的生命周期外发/重试/隔离/死信，但它的回执认不认、超时或进死信都不影响整笔算不算认完；**地址得先完成一次上线握手确认才会收到投递**，换接收位置要重新确认；**每个"地址×事件类型"还可以挂一条只看正文的订阅条件 `filters`——正文对得上才给它、对不上不给且绝不写成已发，条件后来改了只接下一条；可给任一地址标一段**现在不收**的时间——窗口内副本在原队列位置等、不算失败、对账不倒计时，订了同一类型的其他地址照打）、**按事件类型设定认完门槛**（当真副本认够份数整笔即认完且终态不可逆，影子副本不凑数；没定门槛的类型仍要求所有当真副本都认）、**按事件类型排一条接力**（只给名单里的几站、上一站认了才给下一站、没排进来的不给、停住后后面各站不再补且查得到卡在哪一站为什么停、改站序只接之后新收下的事件、同一家不能占两站；见 1.7 节）、**验签 + 发送时间校验后**接收事件（可约定最早外发时间 `not_before`）、**取消/改期尚未打出的事件**、**给已收下的事件补一笔更正**（另补一笔新事件，只补给当初真正打到过的地址，排在各地址队尾，对账从真正打出才算，更正失败只算它自己的）、**接入回执与确认应答**、查询**入口准入记录（含每一条被拒事件，以及"收了但还没确认、一份没发"的事件）**、事件投递轨迹与整笔/逐地址对账情况、人工恢复隔离地址、把超时或失败回执导致未对上的副本重投（整笔重投在认够门槛后不再拉名单；没认够时只重投某一笔事件中尚未认的那些**当真**副本，只跟着看的副本不在名单内）。
 - **worker**：负责真正的 HTTP 投递、重试、熔断隔离、崩溃恢复，以及向未确认地址发送上线握手请求（confirmer 线程）。
 - **reconciler**：独立的对账进程，周期性把超过约定时间仍未收到回执的副本标记为 `timed_out`（可查，不算认）。
 - **PostgreSQL**：作为任务队列和事实来源，用行锁和每地址单调序号保证同一个接收地址严格 FIFO。
@@ -205,6 +205,40 @@
 - **预告放行（gated）类型同样适用**：条件不成立时连预告都不生成（预告本身也会暴露"有这么一件事"）；该地址点头/不要接口对它返回 `orphan`。
 - **更正（correction）按更正自己的正文、用当前条件重判**：更正扇出名单原本是"原事件真正投妥过的地址"，现在还要用**更正自己的正文**对每个地址**当前**的条件再判一次；对不上的地址不补，判定同样落 `subscription_filter_evaluations`（挂在更正这笔事件上）。所有候选地址都被挡住时更正返回 409、什么都不创建，也不占用 `dedupe_key`（之后内容对得上还能用同一个键提交）。
 - **确定性**：求值是 `(条件, 正文)` 的纯函数（无时钟、无随机、无网络、不求值表达式）；同一份正文对着同一套条件再看一次，给/不给必然一致。
+
+### 1.7 给某类事件排一条接力（relay chain）
+
+每种事件类型可以排**一条接力**：按顺序写下几家接收地址（"站"），这种事件**只按这条接力走**——不再扇出给所有订户，也不认订阅、订阅条件或 `observe_only`，只给排进接力的地址。规则一条不松：
+
+- **先给第一家，这家认了才给下一家**：接力事件入库时每一站各建一份副本，但只有第 1 站立即可领；第 N+1 站的副本一直 `pending`，worker 的领取闸门要求**同一条接力里上一站对上成功回执**（`reconcile_state='acknowledged'`，不是仅 2xx）才准领它。任何一站没认，后面的站既拿不到、也**绝不会被写成"已发给后面"**（副本始终是 `pending`，`delivered_at` 为空、不计入已发）。
+- **一种事件同时只能有一条接力**：`PUT /v1/event-types/{event_type}/relay-chain`（body `{"destination_ids": ["<id1>", "<id2>", ...]}`）整体定义当前生效的接力；再次 PUT 是**换一版**（版本号 +1），`GET /v1/event-types/{event_type}/relay-chain` 查当前版，`GET /v1/event-types/relay-chains` 列全部，`DELETE .../relay-chain` 取消（之后新事件恢复普通扇出）。
+- **没排进接力的地址这份不要给**：哪怕它订阅了这个类型、是已确认地址，接力事件也只发给站名单里的地址；名单之外一份副本都不会建，回执也凑不进这条接力。
+- **接力定好之后才收下的事件才走这条**：定义接力**之前**已经收下的事件没有接力快照（`relay_chain_id` 为空），继续按普通扇出走，**绝不补进接力**。
+- **站序后来改了只接下一条新收下的**：每次 PUT 生成一个新版本（`relay_chains.version`）；副本在入库那一刻把"接力版本 + 站号"快照到自己身上。已经在走的那笔继续按它**出发时的那几站**走到底；只有改完之后新收下的事件按新站序走。删除当前接力也只影响之后的事件。
+- **同一家不能在一条接力里排两站**：同一地址在一条 `destination_ids` 里出现两次直接 422；站列表不能为空、地址必须存在（不存在 404）。一个类型**不能同时**开预告放行策略和接力（语义冲突，409）。
+- **这一站回了失败、对账超时、或进了死信，后面各站都不要再补**：只要某一站
+  - 回了**失败回执**（`receipt_failed`，哪怕还在重投预算内），
+  - 超过对账时限没对上回执（`timed_out`，含重投耗尽后进死信），
+  - 传输连续失败耗尽进死信（`delivery_attempts_exhausted`），
+  - 或该站地址换了接收位置、副本被 `superseded`，
+
+  该站之后所有**还在等的站**立即置为终态 `relay_skipped`（永不再发、永不补投），并带上 `relay_skip_reason`（从触发站的停车原因复制）、`relay_skipped_at` 和指向触发站的 `relay_stopped_by_delivery_id`。失败/超时那一站本身按它自己的生命周期走（可单独重投/从死信捞回），但**不会**因此把已经跳过的后面各站补回来——"不要再补"是永久的。
+- **要能查到卡在哪一站、为什么停下来**：事件的 `relay` 视图（`GET /v1/events/{id}` 与 `/trace` 都带）逐站列出：站号、地址、副本状态、对账状态、是否已认（`acknowledged`）、是否真的到过（`reached`）、跳过原因；汇总给出 `station_count` / `acknowledged_count` / `skipped_count`、`current_station_no`（当前走到的站）、`stopped`、`stopped_at_station_no`（卡在哪一站）、`stop_reason`（为什么停）以及 `completed`。事件传输状态在"停住且没有还在推进的站"时显示为 `relay_halted`。
+- **查某一笔**看得出：走到哪一站、哪几站已经认了、后面还没给到（后面的站是 `pending`/`relay_skipped` 且 `reached=false`，不是"已发"）。每份接力副本还带 `relay_chain_id` / `relay_station_no` 快照和 `relay_skip_*` 审计列；投递给接收方的请求带头 `X-Relay-Chain-Id` / `X-Relay-Station-No`，body 里有同名字段。
+- 接力只在**普通事件**上生效：更正是另一笔事件（不带接力快照），仍按"只补给当初真正打到过的地址"走；`not_before`、停收窗口、上线握手、FIFO 等既有闸门对接力副本同样有效（站地址还没完成握手时，轮到它那一站也发不出去，要等它确认）。
+
+```bash
+# 给 paid 排 A -> B -> C 三个地址（用地址 id）
+curl -s -X PUT http://localhost:8000/v1/event-types/paid/relay-chain \
+  -H 'Content-Type: application/json' \
+  -d '{"destination_ids": ["<id-A>", "<id-B>", "<id-C>"]}'
+# {"id":"...","event_type":"paid","version":1,"active":true,
+#  "stations":[{"station_no":1,"destination_id":"<id-A>"}, ...]}
+
+curl -s http://localhost:8000/v1/event-types/paid/relay-chain     # 查当前版
+curl -s http://localhost:8000/v1/event-types/relay-chains          # 列全部
+curl -s -X DELETE http://localhost:8000/v1/event-types/paid/relay-chain  # 取消（只接之后新事件）
+```
 
 ### 2. 同一接收地址严格按进入顺序投递
 
@@ -840,10 +874,11 @@ python3 scripts/mock_receiver.py --port 9000 \
 - `events`：事件本体（来源 `source_id`、类型、去重键、负载、最早外发时间 `not_before`、取消时间 `cancelled_at`，以及入库时快照的认完门槛 `required_ack_count`：无门槛类型等于扇出的当真份数，定了门槛取门槛与当真订户数的较小值，只有影子订户/无人订阅时为 0；老事件该列为 NULL，按"现存每一份当真副本都认"处理；gated 类型另有 `preview_payload`：预告里允许露出的短文本，真正负载仍只在 `payload` 里随正文走），一条事件一行，与地址无关。**更正也是一行事件**：`corrects_event_id` 指向被更正的那笔（普通事件该列为 NULL），它有自己的去重键和副本，原来那笔的行不会被改写。
 - `event_type_ack_thresholds`：按事件类型配置的认完门槛（每个类型至多一行，`ack_threshold >= 1`）。改/删只影响之后入库的事件；事件自己的要求以 `events.required_ack_count` 的快照为准。
 - `event_type_preview_policies`：按事件类型开启的"预告+点头才给正文"策略（每类型至多一行，`consent_timeout_seconds >= 1`）。时限在事件入库时快照到该事件的每份副本（`deliveries.consent_timeout_seconds`）；改/删只影响之后入库的事件。
+- `relay_chains` / `relay_chain_stations`：按事件类型排的接力。每个类型至多一行 `active=true` 的当前版（部分唯一索引），每次重新定义生成一个新版本并把旧版置为 `active=false`（旧版保留——已经在走的事件按出生版本走）。站表以 `(chain_id, station_no)` 为主键，且 `(chain_id, destination_id)` 唯一——同一家不能在一条接力里排两站。副本在入库时快照 `relay_chain_id` + `relay_station_no`（见下）。
 - `release_gate_decisions`：预告决定（点头/不要）的审计表，一行对应一次回调，带决定、处置（`released`/`denied`/`duplicate`/`conflict`/`late_ignored`/`preview_not_delivered`/`orphan`）、关联的事件/地址/正文副本和原因。每扇闸门至多一行有效决定（对非空 `delivery_id` 的唯一部分索引），重复点头只产生 `duplicate` 审计行，不二次放行。
 - `destination_subscriptions`：地址订阅的事件类型集合；`filter_spec`（JSONB，可空）是该"地址×类型"的订阅条件——只有事件正文对得上才扇出，空表示该类型照收；条件只在入库扇出时读取（之后改只影响下一条事件）。
 - `subscription_filter_evaluations`：订阅条件判定记录，每次入库/更正扇出时，每个已确认且挂了条件的订户一行（更正判定挂在更正事件上），含 `matched`、判定时的**条件快照**与 `observe_only`。`matched=false` 就是"这家自己的条件没对上所以没拿到"——没有任何副本、不发出，但与压根没人订（`unrouted`）是明确不同的两种记录；`(event_id, destination_id)` 唯一，同一份正文对同一条件只判一次。
-- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled` / `superseded` / `dead_lettered` / `failed`——`failed` 只出现在更正副本上：外发失败一次即终态，不原地重试、不计地址连续失败、不挡后续副本；`release_denied` / `release_expired` / `release_voided` 只出现在 gated 事件的正文副本上：地址回了不要、预告过点没点头、或人工作废/预告没发成——均为终态、正文从未出门）、下次尝试时间、最早外发时间 `not_before`、租约信息、对账状态（`reconcile_state`、对账时限、回执结果、重投次数）、**确认代号 `confirmation_generation`**、**只跟着看快照 `observe_only`（扇出时从地址复制；为 true 的副本照常外发/重试/隔离/死信/对账，但其回执结果从不改变整笔事件的 `reconcile_status`/传输状态，也不进事件级重投名单）**、**订阅条件快照 `filter_spec`（扇出时从 `destination_subscriptions` 复制；空表示该订阅无条件；非空表示这份正文当时对得上这条条件才生成副本——对不上的根本不会有这行，判定留痕在 `subscription_filter_evaluations`）**、**预告闸门（`phase='preview'` 为预告、`'body'` 为正文；正文的 `release_state` 为 `held`/`released`/`release_denied`/`release_expired`/`release_voided`，`preview_delivery_id`/`body_delivery_id` 互指同一对，`consent_deadline` 在预告真正投妥时写入、`consent_timeout_seconds` 是该事件快照的点头时限，`released_at`/`voided_at`/`void_reason` 记录放行/作废）** 和**死信信息（连续传输失败次数 `consecutive_failures`、死信原因 `dead_letter_reason`、进入时间 `dead_lettered_at`；原因取值为传输失败耗尽 `delivery_attempts_exhausted`、回执超时耗尽 `receipt_timeout_exhausted`、失败回执耗尽 `receipt_failure_exhausted`）**（换位置后老代号排队副本置 `superseded`，领取闸门也会挡住老代号副本）；Worker 只消费这张表且只领取 `pending`/`in_flight`、并且 gated 正文还要 `release_state='released'`，死信与 release 终态副本永不自动外发、也不挡后续副本。
+- `deliveries`：扇出后的每地址投递副本，含每地址顺序号、投递状态（`pending` / `in_flight` / `delivered` / `cancelled` / `superseded` / `dead_lettered` / `failed`——`failed` 只出现在更正副本上：外发失败一次即终态，不原地重试、不计地址连续失败、不挡后续副本；`release_denied` / `release_expired` / `release_voided` 只出现在 gated 事件的正文副本上：地址回了不要、预告过点没点头、或人工作废/预告没发成——均为终态、正文从未出门）、下次尝试时间、最早外发时间 `not_before`、租约信息、对账状态（`reconcile_state`、对账时限、回执结果、重投次数）、**确认代号 `confirmation_generation`**、**只跟着看快照 `observe_only`（扇出时从地址复制；为 true 的副本照常外发/重试/隔离/死信/对账，但其回执结果从不改变整笔事件的 `reconcile_status`/传输状态，也不进事件级重投名单）**、**订阅条件快照 `filter_spec`（扇出时从 `destination_subscriptions` 复制；空表示该订阅无条件；非空表示这份正文当时对得上这条条件才生成副本——对不上的根本不会有这行，判定留痕在 `subscription_filter_evaluations`）**、**预告闸门（`phase='preview'` 为预告、`'body'` 为正文；正文的 `release_state` 为 `held`/`released`/`release_denied`/`release_expired`/`release_voided`，`preview_delivery_id`/`body_delivery_id` 互指同一对，`consent_deadline` 在预告真正投妥时写入、`consent_timeout_seconds` 是该事件快照的点头时限，`released_at`/`voided_at`/`void_reason` 记录放行/作废）** 和**死信信息（连续传输失败次数 `consecutive_failures`、死信原因 `dead_letter_reason`、进入时间 `dead_lettered_at`；原因取值为传输失败耗尽 `delivery_attempts_exhausted`、回执超时耗尽 `receipt_timeout_exhausted`、失败回执耗尽 `receipt_failure_exhausted`）**（换位置后老代号排队副本置 `superseded`，领取闸门也会挡住老代号副本）；Worker 只消费这张表且只领取 `pending`/`in_flight`、并且 gated 正文还要 `release_state='released'`，死信与 release 终态副本永不自动外发、也不挡后续副本。**接力副本另带 `relay_chain_id` + `relay_station_no`（事件入库时的接力版本与站号快照，普通副本为 NULL）：worker 领取闸门还要求"上一站已 `acknowledged`"；上一站停住（失败回执/对账超时/死信/换位置被取代）后，后续还在等的站置为终态 `relay_skipped`（`relay_skipped_at` / `relay_skip_reason` / `relay_stopped_by_delivery_id` 留痕），永不自动外发、永不补投、也不计入在途/已发。
 - `delivery_attempts`：每次 HTTP 投递尝试的审计轨迹（关联事件与副本）。
 - `confirmation_attempts`：上线握手轨迹，一行对应一次确认探测（`challenge`）、应答（`echo`，含回错的 `invalid`）或轮次过期（`expired`），带轮次号、HTTP 状态码、响应片段或错误信息。
 - `receipts`：接收方回执日志，一条回执一行，含处置结果（`applied`/`duplicate`/`late`/`orphan`/`premature`）与匹配到的副本；重复、迟到、查无副本的回执都留在这里可查。

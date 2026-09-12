@@ -338,6 +338,16 @@ class EventOut(BaseModel):
     # state.
     failed_count: int = 0
     shadow_failed_count: int = 0
+    # Relay chain ("接力") stations that were never reached because an earlier
+    # station stopped (failure receipt / reconcile timeout / dead-letter /
+    # supersede). These copies never went out and are excluded from
+    # delivery_count, like superseded copies.
+    relay_skipped_count: int = 0
+    # Present and populated only for events that walked a relay chain; null on
+    # every ordinary event. Shows the snapshotted chain version, each station
+    # in order with its copy's state, which stations acknowledged, the current
+    # ("walking") station, and where/why the run stopped if it did.
+    relay: "RelayRunOut | None" = None
 
 
 class DeliveryOut(BaseModel):
@@ -424,6 +434,16 @@ class DeliveryOut(BaseModel):
     voided_at: datetime | None = None
     # manual | preview_dead_lettered | preview_superseded (release_voided).
     void_reason: str | None = None
+    # Relay chain ("接力") snapshot: set together on station copies, null on
+    # ordinary copies. relay_station_no is the 1-based position in the chain
+    # version this event fanned out under. relay_skip_* are set only on
+    # terminal relay_skipped rows (never reached because an earlier station
+    # stopped).
+    relay_chain_id: UUID | None = None
+    relay_station_no: int | None = None
+    relay_skipped_at: datetime | None = None
+    relay_skip_reason: str | None = None
+    relay_stopped_by_delivery_id: UUID | None = None
 
     model_config = {"from_attributes": True}
 
@@ -826,3 +846,94 @@ class BodyVoidOut(BaseModel):
     voided: bool
     status: str
     release_state: str
+
+
+# --- Per-event-type relay chains ("接力") -----------------------------------
+
+
+class RelayChainIn(BaseModel):
+    # Ordered receiving addresses. The event goes to station 1 first; each
+    # later station only after the immediately previous station carries a
+    # matching success receipt. At least one station is required and the same
+    # destination cannot occupy two stations of the same chain. Re-defining
+    # the order creates a new chain version: events already on their way keep
+    # the stations they set out with, only later accepted events follow the
+    # new order.
+    destination_ids: list[UUID] = Field(..., min_length=1)
+
+    @field_validator("destination_ids")
+    @classmethod
+    def no_duplicate_stations(cls, value: list[UUID]) -> list[UUID]:
+        if len(set(value)) != len(value):
+            raise ValueError(
+                "the same destination cannot occupy two stations of one chain"
+            )
+        return value
+
+
+class RelayStationOut(BaseModel):
+    station_no: int
+    destination_id: UUID
+
+
+class RelayChainOut(BaseModel):
+    id: UUID
+    event_type: str
+    version: int
+    active: bool = True
+    created_at: datetime
+    stations: list[RelayStationOut] = []
+
+    model_config = {"from_attributes": True}
+
+
+class RelayRunStationOut(BaseModel):
+    # One row per station of the chain version this event set out under, in
+    # station order. acknowledged = the station's copy matched a success
+    # receipt (this is what opens the next station); delivered = transport
+    # reached it at least once; reached = the copy is past pure queueing.
+    # skip_reason / stopped_by_delivery_id identify why a later station was
+    # never sent.
+    station_no: int
+    destination_id: UUID
+    destination_url: str | None = None
+    delivery_id: UUID
+    status: str
+    reconcile_state: str = "none"
+    acknowledged: bool = False
+    delivered: bool = False
+    reached: bool = False
+    skip_reason: str | None = None
+    skipped_at: datetime | None = None
+    stopped_by_delivery_id: UUID | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class RelayRunOut(BaseModel):
+    chained: bool = True
+    event_type: str
+    chain_id: UUID
+    # Version of the chain the event fanned out under (kept even if the type's
+    # current chain was later re-defined; the run never changes stations).
+    chain_version: int
+    # Whether THIS version is still the type's current active chain. False
+    # after a later re-definition, while existing runs keep using it.
+    chain_active: bool
+    station_count: int
+    acknowledged_count: int = 0
+    delivered_count: int = 0
+    skipped_count: int = 0
+    # First station that has not acknowledged yet (the station the run is
+    # walking at right now); null once the run completed.
+    current_station_no: int | None = None
+    # True once a station stopped with the run unfinished: later stations are
+    # relay_skipped and will never be backfilled.
+    stopped: bool = False
+    stopped_at_station_no: int | None = None
+    # delivery_attempts_exhausted | receipt_timeout_exhausted |
+    # receipt_failure_exhausted | receipt_failed | receipt_timeout |
+    # superseded
+    stop_reason: str | None = None
+    completed: bool = False
+    stations: list[RelayRunStationOut] = []

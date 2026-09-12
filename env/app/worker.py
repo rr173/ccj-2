@@ -22,6 +22,7 @@ from app.config import settings
 from app.db import SessionLocal, build_engine
 from app.models import init_db
 from app import release as release_gate
+from app import relay
 
 logger = logging.getLogger("event-worker")
 
@@ -83,7 +84,26 @@ CLAIM_SQL = text(
                        COALESCE(e.not_before, '-infinity'::timestamptz)
                    ) AS delivery_due_at,
                    e.confirmation_generation AS delivery_generation,
-                   e.consecutive_failures
+                   e.consecutive_failures,
+                   -- Relay chain ("接力") gate. A station copy is only
+                   -- deliverable when it is station 1 or the immediately
+                   -- preceding station of THIS event's chain version carries
+                   -- a matching success receipt. Later stations stay pending
+                   -- in queue position (and are skipped as the head) until
+                   -- their predecessor acknowledges; a stop upstream moves
+                   -- them to terminal relay_skipped, which is also excluded.
+                   (
+                        e.relay_chain_id IS NULL
+                        OR e.relay_station_no = 1
+                        OR EXISTS (
+                            SELECT 1
+                            FROM deliveries prev
+                            WHERE prev.event_id = e.event_id
+                              AND prev.relay_chain_id = e.relay_chain_id
+                              AND prev.relay_station_no = e.relay_station_no - 1
+                              AND prev.reconcile_state = 'acknowledged'
+                        )
+                   ) AS relay_open
             FROM deliveries e
             WHERE e.destination_id = d.id
               AND e.status IN ('pending', 'in_flight')
@@ -103,6 +123,7 @@ CLAIM_SQL = text(
         ) oldest
         WHERE oldest.delivery_status = 'pending'
           AND oldest.delivery_due_at <= now()
+          AND oldest.relay_open
           AND (
                 d.status = 'active'
              OR (d.status = 'isolated' AND d.recoverable_at <= now())
@@ -150,7 +171,7 @@ CLAIM_SQL = text(
         LATERAL (
             SELECT id, status, next_attempt_at, not_before,
                    confirmation_generation, phase, release_state,
-                   preview_delivery_id
+                   preview_delivery_id, relay_chain_id, relay_station_no
             FROM deliveries
             WHERE destination_id = d.id
               AND status IN ('pending', 'in_flight')
@@ -158,6 +179,19 @@ CLAIM_SQL = text(
               -- bodies are skipped here too so the preceding preview is the
               -- copy picked.
               AND (release_state IS NULL OR release_state = 'released')
+              -- Same relay gate as the candidate head: a station whose
+              -- predecessor has not acknowledged yet is never claimed.
+              AND (
+                    relay_chain_id IS NULL
+                 OR relay_station_no = 1
+                 OR EXISTS (
+                     SELECT 1 FROM deliveries prev
+                     WHERE prev.event_id = deliveries.event_id
+                       AND prev.relay_chain_id = deliveries.relay_chain_id
+                       AND prev.relay_station_no = deliveries.relay_station_no - 1
+                       AND prev.reconcile_state = 'acknowledged'
+                 )
+              )
             ORDER BY destination_seq
             LIMIT 1
             FOR UPDATE SKIP LOCKED
@@ -168,6 +202,17 @@ CLAIM_SQL = text(
           AND (picked.not_before IS NULL OR picked.not_before <= now())
           AND picked.confirmation_generation = d.confirmation_generation
           AND (picked.release_state IS NULL OR picked.release_state = 'released')
+          AND (
+                picked.relay_chain_id IS NULL
+             OR picked.relay_station_no = 1
+             OR EXISTS (
+                 SELECT 1 FROM deliveries prev
+                 WHERE prev.event_id = e.event_id
+                   AND prev.relay_chain_id = picked.relay_chain_id
+                   AND prev.relay_station_no = picked.relay_station_no - 1
+                   AND prev.reconcile_state = 'acknowledged'
+             )
+          )
         RETURNING
             e.*,
             CASE
@@ -201,6 +246,8 @@ CLAIM_SQL = text(
         e.release_state,
         e.body_delivery_id,
         e.consent_timeout_seconds,
+        e.relay_chain_id,
+        e.relay_station_no,
         d.url AS destination_url,
         e.recovered_destination,
         ev.corrects_event_id,
@@ -219,7 +266,7 @@ CLAIM_SQL = text(
 SUPERSEDE_STALE_SQL = text(
     """
     WITH stale AS (
-        SELECT e.id
+        SELECT e.id, e.relay_chain_id
         FROM deliveries e
         JOIN destinations d ON d.id = e.destination_id
         WHERE e.status = 'pending'
@@ -232,6 +279,7 @@ SUPERSEDE_STALE_SQL = text(
         updated_at = now()
     FROM stale
     WHERE e.id = stale.id
+    RETURNING e.id, stale.relay_chain_id
     """
 )
 
@@ -494,6 +542,8 @@ def deliver(
     preview_payload: dict[str, Any] | None = None,
     consent_timeout_seconds: int | None = None,
     body_delivery_id: str | None = None,
+    relay_chain_id: str | None = None,
+    relay_station_no: int | None = None,
 ) -> dict[str, Any]:
     # Previews ("预告") and bodies ("正文") are two distinct messages. A
     # preview never carries the real payload: the receiver only sees the
@@ -532,6 +582,14 @@ def deliver(
         # tell it apart and link it to the original event it corrects.
         body["corrects_event_id"] = corrects_event_id
         headers["X-Corrects-Event-Id"] = corrects_event_id
+    if relay_chain_id is not None:
+        # Relay-chain ("接力") routing: tells the receiver which chain
+        # version this copy belongs to and which station it is, so a station
+        # can tell ordered relay traffic apart from ordinary fan-out.
+        body["relay_chain_id"] = relay_chain_id
+        body["relay_station_no"] = relay_station_no
+        headers["X-Relay-Chain-Id"] = relay_chain_id
+        headers["X-Relay-Station-No"] = str(relay_station_no)
     started = utc_now()
     try:
         response = client.post(url, json=body, headers=headers)
@@ -699,6 +757,10 @@ def record_result(
                 preview_id=claim["delivery_id"],
                 reason="preview_superseded",
             )
+        if claim.get("relay_chain_id") is not None:
+            # A relay station whose queued copy was superseded by a location
+            # change stops its run: every later pending station is skipped.
+            relay.cascade_after_stop(db, str(claim["delivery_id"]))
         logger.info(
             "superseded failed in-flight delivery_id=%s after destination location change",
             claim["delivery_id"],
@@ -740,6 +802,10 @@ def record_result(
                 preview_id=claim["delivery_id"],
                 reason="preview_dead_lettered",
             )
+        if should_dead_letter and claim.get("relay_chain_id") is not None:
+            # A relay station that exhausted its own transport attempts
+            # stops the whole run behind it: no later station is backfilled.
+            relay.cascade_after_stop(db, str(claim["delivery_id"]))
 
     db.execute(
         ATTEMPT_SQL,
@@ -784,7 +850,12 @@ def claim_next_event(db: Session) -> RowMapping | None:
     # Abandon queued copies of earlier confirmation generations (the
     # destination changed location): they must never go to the new URL and
     # must not block its head as pending forever.
-    db.execute(SUPERSEDE_STALE_SQL)
+    superseded = db.execute(SUPERSEDE_STALE_SQL).mappings().all()
+    # A relay station superseded by a location change stops its whole run:
+    # every later station still pending is closed relay_skipped.
+    for row in superseded:
+        if row["relay_chain_id"] is not None:
+            relay.cascade_after_stop(db, str(row["id"]))
     result = db.execute(
         CLAIM_SQL,
         {
@@ -838,6 +909,12 @@ def process_once() -> bool:
                 if claim.get("body_delivery_id")
                 else None
             ),
+            relay_chain_id=(
+                str(claim["relay_chain_id"])
+                if claim.get("relay_chain_id")
+                else None
+            ),
+            relay_station_no=claim.get("relay_station_no"),
         )
         heartbeat.stop()
 

@@ -23,12 +23,13 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app import relay
 
 logger = logging.getLogger("receipts")
 
 LOCK_DELIVERY_SQL = text(
     """
-    SELECT id, status, reconcile_state, requeue_count,
+    SELECT id, status, reconcile_state, requeue_count, relay_chain_id,
            (reconcile_deadline IS NOT NULL AND reconcile_deadline < now())
                AS reconcile_expired
     FROM deliveries
@@ -127,6 +128,8 @@ def ingest_receipt(db: Session, destination_id: UUID, dedupe_key: str, result: s
     receipt_id = uuid4()
     delivery_id = delivery["id"] if delivery is not None else None
     parked_dead_letter = False
+    relay_stopped = False
+    relay_delivery_id: UUID | None = None
 
     if delivery is None:
         disposition = "orphan"
@@ -138,6 +141,12 @@ def ingest_receipt(db: Session, destination_id: UUID, dedupe_key: str, result: s
                 # run yet: this receipt is late and must not acknowledge.
                 db.execute(MARK_TIMED_OUT_SQL, {"delivery_id": str(delivery_id)})
                 disposition = "late"
+                # A relay station whose deadline passed (even if the sweeper
+                # has not run yet) stops its run; the late receipt never
+                # opens the next station.
+                if delivery["relay_chain_id"] is not None:
+                    relay_stopped = True
+                    relay_delivery_id = delivery_id
             else:
                 db.execute(
                     APPLY_RECEIPT_SQL,
@@ -151,6 +160,12 @@ def ingest_receipt(db: Session, destination_id: UUID, dedupe_key: str, result: s
                     },
                 )
                 disposition = "applied"
+                # A relay station answering failure stops the run behind it
+                # whether or not the copy is parked in the dead-letter area;
+                # the next station only ever follows a success receipt.
+                if result == "failure" and delivery["relay_chain_id"] is not None:
+                    relay_stopped = True
+                    relay_delivery_id = delivery_id
                 # The receiver explicitly failed this copy for the last
                 # allowed requeue cycle: park it instead of leaving another
                 # receipt_failed copy that operators must chase forever.
@@ -204,6 +219,11 @@ def ingest_receipt(db: Session, destination_id: UUID, dedupe_key: str, result: s
             "disposition": disposition,
         },
     ).mappings().one()
+    if relay_stopped and relay_delivery_id is not None:
+        # Close every still-pending later station of this relay run in the
+        # same transaction that recorded the stop; nothing later can read the
+        # run as still advancing. Idempotent and keyed on this trigger only.
+        relay.cascade_after_stop(db, str(relay_delivery_id))
     db.commit()
     if parked_dead_letter:
         logger.warning(

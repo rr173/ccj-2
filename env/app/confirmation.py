@@ -174,6 +174,12 @@ def arm_round(
         ),
         {"destination_id": destination_id},
     )
+    # A relay station superseded by this relocation stops each run it belongs
+    # to: every later station still pending is closed relay_skipped (never
+    # sent, never backfilled), carrying this station's superseded reason.
+    from app import relay
+
+    relay.cascade_superseded_destination(db, destination_id)
     # Defensive: a preview abandoned in the queue (e.g. one whose body escaped
     # the generation-scoped pass) voids the held body behind it.
     for row in superseded_previews:

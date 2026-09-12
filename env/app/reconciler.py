@@ -30,6 +30,7 @@ from app.config import settings
 from app.db import SessionLocal, build_engine
 from app.models import init_db
 from app import release as release_gate
+from app import relay
 
 logger = logging.getLogger("reconciler")
 
@@ -57,11 +58,13 @@ SWEEP_SQL = text(
             updated_at = now()
         FROM expired e
         WHERE d.id = e.id
-        RETURNING e.exhausted AS exhausted
+        RETURNING e.id AS delivery_id, e.exhausted AS exhausted,
+                  d.relay_chain_id IS NOT NULL AS is_relay
     )
     SELECT
         COUNT(*) FILTER (WHERE NOT exhausted)::int AS timed_out,
-        COUNT(*) FILTER (WHERE exhausted)::int AS dead_lettered
+        COUNT(*) FILTER (WHERE exhausted)::int AS dead_lettered,
+        ARRAY_AGG(delivery_id) FILTER (WHERE is_relay) AS relay_stopped
     FROM swept
     """
 )
@@ -94,6 +97,11 @@ def sweep_once() -> tuple[int, int]:
             SWEEP_SQL,
             {"max_requeue_cycles": settings.max_requeue_cycles},
         ).mappings().one()
+        # Every relay station whose reconcile deadline passed stops its run:
+        # close its later pending stations relay_skipped, whether this stop is
+        # a plain timed_out or a dead-letter after exhausting requeue cycles.
+        for stopped_id in row.relay_stopped or []:
+            relay.cascade_after_stop(db, str(stopped_id))
         db.commit()
         if expired_gates:
             logger.info(
