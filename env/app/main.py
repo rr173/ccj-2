@@ -34,6 +34,7 @@ from app.ingest_auth import (
     parse_event_body,
 )
 from app.models import init_db
+from app import deadlines
 from app import release as release_gate
 from app import relay
 from app.config import settings
@@ -63,6 +64,8 @@ from app.schemas import (
     DestinationPauseIn,
     DestinationResumeOut,
     EventBulkRequeueOut,
+    EventDeliverByIn,
+    EventDeliverByOut,
     EventIn,
     EventOut,
     EventRescheduleIn,
@@ -97,7 +100,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Event Ingest Service",
-    version="2.10.0",
+    version="2.11.0",
     lifespan=lifespan,
 )
 
@@ -303,6 +306,8 @@ def event_status(
     shadow_superseded_count: int = 0,
     failed_count: int = 0,
     shadow_failed_count: int = 0,
+    deadline_expired_count: int = 0,
+    shadow_deadline_expired_count: int = 0,
     release_closed_count: int = 0,
     shadow_release_closed_count: int = 0,
     filtered_count: int = 0,
@@ -339,6 +344,8 @@ def event_status(
                 # was ever sent to any for-real address. This is explicit and
                 # never "delivered".
                 return "release_closed"
+            if deadline_expired_count > 0:
+                return "deadline_expired"
             if filtered_count > 0:
                 # Confirmed for-real subscribers exist, but every one of their
                 # own subscription conditions withheld this body: no copy was
@@ -348,6 +355,8 @@ def event_status(
             return "unrouted"
         if shadow_pending_count > 0:
             return "pending"
+        if shadow_deadline_expired_count > 0 and shadow_delivered_count == 0:
+            return "deadline_expired"
         if shadow_dead_lettered_count > 0 and shadow_delivered_count == 0:
             return "dead_lettered"
         if shadow_failed_count > 0 and shadow_delivered_count == 0:
@@ -369,6 +378,11 @@ def event_status(
         return "relay_halted"
     if pending_count > 0:
         return "pending"
+    if deadline_expired_count > 0:
+        # Nothing remains queued, and at least one copy missed the cutoff
+        # without being handed off. This must not be "delivered" even when
+        # other addresses already received it.
+        return "deadline_expired"
     if dead_lettered_count > 0:
         # Every for-real live copy stopped: at least one is parked in the
         # dead-letter area and nothing for-real is queued or in flight. It is
@@ -416,6 +430,7 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
     result = dict(event)
     superseded_count = result.get("superseded_count", 0) or 0
     dead_lettered_count = result.get("dead_lettered_count", 0) or 0
+    deadline_expired_count = result.get("deadline_expired_count", 0) or 0
     pending_count = result.get("pending_count", 0) or 0
     failed_count = result.get("failed_count", 0) or 0
     relay_skipped_count = result.get("relay_skipped_count", 0) or 0
@@ -427,6 +442,9 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
     )
     shadow_superseded_count = result.get("shadow_superseded_count", 0) or 0
     shadow_dead_lettered_count = result.get("shadow_dead_lettered_count", 0) or 0
+    shadow_deadline_expired_count = result.get(
+        "shadow_deadline_expired_count", 0
+    ) or 0
     shadow_pending_count = result.get("shadow_pending_count", 0) or 0
     shadow_failed_count = result.get("shadow_failed_count", 0) or 0
     shadow_closed_count = result.get("shadow_bodies_closed_count", 0) or 0
@@ -448,10 +466,12 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
         - superseded_count
         - release_closed_count
         - relay_skipped_count
+        - deadline_expired_count
     )
     result["delivery_count"] = live_count
     result["superseded_count"] = superseded_count
     result["dead_lettered_count"] = dead_lettered_count
+    result["deadline_expired_count"] = deadline_expired_count
     result["pending_count"] = pending_count
     result["failed_count"] = failed_count
     result["relay_skipped_count"] = relay_skipped_count
@@ -462,10 +482,12 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
         (result.get("shadow_delivery_count", 0) or 0)
         - shadow_superseded_count
         - shadow_closed_count
+        - shadow_deadline_expired_count
     )
     result["shadow_delivery_count"] = shadow_live_count
     result["shadow_superseded_count"] = shadow_superseded_count
     result["shadow_dead_lettered_count"] = shadow_dead_lettered_count
+    result["shadow_deadline_expired_count"] = shadow_deadline_expired_count
     result["shadow_pending_count"] = shadow_pending_count
     result["shadow_failed_count"] = shadow_failed_count
     result["status"] = event_status(
@@ -482,6 +504,8 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
         shadow_superseded_count,
         failed_count,
         shadow_failed_count,
+        deadline_expired_count,
+        shadow_deadline_expired_count,
         release_closed_count,
         shadow_closed_count,
         filtered_out_count,
@@ -530,7 +554,8 @@ def event_response(event: RowMapping | dict[str, Any]) -> dict:
 DELIVERY_COLUMNS = (
     "d.id, d.event_id, d.destination_id, dest.url AS destination_url, "
     "d.destination_seq, d.dedupe_key, d.event_type, d.status, d.attempts, "
-    "d.next_attempt_at, d.not_before, d.last_error, d.created_at, d.updated_at, "
+    "d.next_attempt_at, d.not_before, d.deliver_by, d.deliver_by_expired_at, "
+    "d.last_error, d.created_at, d.updated_at, "
     "d.delivered_at, d.reconcile_state, d.reconcile_deadline, "
     "d.reconciled_at, d.receipt_result, d.requeue_count, "
     "d.consecutive_failures, d.dead_letter_reason, d.dead_lettered_at, "
@@ -545,7 +570,7 @@ DELIVERY_COLUMNS = (
 
 EVENT_WITH_COUNTS_SQL = """
     SELECT e.id, e.source_id, e.event_type, e.dedupe_key, e.payload, e.created_at,
-           e.not_before, e.cancelled_at,
+           e.not_before, e.deliver_by, e.cancelled_at,
            e.required_ack_count,
            e.preview_payload,
            e.corrects_event_id,
@@ -577,6 +602,10 @@ EVENT_WITH_COUNTS_SQL = """
            )::int AS dead_lettered_count,
            COUNT(d.id) FILTER (
                WHERE NOT d.observe_only AND d.phase = 'body'
+                 AND d.status = 'deadline_expired'
+           )::int AS deadline_expired_count,
+           COUNT(d.id) FILTER (
+               WHERE NOT d.observe_only AND d.phase = 'body'
                  AND d.status = 'failed'
            )::int AS failed_count,
            -- Relay chain ("接力"): later stations closed relay_skipped after
@@ -594,7 +623,7 @@ EVENT_WITH_COUNTS_SQL = """
            COUNT(d.id) FILTER (
                WHERE d.relay_chain_id IS NOT NULL
                  AND (
-                     d.status IN ('dead_lettered', 'superseded')
+                     d.status IN ('dead_lettered', 'superseded', 'deadline_expired')
                      OR d.reconcile_state IN ('receipt_failed', 'timed_out')
                  )
            )::int AS relay_stopped_count,
@@ -618,6 +647,10 @@ EVENT_WITH_COUNTS_SQL = """
                WHERE d.observe_only AND d.phase = 'body'
                  AND d.status = 'dead_lettered'
            )::int AS shadow_dead_lettered_count,
+           COUNT(d.id) FILTER (
+               WHERE d.observe_only AND d.phase = 'body'
+                 AND d.status = 'deadline_expired'
+           )::int AS shadow_deadline_expired_count,
            COUNT(d.id) FILTER (
                WHERE d.observe_only AND d.phase = 'body'
                  AND d.status = 'failed'
@@ -1406,14 +1439,15 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
         text(
             """
             INSERT INTO events (source_id, event_type, dedupe_key, payload,
-                                not_before, required_ack_count, preview_payload)
+                                not_before, deliver_by, required_ack_count, preview_payload)
             VALUES (CAST(:source_id AS UUID), :event_type, :dedupe_key,
                     CAST(:payload AS JSONB), CAST(:not_before AS TIMESTAMPTZ),
+                    CAST(:deliver_by AS TIMESTAMPTZ),
                     CAST(:required_ack_count AS INTEGER),
                     CAST(:preview_payload AS JSONB))
             ON CONFLICT (dedupe_key) DO NOTHING
             RETURNING id, source_id, event_type, dedupe_key, payload, not_before,
-                      cancelled_at, created_at, required_ack_count,
+                      deliver_by, cancelled_at, created_at, required_ack_count,
                       corrects_event_id, preview_payload
             """
         ),
@@ -1423,6 +1457,7 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
             "dedupe_key": body.dedupe_key,
             "payload": payload,
             "not_before": body.not_before,
+            "deliver_by": body.deliver_by,
             # Filled in after fan-out below; the row stays inside this
             # transaction so nobody can observe the placeholder.
             "required_ack_count": 0,
@@ -1489,6 +1524,7 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
             dedupe_key=body.dedupe_key,
             payload=payload,
             not_before=body.not_before,
+            deliver_by=body.deliver_by,
         )
         station_count = len(active_chain["stations"])
         real_pair_count = station_count
@@ -1588,6 +1624,7 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
                 payload=payload,
                 preview_payload=preview_payload,
                 not_before=body.not_before,
+                deliver_by=body.deliver_by,
                 consent_timeout_seconds=policy["consent_timeout_seconds"],
                 destinations=routed_subscribers,
                 filter_specs={
@@ -1618,11 +1655,12 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
                         )
                         INSERT INTO deliveries
                             (event_id, destination_id, event_type, dedupe_key, payload,
-                             destination_seq, not_before, confirmation_generation,
+                             destination_seq, not_before, deliver_by, confirmation_generation,
                              observe_only, filter_spec)
                         SELECT :event_id, id, :event_type, :dedupe_key,
                                CAST(:payload AS JSONB), next_event_seq,
-                               CAST(:not_before AS TIMESTAMPTZ), confirmation_generation,
+                               CAST(:not_before AS TIMESTAMPTZ),
+                               CAST(:deliver_by AS TIMESTAMPTZ), confirmation_generation,
                                :observe_only, CAST(:filter_spec AS JSONB)
                         FROM bumped
                         """
@@ -1634,6 +1672,7 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
                         "dedupe_key": body.dedupe_key,
                         "payload": payload,
                         "not_before": body.not_before,
+                        "deliver_by": body.deliver_by,
                         "observe_only": row[1],
                         "filter_spec": json.dumps(row[2]) if row[2] is not None else None,
                     },
@@ -1722,6 +1761,7 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     result["acknowledged_count"] = 0
     result["superseded_count"] = 0
     result["dead_lettered_count"] = 0
+    result["deadline_expired_count"] = 0
     result["failed_count"] = 0
     result["bodies_waiting_count"] = real_pair_count if policy is not None else 0
     result["bodies_released_count"] = 0
@@ -1735,6 +1775,7 @@ def store_event(db: Session, body: EventIn, source: dict) -> tuple[dict, int]:
     result["shadow_acknowledged_count"] = 0
     result["shadow_superseded_count"] = 0
     result["shadow_dead_lettered_count"] = 0
+    result["shadow_deadline_expired_count"] = 0
     result["shadow_failed_count"] = 0
     result["shadow_bodies_waiting_count"] = (
         shadow_pair_count if policy is not None else 0
@@ -2413,6 +2454,7 @@ def create_correction(
     result["acknowledged_count"] = 0
     result["superseded_count"] = 0
     result["dead_lettered_count"] = 0
+    result["deadline_expired_count"] = 0
     result["failed_count"] = 0
     result["shadow_delivery_count"] = len(shadow_copies)
     result["shadow_delivered_count"] = 0
@@ -2420,6 +2462,7 @@ def create_correction(
     result["shadow_acknowledged_count"] = 0
     result["shadow_superseded_count"] = 0
     result["shadow_dead_lettered_count"] = 0
+    result["shadow_deadline_expired_count"] = 0
     result["shadow_failed_count"] = 0
     result["filtered_out_count"] = filtered_real
     result["shadow_filtered_out_count"] = filtered_shadow
@@ -2442,13 +2485,14 @@ def list_corrections(event_id: UUID, db: Session = Depends(get_db)):
 
 # --- Cancellation and rescheduling ------------------------------------------
 #
-# Both operations share one rule: once any copy of the event has been handed
-# to a receiver (delivered) or is being handed over right now (in_flight),
-# the event is frozen — what already went out cannot be taken back or moved.
-# While every copy is still queued, cancellation drops them into the terminal
-# 'cancelled' state (the worker never touches those again) and rescheduling
-# rewrites the not_before gate on the queued copies in place, so each copy
-# keeps its original per-destination queue position.
+# Both operations share one rule: while every copy is still queued,
+# cancellation drops them into the terminal 'cancelled' state (the worker never
+# touches those again) and rescheduling rewrites the not_before gate on the
+# queued copies in place, so each copy keeps its original per-destination queue
+# position. A delivered/in-flight copy or another irreversible outcome blocks
+# both operations: what already went out cannot be taken back, and a terminal
+# undelivered outcome (deadline expiry, dead-letter, supersede, relay skip) is
+# not silently converted into an ordinary scheduled event.
 
 LOCK_EVENT_SQL = """
     SELECT id, cancelled_at
@@ -2457,14 +2501,15 @@ LOCK_EVENT_SQL = """
     FOR UPDATE
 """
 
-# Locks every copy that is not yet terminally cancelled, in a stable order.
-# Delivered copies are locked too so a concurrent requeue cannot flip one
-# back to pending in the middle of the decision.
+# Locks every copy that is not already cancelled, in a stable order.
+# Delivered and other terminal-outcome rows are locked so the decision can
+# refuse to rewrite/cancel them and concurrent requeue cannot move one during
+# the check.
 LOCK_EVENT_DELIVERIES_SQL = """
     SELECT id, status
     FROM deliveries
     WHERE event_id = CAST(:event_id AS UUID)
-      AND status IN ('pending', 'in_flight', 'delivered')
+      AND status NOT IN ('cancelled')
     ORDER BY destination_id, destination_seq
     FOR UPDATE
 """
@@ -2489,9 +2534,22 @@ def fetch_event_response(db: Session, event_id: UUID) -> dict:
     return event_response_with_relay(db, event)
 
 
-def event_already_sent(deliveries) -> bool:
-    """True once any copy reached a receiver (or is in flight right now)."""
-    return any(d["status"] in ("in_flight", "delivered") for d in deliveries)
+def event_has_irreversible_delivery(deliveries) -> bool:
+    # Terminal outcome already present: the event cannot be returned to a
+    # pure "all copies are queued" state by cancelling/rescheduling.
+    terminal_outside_cancel = {
+        "in_flight",
+        "delivered",
+        "superseded",
+        "dead_lettered",
+        "failed",
+        "release_denied",
+        "release_expired",
+        "release_voided",
+        "relay_skipped",
+        "deadline_expired",
+    }
+    return any(d["status"] in terminal_outside_cancel for d in deliveries)
 
 
 @app.post("/v1/events/{event_id}/cancel", response_model=EventOut)
@@ -2505,11 +2563,11 @@ def cancel_event(event_id: UUID, db: Session = Depends(get_db)):
         db.rollback()
         return fetch_event_response(db, event_id)
 
-    if event_already_sent(lock_event_deliveries(db, event_id)):
+    if event_has_irreversible_delivery(lock_event_deliveries(db, event_id)):
         db.rollback()
         raise HTTPException(
             status_code=409,
-            detail="event has already been sent out and can no longer be cancelled",
+            detail="event has already been sent or has an irreversible delivery outcome, so it can no longer be cancelled",
         )
 
     # Every copy is still queued and now locked by this transaction, so the
@@ -2561,16 +2619,16 @@ def reschedule_event(
             status_code=409, detail="a cancelled event cannot be rescheduled"
         )
 
-    if event_already_sent(lock_event_deliveries(db, event_id)):
+    if event_has_irreversible_delivery(lock_event_deliveries(db, event_id)):
         db.rollback()
         raise HTTPException(
             status_code=409,
-            detail="event has already been sent out and can no longer be rescheduled",
+            detail="event has an irreversible delivery outcome and can no longer be rescheduled",
         )
 
-    # Rewrite the gate on the event and on every still-queued copy. The copies
-    # keep their destination_seq, so they rejoin their queues exactly where
-    # they already were — only the earliest send time moves.
+    # Rewrite the earliest-send gate on the event and on every still-queued
+    # copy. The copies keep their destination_seq, so they rejoin their queues
+    # exactly where they already were — only the earliest send time moves.
     db.execute(
         text(
             """
@@ -2595,6 +2653,35 @@ def reschedule_event(
     )
     db.commit()
     return fetch_event_response(db, event_id)
+
+
+@app.post("/v1/events/{event_id}/deliver-by", response_model=EventDeliverByOut)
+def update_event_deliver_by(
+    event_id: UUID, body: EventDeliverByIn, db: Session = Depends(get_db)
+):
+    event = lock_event(db, event_id)
+    if event is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="event not found")
+    if event["cancelled_at"] is not None:
+        db.rollback()
+        raise HTTPException(
+            status_code=409, detail="a cancelled event's cutoff cannot be changed"
+        )
+
+    # Rewrite the event's current promise and snapshot it only onto queued /
+    # in-flight copies. Delivered copies are deliberately excluded: what
+    # already reached an address is not recalled and cannot be retroactively
+    # called "missed". Terminal copies keep their own standing too.
+    counts = deadlines.update_event_deadline(db, str(event_id), body.deliver_by)
+    db.commit()
+    return {
+        "event_id": event_id,
+        "deliver_by": body.deliver_by,
+        "updated_count": counts["updated_count"],
+        "updated_real_count": counts["real_count"],
+        "updated_shadow_count": counts["shadow_count"],
+    }
 
 
 @app.post(
@@ -3378,6 +3465,7 @@ def list_release_gates(
         release_gate.DENIED,
         release_gate.EXPIRED,
         release_gate.VOIDED,
+        "deadline_expired",
     ):
         raise HTTPException(status_code=422, detail="invalid release_state")
     if status_filter is not None and status_filter not in (
@@ -3387,6 +3475,7 @@ def list_release_gates(
         "release_denied",
         "release_expired",
         "release_voided",
+        "deadline_expired",
         "dead_lettered",
     ):
         raise HTTPException(status_code=422, detail="invalid status")
@@ -3425,6 +3514,7 @@ def list_event_release_gates(
         release_gate.DENIED,
         release_gate.EXPIRED,
         release_gate.VOIDED,
+        "deadline_expired",
     ):
         raise HTTPException(status_code=422, detail="invalid release_state")
     return _gate_rows(

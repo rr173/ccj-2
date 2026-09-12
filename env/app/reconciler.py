@@ -29,6 +29,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.config import settings
 from app.db import SessionLocal, build_engine
 from app.models import init_db
+from app import deadlines
 from app import release as release_gate
 from app import relay
 
@@ -82,6 +83,14 @@ def void_expired_gates(db) -> int:
     return release_gate.sweep_expired_gates(db)
 
 
+def expire_delivery_deadlines(db) -> int:
+    """Close queued copies that missed their deliver-by cutoff."""
+    expired_ids = deadlines.expire_due_deliveries(db)
+    for delivery_id in expired_ids:
+        relay.cascade_after_stop(db, delivery_id)
+    return len(expired_ids)
+
+
 def sweep_once() -> tuple[int, int]:
     """Sweep overdue awaiting deliveries and expired preview gates.
 
@@ -91,7 +100,9 @@ def sweep_once() -> tuple[int, int]:
     """
     db = SessionLocal()
     expired_gates = 0
+    expired_deadlines = 0
     try:
+        expired_deadlines = expire_delivery_deadlines(db)
         expired_gates = void_expired_gates(db)
         row = db.execute(
             SWEEP_SQL,
@@ -107,6 +118,11 @@ def sweep_once() -> tuple[int, int]:
             logger.info(
                 "voided %s gated bodies whose address did not nod in time",
                 expired_gates,
+            )
+        if expired_deadlines:
+            logger.info(
+                "closed %s deliveries after their deliver-by cutoff passed",
+                expired_deadlines,
             )
         return row["timed_out"], row["dead_lettered"]
     except SQLAlchemyError:

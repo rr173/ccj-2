@@ -129,6 +129,11 @@ SCHEMA_STATEMENTS = [
         dedupe_key TEXT NOT NULL UNIQUE,
         payload JSONB NOT NULL,
         not_before TIMESTAMPTZ,
+        -- Latest transport time chosen at submission ("最晚送到"). Null means
+        -- no such promise; deliveries then proceed normally. The value is
+        -- snapshotted onto undelivered copies, and changing it later only
+        -- rewrites copies that have not completed transport.
+        deliver_by TIMESTAMPTZ,
         cancelled_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         -- Optional short text a gated event's preview is allowed to show.
@@ -163,10 +168,19 @@ SCHEMA_STATEMENTS = [
         lease_until TIMESTAMPTZ,
         next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         not_before TIMESTAMPTZ,
+        -- Snapshot of events.deliver_by for this copy. It is copied/rewritten
+        -- only while transport has not completed: once delivered_at is set a
+        -- later deadline change can never touch the copy. Null copies ignore
+        -- the cutoff and keep their ordinary delivery lifecycle.
+        deliver_by TIMESTAMPTZ,
         last_error TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         delivered_at TIMESTAMPTZ,
+        -- When an undelivered copy was closed because its deliver_by cutoff
+        -- had passed. Terminal deadline_expired rows never go out and must be
+        -- distinguishable from delivered, filtered, and unrouted outcomes.
+        deliver_by_expired_at TIMESTAMPTZ,
         reconcile_state TEXT NOT NULL DEFAULT 'none',
         reconcile_deadline TIMESTAMPTZ,
         reconciled_at TIMESTAMPTZ,
@@ -266,8 +280,11 @@ SCHEMA_STATEMENTS = [
         -- of a gated body that never went out — the address answered "no",
         -- did not nod before the agreed deadline, or the not-yet-out body was
         -- voided manually / because its preview never made it through.
+        -- deadline_expired: still undelivered when its deliver_by cutoff
+        -- passed; terminal, it never goes out and is not marked delivered.
         CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
-                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped')),
+                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped',
+                          'deadline_expired')),
         CHECK (phase IN ('preview', 'body')),
         CHECK (
             -- Relay-chain snapshots come as a pair and only ever appear on
@@ -296,14 +313,16 @@ SCHEMA_STATEMENTS = [
                 'receipt_timeout',
                 -- The previous station's destination changed location before
                 -- the copy could be sent.
-                'superseded'
+                'superseded',
+                -- The previous station missed its promised deliver-by cutoff.
+                'deliver_by_expired'
             )
         ),
         CHECK (
             release_state IS NULL
             OR release_state IN (
                 'held', 'released', 'release_denied',
-                'release_expired', 'release_voided'
+                'release_expired', 'release_voided', 'deadline_expired'
             )
         ),
         -- Only preview rows self-mark body_delivery_id; bodies leave it null.
@@ -316,7 +335,8 @@ SCHEMA_STATEMENTS = [
         ),
         CHECK (
             void_reason IS NULL OR void_reason IN (
-                'manual', 'preview_dead_lettered', 'preview_superseded'
+                'manual', 'preview_dead_lettered', 'preview_superseded',
+                'preview_deadline_expired', 'deliver_by_expired'
             )
         ),
         CHECK (attempts >= 0),
@@ -386,7 +406,7 @@ SCHEMA_STATEMENTS = [
             release_state IS NULL
             OR release_state IN (
                 'held', 'released', 'release_denied',
-                'release_expired', 'release_voided'
+                'release_expired', 'release_voided', 'deadline_expired'
             )
         )
     """,
@@ -407,7 +427,8 @@ SCHEMA_STATEMENTS = [
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_void_reason_check
         CHECK (
             void_reason IS NULL OR void_reason IN (
-                'manual', 'preview_dead_lettered', 'preview_superseded'
+                'manual', 'preview_dead_lettered', 'preview_superseded',
+                'preview_deadline_expired', 'deliver_by_expired'
             )
         )
     """,
@@ -737,7 +758,8 @@ SCHEMA_STATEMENTS = [
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
         CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
-                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped'))
+                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped',
+                          'deadline_expired'))
     """,
     # Idempotent upgrades for databases created before inbound source auth.
     # Every newly accepted event belongs to the registered source that pushed
@@ -818,7 +840,8 @@ SCHEMA_STATEMENTS = [
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
         CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
-                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped'))
+                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped',
+                          'deadline_expired'))
     """,
     # Widen the ingestion disposition check to include pending_confirmation.
     "ALTER TABLE ingestion_attempts DROP CONSTRAINT IF EXISTS ingestion_attempts_disposition_check",
@@ -846,7 +869,8 @@ SCHEMA_STATEMENTS = [
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
         CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
-                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped'))
+                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped',
+                          'deadline_expired'))
     """,
     "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_consecutive_failures_check",
     """
@@ -974,7 +998,8 @@ SCHEMA_STATEMENTS = [
     """
     ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
         CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
-                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped'))
+                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped',
+                          'deadline_expired'))
     """,
     # Idempotent upgrades for per-event-type relay chains ("接力"). One
     # ACTIVE chain per event type; stations are an ordered list of
@@ -1057,7 +1082,8 @@ SCHEMA_STATEMENTS = [
                 'receipt_failure_exhausted',
                 'receipt_failed',
                 'receipt_timeout',
-                'superseded'
+                'superseded',
+                'deliver_by_expired'
             )
         )
     """,
@@ -1068,6 +1094,65 @@ SCHEMA_STATEMENTS = [
     CREATE INDEX IF NOT EXISTS deliveries_relay_gate_idx
         ON deliveries (event_id, relay_chain_id, relay_station_no)
         WHERE relay_chain_id IS NOT NULL
+    """,
+    # Idempotent upgrades for an event-wide latest delivery promise
+    # ("最晚送到"). The event timestamp is copied onto copies while they are
+    # still undelivered; a later change rewrites only status='pending' and
+    # in-flight copies. The sweep moves still-pending copies with a missed
+    # cutoff to the terminal deadline_expired state; delivered copies remain
+    # exactly as they were and are never recalled.
+    "ALTER TABLE events ADD COLUMN IF NOT EXISTS deliver_by TIMESTAMPTZ",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS deliver_by TIMESTAMPTZ",
+    "ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS deliver_by_expired_at TIMESTAMPTZ",
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_status_check",
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS events_status_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_status_check
+        CHECK (status IN ('pending', 'in_flight', 'delivered', 'cancelled', 'superseded', 'dead_lettered', 'failed',
+                          'release_denied', 'release_expired', 'release_voided', 'relay_skipped',
+                          'deadline_expired'))
+    """,
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_release_state_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_release_state_check
+        CHECK (
+            release_state IS NULL
+            OR release_state IN (
+                'held', 'released', 'release_denied',
+                'release_expired', 'release_voided', 'deadline_expired'
+            )
+        )
+    """,
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_void_reason_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_void_reason_check
+        CHECK (
+            void_reason IS NULL OR void_reason IN (
+                'manual', 'preview_dead_lettered', 'preview_superseded',
+                'preview_deadline_expired', 'deliver_by_expired'
+            )
+        )
+    """,
+    "ALTER TABLE deliveries DROP CONSTRAINT IF EXISTS deliveries_relay_skip_reason_check",
+    """
+    ALTER TABLE deliveries ADD CONSTRAINT deliveries_relay_skip_reason_check
+        CHECK (
+            relay_skip_reason IS NULL OR relay_skip_reason IN (
+                'delivery_attempts_exhausted',
+                'receipt_timeout_exhausted',
+                'receipt_failure_exhausted',
+                'receipt_failed',
+                'receipt_timeout',
+                'superseded',
+                'deliver_by_expired'
+            )
+        )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS deliveries_deliver_by_due_idx
+        ON deliveries (deliver_by)
+        WHERE status = 'pending'
+          AND deliver_by IS NOT NULL
     """,
 ]
 

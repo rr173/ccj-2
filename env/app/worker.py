@@ -21,6 +21,7 @@ from app.confirmation import (
 from app.config import settings
 from app.db import SessionLocal, build_engine
 from app.models import init_db
+from app import deadlines
 from app import release as release_gate
 from app import relay
 
@@ -118,6 +119,15 @@ CLAIM_SQL = text(
                     e.release_state IS NULL
                  OR e.release_state = 'released'
               )
+              -- Latest-delivery promise ("最晚送到"): a queued copy at or
+              -- past its cutoff is never claimed. A sweeper turns such rows
+              -- terminal; the condition is also in the claim itself so the
+              -- cutoff is enforced before the HTTP call even when the
+              -- sweeper has not run yet.
+              AND (
+                    e.deliver_by IS NULL
+                 OR e.deliver_by > now()
+              )
             ORDER BY e.destination_seq
             LIMIT 1
         ) oldest
@@ -179,6 +189,10 @@ CLAIM_SQL = text(
               -- bodies are skipped here too so the preceding preview is the
               -- copy picked.
               AND (release_state IS NULL OR release_state = 'released')
+              AND (
+                    deliver_by IS NULL
+                 OR deliver_by > now()
+              )
               -- Same relay gate as the candidate head: a station whose
               -- predecessor has not acknowledged yet is never claimed.
               AND (
@@ -202,6 +216,7 @@ CLAIM_SQL = text(
           AND (picked.not_before IS NULL OR picked.not_before <= now())
           AND picked.confirmation_generation = d.confirmation_generation
           AND (picked.release_state IS NULL OR picked.release_state = 'released')
+          AND (picked.deliver_by IS NULL OR picked.deliver_by > now())
           AND (
                 picked.relay_chain_id IS NULL
              OR picked.relay_station_no = 1
@@ -302,6 +317,11 @@ EVENT_SUCCESS_SQL = text(
     WHERE id = :delivery_id
       AND status = 'in_flight'
       AND claim_token = :claim_token
+      -- A response arriving at/after the promised latest-delivery time is
+      -- not written as delivered. Use the HTTP response's finish time rather
+      -- the result-write transaction's clock so a quick commit delay cannot
+      -- turn a timely delivery into an expiry.
+      AND (deliver_by IS NULL OR deliver_by > CAST(:finished_at AS TIMESTAMPTZ))
     """
 )
 
@@ -639,7 +659,8 @@ def record_result(
     claim: RowMapping,
     result: MappingProxyType | dict[str, Any],
     lease_lost: bool,
-) -> None:
+) -> bool:
+    """Persist one attempt result. Returns True when a 2xx missed cutoff."""
     lease_lost = lease_lost or not still_owns_lease(db, claim)
     attempt_params = {
         "delivery_id": claim["delivery_id"],
@@ -669,7 +690,7 @@ def record_result(
             result["success"],
             result["status_code"],
         )
-        return
+        return False
 
     next_attempt_at = utc_now() + backoff_delay(claim["attempts"])
     should_isolate = False
@@ -686,6 +707,7 @@ def record_result(
     # its still-held body is cascaded to a terminal void — the address never
     # got the notice, so it can never receive the body.
     is_preview = claim["phase"] == "preview"
+    cutoff_expired = False
     if not result["success"] and not is_correction:
         should_isolate = claim["attempts"] >= settings.failure_threshold
         if should_isolate:
@@ -717,10 +739,32 @@ def record_result(
 
     if result["success"]:
         if is_preview:
-            # The notice landed: mark it delivered (no receipt reconciliation)
-            # and open the consent deadline on the still-held body. The body's
-            # queue position never changes.
-            release_gate.mark_preview_delivered(db, claim["delivery_id"])
+            preview_delivered = release_gate.mark_preview_delivered(
+                db, claim["delivery_id"], result["finished_at"]
+            )
+            if not preview_delivered:
+                # The cutoff passed while the notice was in flight (the
+                # mark_preview_delivered helper closes preview/body), or the
+                # claim was lost; only relay-cascade for the terminal cutoff
+                # state.
+                cutoff_row = db.execute(
+                    text(
+                        """
+                        SELECT status FROM deliveries
+                        WHERE id = CAST(:delivery_id AS UUID)
+                        """
+                    ),
+                    {"delivery_id": claim["delivery_id"]},
+                ).mappings().one()
+                if cutoff_row["status"] == "deadline_expired":
+                    cutoff_expired = True
+                    if claim.get("relay_chain_id") is not None:
+                        relay.cascade_after_stop(db, str(claim["delivery_id"]))
+                else:
+                    raise StaleClaimError(
+                        f"delivery {claim['delivery_id']} is no longer owned "
+                        "by this worker"
+                    )
         else:
             updated = db.execute(
                 EVENT_SUCCESS_SQL,
@@ -728,14 +772,26 @@ def record_result(
                     "delivery_id": claim["delivery_id"],
                     "claim_token": claim["claim_token"],
                     "receipt_timeout_seconds": settings.receipt_timeout_seconds,
+                    "finished_at": result["finished_at"],
                 },
             )
             if updated.rowcount != 1:
-                raise StaleClaimError(f"delivery {claim['delivery_id']} is no longer owned by this worker")
-            db.execute(
-                DESTINATION_SUCCESS_SQL,
-                {"destination_id": claim["destination_id"]},
-            )
+                if deadlines.expire_in_flight_delivery(
+                    db, str(claim["delivery_id"]), result["finished_at"]
+                ):
+                    cutoff_expired = True
+                    if claim.get("relay_chain_id") is not None:
+                        relay.cascade_after_stop(db, str(claim["delivery_id"]))
+                else:
+                    raise StaleClaimError(
+                        f"delivery {claim['delivery_id']} is no longer owned by "
+                        "this worker"
+                    )
+            else:
+                db.execute(
+                    DESTINATION_SUCCESS_SQL,
+                    {"destination_id": claim["destination_id"]},
+                )
     elif stale_generation:
         updated = db.execute(
             SUPERSEDE_FAILED_SQL,
@@ -776,6 +832,15 @@ def record_result(
         )
         if updated.rowcount != 1:
             raise StaleClaimError(f"delivery {claim['delivery_id']} is no longer owned by this worker")
+    elif deadlines.expire_in_flight_delivery(
+        db, str(claim["delivery_id"]), result["finished_at"]
+    ):
+        # The cutoff passed while the request was in flight. Even a failed
+        # attempt must not be retried or charged against the destination: the
+        # copy is closed because the promised latest delivery time is gone.
+        cutoff_expired = True
+        if claim.get("relay_chain_id") is not None:
+            relay.cascade_after_stop(db, str(claim["delivery_id"]))
     else:
         updated = db.execute(
             FAILURE_SQL,
@@ -813,7 +878,15 @@ def record_result(
     )
 
     db.commit()
-    if is_correction and not result["success"] and not stale_generation:
+    if cutoff_expired and result["success"]:
+        logger.warning(
+            "delivery_id=%s missed deliver_by while in flight; marked deadline_expired "
+            "instead of delivered (destination_id=%s, event_id=%s)",
+            claim["delivery_id"],
+            claim["destination_id"],
+            claim["event_id"],
+        )
+    elif is_correction and not result["success"] and not stale_generation:
         logger.warning(
             "correction delivery_id=%s failed terminally (destination_id=%s, "
             "event_id=%s, error=%s); destination failure tally untouched",
@@ -839,6 +912,7 @@ def record_result(
             claim["delivery_id"],
             claim["attempts"],
         )
+    return cutoff_expired
 
 
 def claim_next_event(db: Session) -> RowMapping | None:
@@ -847,6 +921,12 @@ def claim_next_event(db: Session) -> RowMapping | None:
     # its lease never expires and it keeps holding the destination's head;
     # only a dead worker stops heartbeating and becomes eligible to take over.
     db.execute(REAP_SQL)
+    # Close queued copies whose promised latest-delivery time has passed before
+    # selecting a new claim. Expired relay stations stop their later stations;
+    # expired gated previews close their held body in the same operation.
+    expired_relay_ids = deadlines.expire_due_deliveries(db)
+    for expired_id in expired_relay_ids:
+        relay.cascade_after_stop(db, expired_id)
     # Abandon queued copies of earlier confirmation generations (the
     # destination changed location): they must never go to the new URL and
     # must not block its head as pending forever.
@@ -918,8 +998,8 @@ def process_once() -> bool:
         )
         heartbeat.stop()
 
-        record_result(db, claim, result, lease_lost=heartbeat.lost)
-        if result["success"]:
+        cutoff_expired = record_result(db, claim, result, lease_lost=heartbeat.lost)
+        if result["success"] and not cutoff_expired:
             logger.info(
                 "delivered delivery_id=%s event_id=%s destination_id=%s attempt=%s",
                 claim["delivery_id"],
@@ -927,9 +1007,17 @@ def process_once() -> bool:
                 claim["destination_id"],
                 claim["attempts"],
             )
+        elif cutoff_expired:
+            logger.warning(
+                "delivery_id=%s missed deliver_by while in flight and was closed "
+                "without delivery (response success=%s)",
+                claim["delivery_id"],
+                result["success"],
+            )
         else:
             logger.warning(
-                "delivery failed delivery_id=%s event_id=%s destination_id=%s attempt=%s error=%s",
+                "delivery failed delivery_id=%s event_id=%s destination_id=%s "
+                "attempt=%s error=%s",
                 claim["delivery_id"],
                 claim["event_id"],
                 claim["destination_id"],

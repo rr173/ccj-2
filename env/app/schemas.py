@@ -187,6 +187,10 @@ class EventIn(BaseModel):
     # Earliest time the event may be sent out. None means "as soon as its
     # per-destination queue position is reached".
     not_before: datetime | None = None
+    # Latest time each copy is allowed to complete transport. Null means no
+    # such promise; copies still queued when it passes become terminal
+    # deadline_expired. Delivered copies are never recalled.
+    deliver_by: datetime | None = None
     # Only meaningful when the event type is gated (preview-consent). This is
     # the short text the preview is allowed to show; the real content stays in
     # payload and only goes out with the body after this address nods. Sending
@@ -203,6 +207,11 @@ class EventIn(BaseModel):
     def normalize_not_before(cls, value: datetime | None) -> datetime | None:
         return _normalize_optional_datetime(value)
 
+    @field_validator("deliver_by")
+    @classmethod
+    def normalize_deliver_by(cls, value: datetime | None) -> datetime | None:
+        return _normalize_optional_datetime(value)
+
 
 class EventRescheduleIn(BaseModel):
     # New earliest send time. Null clears the schedule, so the event goes out
@@ -213,6 +222,29 @@ class EventRescheduleIn(BaseModel):
     @classmethod
     def normalize_not_before(cls, value: datetime | None) -> datetime | None:
         return _normalize_optional_datetime(value)
+
+
+class EventDeliverByIn(BaseModel):
+    # New latest-delivery promise. Null clears it for copies that are still
+    # undelivered, so those copies go out normally.
+    deliver_by: datetime | None = None
+
+    @field_validator("deliver_by")
+    @classmethod
+    def normalize_deliver_by(cls, value: datetime | None) -> datetime | None:
+        return _normalize_optional_datetime(value)
+
+
+class EventDeliverByOut(BaseModel):
+    event_id: UUID
+    # Current latest-delivery promise on the event; null means the cutoff was
+    # cleared and remaining undelivered copies proceed normally.
+    deliver_by: datetime | None = None
+    # Copies the new value was snapshotted onto. Delivered/terminal copies are
+    # never rewritten and therefore are not counted here.
+    updated_count: int
+    updated_real_count: int = 0
+    updated_shadow_count: int = 0
 
 
 class CorrectionIn(BaseModel):
@@ -246,7 +278,9 @@ class EventOut(BaseModel):
     # remaining copies will never go out;
     # failed: every live copy stopped and at least one is a correction copy
     # whose send attempt failed terminally (only correction events can reach
-    # this state — ordinary copies retry or dead-letter instead).
+    # this state — ordinary copies retry or dead-letter instead);
+    # deadline_expired: no copy is still queued and at least one for-real copy
+    # was closed because its deliver_by cutoff passed without transport.
     status: str
     # Set only on correction events: the original event this one corrects.
     # A correction is an additional entry fanned out to the destinations the
@@ -296,6 +330,9 @@ class EventOut(BaseModel):
     # Scheduled send gate copied onto every fanned-out copy; null = send as
     # soon as the per-destination queue reaches it.
     not_before: datetime | None = None
+    # Latest transport time chosen at submission (or changed later before
+    # delivery). Null means "no cutoff".
+    deliver_by: datetime | None = None
     cancelled_at: datetime | None = None
     # Preview-consent gate ("预告 + 点头才给正文"): true when this event's type
     # is gated. A gated event fans out as a preview/body pair per subscriber;
@@ -332,6 +369,11 @@ class EventOut(BaseModel):
     # receipts kept not matching after redelivery). They never go out on their
     # own and are not acked; a manual revive puts them back in queue.
     dead_lettered_count: int = 0
+    # Undelivered for-real bodies closed at the deliver-by cutoff. They never
+    # went out and are deliberately neither "delivered" nor "unrouted".
+    deadline_expired_count: int = 0
+    # The same cutoff outcomes for observe-only subscribers.
+    shadow_deadline_expired_count: int = 0
     # Correction copies whose send attempt failed terminally (corrections are
     # not retried in place and never count toward the address's failure
     # tally). Always zero on ordinary events — their copies never take this
@@ -373,11 +415,18 @@ class DeliveryOut(BaseModel):
     # copy; corrections are not retried in place, the failure is not charged
     # to the address's consecutive-failure tally (no isolation) and the copy
     # no longer blocks later copies of its destination.
+    # deadline_expired: this copy was still undelivered when its deliver_by
+    # cutoff passed; terminal, it never went out and is not delivered.
     status: str
     attempts: int
     next_attempt_at: datetime
     # Earliest time this copy may be sent; null = no schedule gate.
     not_before: datetime | None = None
+    # Latest time this copy is allowed to complete transport; null = no cutoff.
+    deliver_by: datetime | None = None
+    # Set when this copy was closed because deliver_by passed without
+    # transport completion. Such a copy is terminal and was never delivered.
+    deliver_by_expired_at: datetime | None = None
     last_error: str | None = None
     created_at: datetime
     updated_at: datetime

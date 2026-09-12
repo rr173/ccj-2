@@ -52,11 +52,12 @@ REASON_RECEIPT_FAILURE_EXHAUSTED = "receipt_failure_exhausted"
 REASON_RECEIPT_FAILURE = "receipt_failed"
 REASON_RECEIPT_TIMEOUT = "receipt_timeout"
 REASON_SUPERSEDED = "superseded"
+REASON_DELIVER_BY_EXPIRED = "deliver_by_expired"
 
 # Terminal/stop states a station copy can be in that make the run stop behind
 # it. A station is NOT a stop while it is merely waiting (pending / in_flight
 # / delivered-awaiting / retried).
-_STOP_STATUSES = ("dead_lettered", "superseded")
+_STOP_STATUSES = ("dead_lettered", "superseded", "deadline_expired")
 _STOP_RECONCILE_STATES = ("receipt_failed", "timed_out")
 
 CHAIN_COLUMNS = "id, event_type, version, active, created_at"
@@ -268,6 +269,7 @@ def fan_out_relay_event(
     dedupe_key: str,
     payload: str,
     not_before: Any,
+    deliver_by: Any,
 ) -> None:
     """Create one body delivery per chain station, in station order.
 
@@ -312,11 +314,12 @@ def fan_out_relay_event(
                 )
                 INSERT INTO deliveries
                     (event_id, destination_id, event_type, dedupe_key, payload,
-                     destination_seq, not_before, confirmation_generation,
+                     destination_seq, not_before, deliver_by, confirmation_generation,
                      observe_only, relay_chain_id, relay_station_no)
                 SELECT :event_id, id, :event_type, :dedupe_key,
                        CAST(:payload AS JSONB), next_event_seq,
-                       CAST(:not_before AS TIMESTAMPTZ), confirmation_generation,
+                       CAST(:not_before AS TIMESTAMPTZ),
+                       CAST(:deliver_by AS TIMESTAMPTZ), confirmation_generation,
                        FALSE, CAST(:relay_chain_id AS UUID), :station_no
                 FROM bumped
                 """
@@ -328,6 +331,7 @@ def fan_out_relay_event(
                 "dedupe_key": dedupe_key,
                 "payload": payload,
                 "not_before": not_before,
+                "deliver_by": deliver_by,
                 "relay_chain_id": chain_id,
                 "station_no": station_no,
             },
@@ -362,6 +366,8 @@ def cascade_after_stop(db: Session, delivery_id: str) -> int:
                     CASE
                         WHEN d.status = 'dead_lettered' THEN d.dead_letter_reason
                         WHEN d.status = 'superseded' THEN 'superseded'
+                        WHEN d.status = 'deadline_expired'
+                            THEN 'deliver_by_expired'
                         WHEN d.reconcile_state = 'receipt_failed' THEN 'receipt_failed'
                         WHEN d.reconcile_state = 'timed_out' THEN 'receipt_timeout'
                         ELSE NULL
@@ -562,6 +568,8 @@ def build_event_relay(db: Session, event: dict[str, Any]) -> dict[str, Any] | No
 def _reason_of(row) -> str | None:
     if row["status"] == "superseded":
         return REASON_SUPERSEDED
+    if row["status"] == "deadline_expired":
+        return REASON_DELIVER_BY_EXPIRED
     if row["status"] == "dead_lettered":
         return row["dead_letter_reason"] or REASON_TRANSPORT_EXHAUSTED
     if row["reconcile_state"] == "receipt_failed":

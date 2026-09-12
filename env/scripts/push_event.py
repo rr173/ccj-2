@@ -16,7 +16,8 @@ Examples:
     python3 scripts/push_event.py \\
         --source-id 3f1c... --secret '...' \\
         --event-type paid --dedupe-key order-1001 \\
-        --payload '{"order_id":"1001"}'
+        --payload '{"order_id":"1001"}' \
+        --deliver-by 2026-09-10T12:00:00Z
 
     # simulate a replay (re-sign with an old send timestamp) -> 401 stale
     python3 scripts/push_event.py ... --signed-at $(( $(date +%s) - 600 ))
@@ -84,6 +85,8 @@ def push(base_url: str, args: argparse.Namespace) -> int:
         event["preview_payload"] = json.loads(args.preview_payload)
     if args.not_before is not None:
         event["not_before"] = args.not_before
+    if args.deliver_by is not None:
+        event["deliver_by"] = args.deliver_by
     raw_body = json.dumps(event).encode()
     signed_at = args.signed_at or str(int(time.time()))
     headers = {
@@ -125,6 +128,7 @@ def main() -> None:
         help="short text for the preview of a gated event type (JSON)",
     )
     parser.add_argument("--not_before", "--not-before", dest="not_before", default=None)
+    parser.add_argument("--deliver_by", "--deliver-by", dest="deliver_by", default=None)
     args = parser.parse_args()
 
     if args.register:

@@ -62,10 +62,16 @@ RELEASED = "released"
 DENIED = "release_denied"
 EXPIRED = "release_expired"
 VOIDED = "release_voided"
-TERMINAL_RELEASE_STATES = (DENIED, EXPIRED, VOIDED)
+DEADLINE_EXPIRED = "deadline_expired"
+TERMINAL_RELEASE_STATES = (DENIED, EXPIRED, VOIDED, DEADLINE_EXPIRED)
 
 # Delivery statuses a gated body ends in without ever going out.
-BODY_VOID_STATUSES = ("release_denied", "release_expired", "release_voided")
+BODY_VOID_STATUSES = (
+    "release_denied",
+    "release_expired",
+    "release_voided",
+    "deadline_expired",
+)
 
 # Policy table column list.
 POLICY_COLUMNS = "event_type, consent_timeout_seconds, created_at, updated_at"
@@ -140,6 +146,7 @@ def fan_out_gated_event(
     payload: str,
     preview_payload: str | None,
     not_before: Any,
+    deliver_by: Any,
     consent_timeout_seconds: int,
     observe_only: bool | None = None,
     destinations: list | None = None,
@@ -213,12 +220,13 @@ def fan_out_gated_event(
                 )
                 INSERT INTO deliveries
                     (event_id, destination_id, event_type, dedupe_key, payload,
-                     destination_seq, not_before, confirmation_generation,
+                     destination_seq, not_before, deliver_by, confirmation_generation,
                      observe_only, filter_spec, phase, release_state,
                      consent_timeout_seconds, body_delivery_id)
                 SELECT :event_id, id, :event_type, :preview_key,
                        CAST(:preview_payload AS JSONB), next_event_seq,
-                       CAST(:not_before AS TIMESTAMPTZ), confirmation_generation,
+                       CAST(:not_before AS TIMESTAMPTZ),
+                       CAST(:deliver_by AS TIMESTAMPTZ), confirmation_generation,
                        :observe_only, CAST(:filter_spec AS JSONB), 'preview', NULL,
                        :consent_timeout_seconds,
                        CAST(:placeholder AS UUID)
@@ -233,6 +241,7 @@ def fan_out_gated_event(
                 "preview_key": prev_key,
                 "preview_payload": preview_payload or json.dumps({}),
                 "not_before": not_before,
+                "deliver_by": deliver_by,
                 "observe_only": is_shadow,
                 "filter_spec": filter_param,
                 "consent_timeout_seconds": consent_timeout_seconds,
@@ -255,12 +264,13 @@ def fan_out_gated_event(
                 )
                 INSERT INTO deliveries
                     (event_id, destination_id, event_type, dedupe_key, payload,
-                     destination_seq, not_before, confirmation_generation,
+                     destination_seq, not_before, deliver_by, confirmation_generation,
                      observe_only, filter_spec, phase, release_state,
                      consent_timeout_seconds, preview_delivery_id)
                 SELECT :event_id, id, :event_type, :dedupe_key,
                        CAST(:payload AS JSONB), next_event_seq,
-                       CAST(:not_before AS TIMESTAMPTZ), confirmation_generation,
+                       CAST(:not_before AS TIMESTAMPTZ),
+                       CAST(:deliver_by AS TIMESTAMPTZ), confirmation_generation,
                        :observe_only, CAST(:filter_spec AS JSONB), 'body', 'held',
                        :consent_timeout_seconds, CAST(:preview_id AS UUID)
                 FROM bumped
@@ -274,6 +284,7 @@ def fan_out_gated_event(
                 "dedupe_key": dedupe_key,
                 "payload": payload,
                 "not_before": not_before,
+                "deliver_by": deliver_by,
                 "observe_only": is_shadow,
                 "filter_spec": filter_param,
                 "consent_timeout_seconds": consent_timeout_seconds,
@@ -301,14 +312,67 @@ def fan_out_gated_event(
 # -- Preview send outcomes (called by the worker) -----------------------------
 
 
-def mark_preview_delivered(db: Session, delivery_id: str) -> None:
-    """A preview completed transport.
+def mark_preview_delivered(
+    db: Session, delivery_id: str, finished_at: Any | None = None
+) -> bool:
+    """A preview completed transport before its cutoff.
 
     Unlike an ordinary copy it does not enter receipt reconciliation; instead
     the consent deadline is opened on its body (delivered-at + the timeout
-    snapshotted on the pair). The body's queue position never changes.
+    snapshotted on the pair). The body's queue position never changes. Returns
+    False when transport completed after the latest-delivery cutoff: the
+    preview and its body are closed instead, never marked delivered.
     """
-    db.execute(
+    expired = db.execute(
+        text(
+            """
+            UPDATE deliveries
+            SET status = 'deadline_expired',
+                deliver_by_expired_at = COALESCE(deliver_by_expired_at, now()),
+                claim_token = NULL,
+                claimed_at = NULL,
+                lease_until = NULL,
+                next_attempt_at = now(),
+                updated_at = now()
+            WHERE id = CAST(:delivery_id AS UUID)
+              AND status = 'in_flight'
+              AND deliver_by IS NOT NULL
+              AND deliver_by <= COALESCE(CAST(:finished_at AS TIMESTAMPTZ), now())
+            RETURNING body_delivery_id
+            """
+        ),
+        {
+            "delivery_id": delivery_id,
+            "finished_at": finished_at,
+        },
+    ).mappings().first()
+    if expired is not None:
+        # The notice only completed after the cutoff and is therefore not a
+        # delivered preview. Close its body as a missed deadline too.
+        if expired["body_delivery_id"] is not None:
+            db.execute(
+                text(
+                    """
+                    UPDATE deliveries
+                    SET status = 'deadline_expired',
+                        release_state = 'deadline_expired',
+                        voided_at = now(),
+                        void_reason = 'preview_deadline_expired',
+                        claim_token = NULL,
+                        claimed_at = NULL,
+                        lease_until = NULL,
+                        next_attempt_at = now(),
+                        updated_at = now()
+                    WHERE id = CAST(:body_id AS UUID)
+                      AND status = 'pending'
+                      AND release_state IN ('held', 'released')
+                    """
+                ),
+                {"body_id": str(expired["body_delivery_id"])},
+            )
+        return False
+
+    delivered = db.execute(
         text(
             """
             UPDATE deliveries
@@ -322,10 +386,23 @@ def mark_preview_delivered(db: Session, delivery_id: str) -> None:
                 consecutive_failures = 0
             WHERE id = CAST(:delivery_id AS UUID)
               AND status = 'in_flight'
+              AND (
+                    deliver_by IS NULL
+                 OR deliver_by > COALESCE(CAST(:finished_at AS TIMESTAMPTZ), now())
+              )
             """
         ),
-        {"delivery_id": delivery_id},
+        {
+            "delivery_id": delivery_id,
+            "finished_at": finished_at,
+        },
     )
+    if delivered.rowcount != 1:
+        # Lost the claim while the HTTP call was running; the worker owning
+        # the result records the attempt elsewhere. Do not open a consent
+        # window or reset the destination tally for a copy we did not update.
+        return False
+
     # Open the decision window on the still-held body. If it is already
     # terminal (voided manually / superseded) nothing is opened.
     db.execute(
@@ -354,6 +431,7 @@ def mark_preview_delivered(db: Session, delivery_id: str) -> None:
         ),
         {"delivery_id": delivery_id},
     )
+    return True
 
 
 def void_body_after_preview_failure(
@@ -542,9 +620,10 @@ def ingest_decision(
         db.commit()
         return _decision_response(body_id, disposition, state)
 
-    if state in (EXPIRED, VOIDED):
-        # Body already gone (deadline passed / manual or cascading void):
-        # neither a late nod nor a late "no" revives or moves it.
+    if state in (EXPIRED, VOIDED, DEADLINE_EXPIRED):
+        # Body already gone (consent cutoff, manual/cascading void, or the
+        # event's deliver-by cutoff): neither a late nod nor a late "no"
+        # revives or moves it.
         disposition = "late_ignored"
         reason = f"body already {state}"
         record()

@@ -200,8 +200,12 @@ def ingest_receipt(db: Session, destination_id: UUID, dedupe_key: str, result: s
         elif state in ("acknowledged", "receipt_failed"):
             # Same receipt delivered again: applied exactly once, this is a no-op.
             disposition = "duplicate"
-        elif state == "timed_out":
-            # After the deadline: visible as late, never flips back to acknowledged.
+        elif state == "timed_out" or (
+            delivery["status"] == "deadline_expired"
+        ):
+            # After the receipt deadline, or after the copy was closed because
+            # it missed its promised latest-delivery time: visible as late,
+            # never flips the row to acknowledged/delivered.
             disposition = "late"
         else:
             # Delivery exists but transport has not completed (pending, or still
